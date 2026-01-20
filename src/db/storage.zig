@@ -336,6 +336,7 @@ pub const Table = struct {
     schema: TableSchema,
     btree: *btree.BTree,
     row_count: u64,
+    deleted_keys: std.AutoHashMap(u64, void), // Keys of logically deleted rows
 
     const Self = @This();
 
@@ -348,19 +349,106 @@ pub const Table = struct {
         table.schema = try schema.clone(allocator);
         table.btree = try btree.BTree.init(allocator, page_manager);
         table.row_count = 0;
+        table.deleted_keys = std.AutoHashMap(u64, void).init(allocator);
 
         return table;
     }
 
-    /// Insert a row into the table
-    pub fn insert(self: *Self, row: Row) !void {
+    /// Insert a row into the table (returns the row_id/key)
+    pub fn insert(self: *Self, alloc: std.mem.Allocator, values: []Value) !i64 {
+        _ = alloc;
+        const row_id = self.row_count;
+        try self.btree.insert(row_id, Row{ .values = values });
+        self.row_count += 1;
+        return @intCast(row_id);
+    }
+
+    /// Insert a Row into the table
+    pub fn insertRow(self: *Self, row: Row) !void {
         try self.btree.insert(self.row_count, row);
         self.row_count += 1;
     }
 
-    /// Select all rows
+    /// Delete a row by its key (logical delete)
+    pub fn delete(self: *Self, alloc: std.mem.Allocator, row_id: i64) !void {
+        _ = alloc;
+        try self.deleted_keys.put(@intCast(row_id), {});
+    }
+
+    /// Undelete a row by its key (for ROLLBACK of DELETE)
+    pub fn undelete(self: *Self, row_id: i64) void {
+        _ = self.deleted_keys.remove(@intCast(row_id));
+    }
+
+    /// Update a row by key
+    pub fn updateRow(self: *Self, alloc: std.mem.Allocator, row_id: i64, new_values: []Value) !void {
+        // Mark old as deleted
+        try self.deleted_keys.put(@intCast(row_id), {});
+        // Insert new values with a new key
+        const new_row_id = self.row_count;
+        try self.btree.insert(new_row_id, Row{ .values = new_values });
+        self.row_count += 1;
+        _ = alloc;
+    }
+
+    /// Select all non-deleted rows
     pub fn select(self: *Self, allocator: std.mem.Allocator) ![]Row {
-        return try self.btree.selectAll(allocator);
+        const all_rows = try self.btree.selectAllWithKeys(allocator);
+        defer allocator.free(all_rows);
+
+        // Filter out deleted rows
+        var results: std.ArrayList(Row) = .{};
+        for (all_rows) |item| {
+            if (!self.deleted_keys.contains(item.key)) {
+                try results.append(allocator, item.row);
+            } else {
+                // Free the deleted row's values
+                for (item.row.values) |value| {
+                    value.deinit(allocator);
+                }
+                allocator.free(item.row.values);
+            }
+        }
+        return results.toOwnedSlice(allocator);
+    }
+
+    /// KeyRow pair for returning rows with their keys
+    pub const KeyRow = struct {
+        key: i64,
+        row: Row,
+    };
+
+    /// Select all non-deleted rows with their keys (for UPDATE/DELETE with undo logging)
+    pub fn selectWithKeys(self: *Self, allocator: std.mem.Allocator) ![]KeyRow {
+        const all_rows = try self.btree.selectAllWithKeys(allocator);
+        defer allocator.free(all_rows);
+
+        // Filter out deleted rows
+        var results: std.ArrayList(KeyRow) = .{};
+        for (all_rows) |item| {
+            if (!self.deleted_keys.contains(item.key)) {
+                try results.append(allocator, KeyRow{
+                    .key = @intCast(item.key),
+                    .row = item.row,
+                });
+            } else {
+                // Free the deleted row's values
+                for (item.row.values) |value| {
+                    value.deinit(allocator);
+                }
+                allocator.free(item.row.values);
+            }
+        }
+        return results.toOwnedSlice(allocator);
+    }
+
+    /// Get a single row by key (returns null if deleted or not found)
+    pub fn getRow(self: *Self, row_id: i64) !?Row {
+        const key: u64 = @intCast(row_id);
+        if (self.deleted_keys.contains(key)) {
+            return null;
+        }
+        return try self.btree.search(key);
     }
 
     /// Get column index by name
@@ -376,6 +464,7 @@ pub const Table = struct {
     /// Clean up table
     pub fn deinit(self: *Self) void {
         self.btree.deinit();
+        self.deleted_keys.deinit();
         self.allocator.free(self.name);
         self.schema.deinit(self.allocator);
         self.allocator.destroy(self);

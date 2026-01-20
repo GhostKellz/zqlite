@@ -54,7 +54,7 @@ test "database integration" {
     // Test selection (this should work without crashing)
     try conn.execute("SELECT * FROM users;");
 
-    std.debug.print("✅ Integration test passed!\n", .{});
+    // Integration test passed
 }
 
 test "end-to-end workflow" {
@@ -89,16 +89,8 @@ test "end-to-end workflow" {
 
     try std.testing.expectEqual(@as(u32, 1), result.affected_rows);
 
-    std.debug.print("✅ End-to-end test passed!\n", .{});
+    // End-to-end test passed
 }
 
-test "fuzz example" {
-    const Context = struct {
-        fn testOne(context: @This(), input: []const u8) anyerror!void {
-            _ = context;
-            // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-            try std.testing.expect(!std.mem.eql(u8, "canyoufindme", input));
-        }
-    };
-    try std.testing.fuzz(Context{}, Context.testOne, .{});
-}
+// Fuzz test moved to tests/fuzz/fuzz_example.zig to avoid test harness protocol issues
+// Run with: zig build fuzz-example

@@ -3,6 +3,7 @@ const storage = @import("../db/storage.zig");
 const mvcc = @import("mvcc_transactions.zig");
 const transport = @import("../transport/transport.zig");
 const zsync = @import("zsync");
+const time_utils = @import("../time_utils.zig");
 
 /// Hot Standby System for Zero-Downtime Failover
 /// Provides continuous replication and seamless failover capabilities
@@ -133,7 +134,7 @@ pub const HotStandby = struct {
 
         // Update sync state
         self.sync_state.last_applied_index = entry.index;
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         self.sync_state.last_applied_timestamp = ts.sec;
 
         // Apply entry immediately for better performance
@@ -459,7 +460,7 @@ const HeartbeatManager = struct {
     pub fn startMonitoring(self: *Self, primary: *Node) !void {
         self.primary_node = primary;
         self.is_monitoring = true;
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         self.last_heartbeat = ts.sec;
         // Start background monitoring thread
     }
@@ -481,7 +482,7 @@ const HeartbeatManager = struct {
     pub fn isPrimaryHealthy(self: *Self) bool {
         if (!self.is_monitoring) return false;
 
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         const now = ts.sec;
         const time_since_heartbeat = now - self.last_heartbeat;
 
@@ -515,7 +516,7 @@ const FailoverManager = struct {
         }
 
         self.failover_in_progress = true;
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         self.failover_start_time = ts.sec;
     }
 
@@ -582,7 +583,7 @@ test "hot standby basic operations" {
     try testing.expect(hot_standby.getReplicationLag() == 0);
 
     // Test replication entry
-    const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+    const ts = time_utils.getTimespec();
     const entry = ReplicationEntry{
         .index = 1,
         .timestamp = ts.sec,

@@ -32,6 +32,7 @@ pub const Planner = struct {
             .With => |*with| try self.planWith(with), // Handle CTE
             .Pragma => |*pragma| try self.planPragma(pragma),
             .Explain => |*explain| try self.planExplain(explain),
+            .CompoundSelect => |*compound| try self.planCompoundSelect(compound),
         };
     }
 
@@ -109,21 +110,29 @@ pub const Planner = struct {
             var columns: std.ArrayList([]const u8) = .{};
             var expressions: std.ArrayList(ast.ColumnExpression) = .{};
             var has_expressions = false;
+            var window_functions: std.ArrayList(ast.WindowFunction) = .{};
+            var window_column_names: std.ArrayList([]const u8) = .{};
+            var non_window_columns: std.ArrayList([]const u8) = .{};
 
             for (select.columns) |column| {
                 switch (column.expression) {
                     .Simple => |name| {
                         try columns.append(self.allocator, try self.allocator.dupe(u8, name));
                         try expressions.append(self.allocator, ast.ColumnExpression{ .Simple = try self.allocator.dupe(u8, name) });
+                        try non_window_columns.append(self.allocator, try self.allocator.dupe(u8, name));
                     },
                     .Aggregate => {
                         // This shouldn't happen if has_aggregates was false
                         return error.UnexpectedAggregate;
                     },
-                    .Window => {
-                        // Window functions will be handled in a later version
-                        try columns.append(self.allocator, try self.allocator.dupe(u8, "window_result"));
-                        try expressions.append(self.allocator, ast.ColumnExpression{ .Simple = try self.allocator.dupe(u8, "window_result") });
+                    .Window => |window_func| {
+                        // Collect window functions for a separate WindowStep
+                        const cloned_wf = try self.cloneWindowFunction(window_func);
+                        try window_functions.append(self.allocator, cloned_wf);
+                        // Use alias or generate a name for the window column
+                        const col_name = if (column.alias) |a| a else column.name;
+                        try window_column_names.append(self.allocator, try self.allocator.dupe(u8, col_name));
+                        // DON'T add window columns to Project - they don't exist in table schema yet
                     },
                     .FunctionCall => |func_call| {
                         // Function calls in SELECT columns
@@ -131,6 +140,7 @@ pub const Planner = struct {
                         try columns.append(self.allocator, try self.allocator.dupe(u8, col_name));
                         try expressions.append(self.allocator, ast.ColumnExpression{ .FunctionCall = try self.cloneFunctionCall(func_call) });
                         has_expressions = true;
+                        try non_window_columns.append(self.allocator, try self.allocator.dupe(u8, col_name));
                     },
                     .Case => |case_expr| {
                         // Use alias or generate a name for CASE column
@@ -138,23 +148,55 @@ pub const Planner = struct {
                         try columns.append(self.allocator, try self.allocator.dupe(u8, col_name));
                         try expressions.append(self.allocator, ast.ColumnExpression{ .Case = try self.cloneCaseExpression(case_expr) });
                         has_expressions = true;
+                        try non_window_columns.append(self.allocator, try self.allocator.dupe(u8, col_name));
                     },
                 }
             }
 
-            try steps.append(self.allocator, ExecutionStep{
-                .Project = ProjectStep{
-                    .columns = try columns.toOwnedSlice(self.allocator),
-                    .expressions = if (has_expressions) try expressions.toOwnedSlice(self.allocator) else null,
-                },
-            });
+            // Add WindowStep BEFORE Project if there are window functions
+            // Window step will project non-window columns and compute window functions
+            if (window_functions.items.len > 0) {
+                try steps.append(self.allocator, ExecutionStep{
+                    .Window = WindowStep{
+                        .window_functions = try window_functions.toOwnedSlice(self.allocator),
+                        .column_names = try window_column_names.toOwnedSlice(self.allocator),
+                        .projected_columns = try non_window_columns.toOwnedSlice(self.allocator),
+                    },
+                });
 
-            // Clean up expressions if not used
-            if (!has_expressions) {
+                // Clean up columns/expressions arrays since Window step handles projection
+                for (columns.items) |col| {
+                    self.allocator.free(col);
+                }
+                columns.deinit(self.allocator);
                 for (expressions.items) |*expr| {
                     expr.deinit(self.allocator);
                 }
                 expressions.deinit(self.allocator);
+            } else {
+                // No window functions - use regular Project step
+                try steps.append(self.allocator, ExecutionStep{
+                    .Project = ProjectStep{
+                        .columns = try columns.toOwnedSlice(self.allocator),
+                        .expressions = if (has_expressions) try expressions.toOwnedSlice(self.allocator) else null,
+                    },
+                });
+
+                // Clean up expressions if not used
+                if (!has_expressions) {
+                    for (expressions.items) |*expr| {
+                        expr.deinit(self.allocator);
+                    }
+                    expressions.deinit(self.allocator);
+                }
+
+                window_functions.deinit(self.allocator);
+                window_column_names.deinit(self.allocator);
+                // Free the strings in non_window_columns before deinit
+                for (non_window_columns.items) |col| {
+                    self.allocator.free(col);
+                }
+                non_window_columns.deinit(self.allocator);
             }
         }
 
@@ -607,6 +649,69 @@ pub const Planner = struct {
         };
     }
 
+    /// Clone a window function
+    fn cloneWindowFunction(self: *Self, window_func: ast.WindowFunction) anyerror!ast.WindowFunction {
+        // Clone arguments
+        var cloned_args = try self.allocator.alloc(ast.FunctionArgument, window_func.arguments.len);
+        for (window_func.arguments, 0..) |arg, i| {
+            cloned_args[i] = try self.cloneFunctionArgument(arg);
+        }
+
+        // Clone window specification
+        const cloned_spec = try self.cloneWindowSpecification(window_func.window_spec);
+
+        return ast.WindowFunction{
+            .function_type = window_func.function_type,
+            .arguments = cloned_args,
+            .window_spec = cloned_spec,
+        };
+    }
+
+    /// Clone a window specification
+    fn cloneWindowSpecification(self: *Self, spec: ast.WindowSpecification) anyerror!ast.WindowSpecification {
+        // Clone window_name
+        const cloned_name: ?[]const u8 = if (spec.window_name) |name|
+            try self.allocator.dupe(u8, name)
+        else
+            null;
+
+        // Clone partition_by
+        var cloned_partition_by: ?[][]const u8 = null;
+        if (spec.partition_by) |partition_by| {
+            var cols = try self.allocator.alloc([]const u8, partition_by.len);
+            for (partition_by, 0..) |col, i| {
+                cols[i] = try self.allocator.dupe(u8, col);
+            }
+            cloned_partition_by = cols;
+        }
+
+        // Clone order_by
+        var cloned_order_by: ?[]ast.OrderByClause = null;
+        if (spec.order_by) |order_by| {
+            var clauses = try self.allocator.alloc(ast.OrderByClause, order_by.len);
+            for (order_by, 0..) |clause, i| {
+                clauses[i] = ast.OrderByClause{
+                    .column = try self.allocator.dupe(u8, clause.column),
+                    .direction = clause.direction,
+                };
+            }
+            cloned_order_by = clauses;
+        }
+
+        // Clone frame clause (simple copy since it has no dynamic memory)
+        const cloned_frame: ?ast.FrameClause = if (spec.frame_clause) |frame|
+            frame
+        else
+            null;
+
+        return ast.WindowSpecification{
+            .window_name = cloned_name,
+            .partition_by = cloned_partition_by,
+            .order_by = cloned_order_by,
+            .frame_clause = cloned_frame,
+        };
+    }
+
     /// Convert AST default value to storage default value
     fn convertAstDefaultToStorage(self: *Self, default_value: ast.DefaultValue) !storage.Column.DefaultValue {
         return switch (default_value) {
@@ -801,6 +906,49 @@ pub const Planner = struct {
             .allocator = self.allocator,
         };
     }
+
+    /// Plan compound SELECT (UNION/INTERSECT/EXCEPT)
+    fn planCompoundSelect(self: *Self, compound: *const ast.CompoundSelectStatement) !ExecutionPlan {
+        var steps: std.ArrayList(ExecutionStep) = .{};
+
+        // Plan the left SELECT
+        const left_plan = try self.planSelect(compound.left);
+        defer self.allocator.free(left_plan.steps);
+
+        // Plan the right statement (could be SELECT or another CompoundSelect)
+        const right_plan = try self.plan(compound.right);
+        defer self.allocator.free(right_plan.steps);
+
+        // Clone order_by if present
+        var order_by: ?[]ast.OrderByClause = null;
+        if (compound.order_by) |orig_order_by| {
+            var cloned_order: std.ArrayList(ast.OrderByClause) = .{};
+            for (orig_order_by) |clause| {
+                try cloned_order.append(self.allocator, ast.OrderByClause{
+                    .column = try self.allocator.dupe(u8, clause.column),
+                    .direction = clause.direction,
+                });
+            }
+            order_by = try cloned_order.toOwnedSlice(self.allocator);
+        }
+
+        // Create the SetOperation step
+        try steps.append(self.allocator, ExecutionStep{
+            .SetOperation = SetOperationStep{
+                .operation = compound.operation,
+                .left_steps = try self.allocator.dupe(ExecutionStep, left_plan.steps),
+                .right_steps = try self.allocator.dupe(ExecutionStep, right_plan.steps),
+                .order_by = order_by,
+                .limit = compound.limit,
+                .offset = compound.offset,
+            },
+        });
+
+        return ExecutionPlan{
+            .steps = try steps.toOwnedSlice(self.allocator),
+            .allocator = self.allocator,
+        };
+    }
 };
 
 /// Execution plan containing steps to execute
@@ -839,6 +987,8 @@ pub const ExecutionStep = union(enum) {
     CreateCTE: CreateCTEStep, // Common Table Expression support
     Pragma: PragmaStep, // PRAGMA statements for introspection
     Explain: ExplainStep, // EXPLAIN / EXPLAIN QUERY PLAN
+    SetOperation: SetOperationStep, // UNION/INTERSECT/EXCEPT
+    Window: WindowStep, // Window functions (ROW_NUMBER, RANK, etc.)
 
     pub fn deinit(self: *ExecutionStep, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -863,6 +1013,8 @@ pub const ExecutionStep = union(enum) {
             .CreateCTE => |*step| step.deinit(allocator),
             .Pragma => |*step| step.deinit(allocator),
             .Explain => |*step| step.deinit(allocator),
+            .SetOperation => |*step| step.deinit(allocator),
+            .Window => |*step| step.deinit(allocator),
         }
     }
 };
@@ -1172,6 +1324,68 @@ pub const ExplainStep = struct {
             step.deinit(allocator);
         }
         allocator.free(self.inner_steps);
+    }
+};
+
+/// Set operation step - UNION/INTERSECT/EXCEPT
+pub const SetOperationStep = struct {
+    /// The set operation type
+    operation: ast.SetOperation,
+    /// Execution steps for the left side
+    left_steps: []ExecutionStep,
+    /// Execution steps for the right side
+    right_steps: []ExecutionStep,
+    /// Optional ORDER BY columns
+    order_by: ?[]ast.OrderByClause,
+    /// Optional LIMIT
+    limit: ?u32,
+    /// Optional OFFSET
+    offset: ?u32,
+
+    pub fn deinit(self: *SetOperationStep, allocator: std.mem.Allocator) void {
+        for (self.left_steps) |*step| {
+            step.deinit(allocator);
+        }
+        allocator.free(self.left_steps);
+
+        for (self.right_steps) |*step| {
+            step.deinit(allocator);
+        }
+        allocator.free(self.right_steps);
+
+        if (self.order_by) |order_by| {
+            for (order_by) |clause| {
+                allocator.free(clause.column);
+            }
+            allocator.free(order_by);
+        }
+    }
+};
+
+/// Window function step - applies window functions to result set
+pub const WindowStep = struct {
+    /// Window functions to apply
+    window_functions: []ast.WindowFunction,
+    /// Column names for result mapping (window function output names)
+    column_names: [][]const u8,
+    /// Projected column names (input columns that ORDER BY can reference)
+    projected_columns: [][]const u8,
+
+    pub fn deinit(self: *WindowStep, allocator: std.mem.Allocator) void {
+        for (self.window_functions) |*wf| {
+            wf.deinit(allocator);
+        }
+        allocator.free(self.window_functions);
+
+        for (self.column_names) |col| {
+            allocator.free(col);
+        }
+        allocator.free(self.column_names);
+
+        for (self.projected_columns) |col| {
+            allocator.free(col);
+        }
+        allocator.free(self.projected_columns);
     }
 };
 

@@ -2,6 +2,7 @@ const std = @import("std");
 const storage = @import("../db/storage.zig");
 const mvcc = @import("mvcc_transactions.zig");
 const zsync = @import("zsync");
+const time_utils = @import("../time_utils.zig");
 
 /// Ultra-High Performance Batch Processor - TigerBeetle Inspired
 /// Processes 8192+ operations in single batch with SIMD optimizations
@@ -27,7 +28,7 @@ pub const BatchProcessor = struct {
 
     /// Process a batch of operations with vectorized optimizations
     pub fn processBatch(self: *Self, operations: []const BatchOperation) !BatchResult {
-        const ts_start = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts_start = time_utils.getTimespec();
         const start_time: i64 = @intCast(@divTrunc((@as(i128, ts_start.sec) * std.time.ns_per_s + ts_start.nsec), 1000));
 
         // Validate batch size
@@ -71,7 +72,7 @@ pub const BatchProcessor = struct {
         // Commit batch transaction
         try self.mvcc_manager.commitTransaction(batch_tx);
 
-        const ts_end = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts_end = time_utils.getTimespec();
         const end_time: i64 = @intCast(@divTrunc((@as(i128, ts_end.sec) * std.time.ns_per_s + ts_end.nsec), 1000));
         const execution_time = end_time - start_time;
 

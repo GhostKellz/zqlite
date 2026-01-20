@@ -6,6 +6,25 @@ const parser = @import("../parser/parser.zig");
 const planner = @import("../executor/planner.zig");
 const vm = @import("../executor/vm.zig");
 
+/// Undo log entry for transaction rollback
+pub const UndoEntry = struct {
+    operation: enum { Insert, Delete, Update },
+    table_name: []const u8,
+    row_id: i64,
+    new_row_id: ?i64, // For UPDATE: the new row that was inserted
+    old_values: ?[]storage.Value, // For DELETE/UPDATE: values to restore (not used with logical deletes)
+
+    pub fn deinit(self: *UndoEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.table_name);
+        if (self.old_values) |values| {
+            for (values) |value| {
+                value.deinit(allocator);
+            }
+            allocator.free(values);
+        }
+    }
+};
+
 /// Database connection handle
 pub const Connection = struct {
     allocator: std.mem.Allocator,
@@ -14,6 +33,8 @@ pub const Connection = struct {
     is_memory: bool,
     path: ?[]const u8,
     owns_storage: bool, // Whether this connection owns and should clean up the storage engine
+    in_transaction: bool,
+    undo_log: std.ArrayList(UndoEntry),
 
     const Self = @This();
 
@@ -26,6 +47,8 @@ pub const Connection = struct {
         conn.is_memory = false;
         conn.path = try allocator.dupe(u8, path);
         conn.owns_storage = true;
+        conn.in_transaction = false;
+        conn.undo_log = .{};
 
         // Replay WAL on startup to recover any uncommitted changes
         if (conn.wal) |w| {
@@ -44,6 +67,8 @@ pub const Connection = struct {
         conn.is_memory = true;
         conn.path = null;
         conn.owns_storage = true;
+        conn.in_transaction = false;
+        conn.undo_log = .{};
 
         return conn;
     }
@@ -57,6 +82,8 @@ pub const Connection = struct {
         conn.is_memory = true; // Assume shared storage is memory-based for simplicity
         conn.path = null;
         conn.owns_storage = false; // This connection doesn't own the storage
+        conn.in_transaction = false;
+        conn.undo_log = .{};
 
         return conn;
     }
@@ -76,6 +103,7 @@ pub const Connection = struct {
         if (self.wal) |w| {
             try w.beginTransaction();
         }
+        self.in_transaction = true;
     }
 
     /// Begin a transaction (alias)
@@ -90,6 +118,13 @@ pub const Connection = struct {
             // Checkpoint WAL to apply changes to the main database file
             try w.checkpointToPager(self.storage_engine.pager);
         }
+
+        // Clear undo log - changes are now permanent
+        for (self.undo_log.items) |*entry| {
+            entry.deinit(self.allocator);
+        }
+        self.undo_log.clearRetainingCapacity();
+        self.in_transaction = false;
     }
 
     /// Commit a transaction (alias)
@@ -99,8 +134,55 @@ pub const Connection = struct {
 
     /// Rollback a transaction
     pub fn rollbackTransaction(self: *Self) !void {
+        // WAL rollback first - if this fails, keep undo log intact for retry
         if (self.wal) |w| {
             try w.rollback();
+        }
+
+        // Only clear undo log after WAL rollback succeeds
+        while (self.undo_log.items.len > 0) {
+            if (self.undo_log.pop()) |entry_val| {
+                var entry = entry_val;
+                self.applyUndo(&entry) catch |err| {
+                    std.log.err("Failed to apply undo: {}", .{err});
+                };
+                entry.deinit(self.allocator);
+            }
+        }
+        self.in_transaction = false;
+    }
+
+    /// Apply a single undo entry
+    fn applyUndo(self: *Self, entry: *UndoEntry) !void {
+        const table = self.storage_engine.getTable(entry.table_name) orelse return error.TableNotFound;
+
+        switch (entry.operation) {
+            .Insert => {
+                // Undo INSERT by deleting the row (logical delete)
+                try table.delete(self.allocator, entry.row_id);
+            },
+            .Delete => {
+                // Undo DELETE by undeleting the row (it's still in the btree)
+                table.undelete(entry.row_id);
+            },
+            .Update => {
+                // Undo UPDATE: undelete the old row and delete the new row
+                table.undelete(entry.row_id);
+                if (entry.new_row_id) |new_id| {
+                    try table.delete(self.allocator, new_id);
+                }
+            },
+        }
+    }
+
+    /// Log an undo entry for transaction rollback
+    pub fn logUndo(self: *Self, entry: UndoEntry) !void {
+        if (self.in_transaction) {
+            try self.undo_log.append(self.allocator, entry);
+        } else {
+            // Not in a transaction, free the entry immediately
+            var mutable_entry = entry;
+            mutable_entry.deinit(self.allocator);
         }
     }
 
@@ -165,6 +247,7 @@ pub const Connection = struct {
 
         // Execute and get results
         var virtual_machine = vm.VirtualMachine.init(self.allocator, self);
+        defer virtual_machine.deinitVM();
         var result = try virtual_machine.execute(&plan);
         defer result.deinit();
 
@@ -206,6 +289,7 @@ pub const Connection = struct {
 
         // Execute and get results
         var virtual_machine = vm.VirtualMachine.init(self.allocator, self);
+        defer virtual_machine.deinitVM();
         var result = try virtual_machine.execute(&plan);
         defer result.deinit();
 
@@ -275,6 +359,12 @@ pub const Connection = struct {
 
     /// Close the database connection
     pub fn close(self: *Self) void {
+        // Clean up any remaining undo log entries
+        for (self.undo_log.items) |*entry| {
+            entry.deinit(self.allocator);
+        }
+        self.undo_log.deinit(self.allocator);
+
         // Checkpoint any remaining WAL entries before closing
         if (self.wal) |w| {
             w.checkpointToPager(self.storage_engine.pager) catch {};
@@ -680,12 +770,14 @@ pub const PreparedStatement = struct {
     /// Execute the prepared statement
     pub fn execute(self: *Self) !vm.ExecutionResult {
         var virtual_machine = vm.VirtualMachine.init(self.connection.allocator, self.connection);
+        defer virtual_machine.deinitVM();
         return virtual_machine.executeWithParameters(&self.execution_plan, self.parameters);
     }
 
     /// Execute the prepared statement with explicit connection (for backwards compatibility)
     pub fn executeWithConnection(self: *Self, connection: *Connection) !vm.ExecutionResult {
         var virtual_machine = vm.VirtualMachine.init(connection.allocator, connection);
+        defer virtual_machine.deinitVM();
         return virtual_machine.executeWithParameters(&self.execution_plan, self.parameters);
     }
 

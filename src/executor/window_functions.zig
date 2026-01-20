@@ -59,6 +59,35 @@ pub const WindowContext = struct {
         return ctx;
     }
 
+    /// Initialize with ORDER BY clause and explicit partition boundaries
+    pub fn initWithOrderByAndPartition(
+        allocator: std.mem.Allocator,
+        rows: []storage.Row,
+        order_by: ?[]const ast.OrderByClause,
+        column_indices: ?std.StringHashMap(usize),
+        partition_start: usize,
+        partition_end: usize,
+    ) !WindowContext {
+        var ctx = WindowContext{
+            .allocator = allocator,
+            .rows = rows,
+            .current_row = partition_start,
+            .partition_start = partition_start,
+            .partition_end = partition_end,
+            .order_by = order_by,
+            .column_indices = column_indices,
+            .ranks = null,
+            .dense_ranks = null,
+        };
+
+        // Precompute ranks within this partition if we have ORDER BY
+        if (order_by != null and partition_end > partition_start) {
+            try ctx.computeRanks();
+        }
+
+        return ctx;
+    }
+
     /// Compute RANK and DENSE_RANK values for all rows based on ORDER BY
     fn computeRanks(self: *WindowContext) !void {
         const n = self.partition_end - self.partition_start;

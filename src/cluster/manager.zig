@@ -4,6 +4,7 @@ const mvcc = @import("../concurrent/mvcc_transactions.zig");
 const hot_standby = @import("../concurrent/hot_standby.zig");
 const transport = @import("../transport/transport.zig");
 const zsync = @import("zsync");
+const time_utils = @import("../time_utils.zig");
 
 /// Cluster Manager for Horizontal Scaling
 /// Manages multiple nodes, load balancing, and cluster coordination
@@ -22,7 +23,7 @@ pub const ClusterManager = struct {
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, cluster_id: []const u8, local_node_id: []const u8) !Self {
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         const timestamp = ts.sec;
         const local_node = try allocator.create(Node);
         local_node.* = Node{
@@ -52,7 +53,7 @@ pub const ClusterManager = struct {
 
     /// Add node to cluster
     pub fn addNode(self: *Self, node_id: []const u8, address: []const u8, port: u16) !void {
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         const timestamp = ts.sec;
         const node = try self.allocator.create(Node);
         node.* = Node{
@@ -102,7 +103,7 @@ pub const ClusterManager = struct {
 
     /// Route query to appropriate node
     pub fn routeQuery(self: *Self, query: ClusterQuery) !QueryResult {
-        const ts_start = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts_start = time_utils.getTimespec();
         const start_time: i64 = @intCast(@divTrunc((@as(i128, ts_start.sec) * std.time.ns_per_s + ts_start.nsec), 1000));
 
         // Determine target nodes based on query
@@ -121,7 +122,7 @@ pub const ClusterManager = struct {
         // Merge results
         const merged_result = try self.mergeResults(results.items);
 
-        const ts_end = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts_end = time_utils.getTimespec();
         const end_time: i64 = @intCast(@divTrunc((@as(i128, ts_end.sec) * std.time.ns_per_s + ts_end.nsec), 1000));
         const execution_time = end_time - start_time;
 

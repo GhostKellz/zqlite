@@ -97,6 +97,9 @@ else
 pub const error_handling = @import("error_handling/enhanced_errors.zig");
 pub const database_errors = @import("error_handling/database_errors.zig");
 
+// Time utilities (safe timestamp functions)
+pub const time_utils = @import("time_utils.zig");
+
 // PQ-QUIC transport (profile: full, or -Dtransport=true)
 pub const transport = if (build_options.enable_transport)
     struct {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const time_utils = @import("../time_utils.zig");
 const connection = @import("connection.zig");
 const storage = @import("storage.zig");
 
@@ -64,7 +65,7 @@ pub const ConnectionPool = struct {
 
         pooled_conn.pool = self;
         pooled_conn.is_in_use = false;
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         pooled_conn.last_used = ts.sec;
         pooled_conn.id = self.generateConnectionId();
 
@@ -74,7 +75,7 @@ pub const ConnectionPool = struct {
     /// Generate unique connection ID
     fn generateConnectionId(self: *Self) u64 {
         _ = self;
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         return @intCast(ts.sec);
     }
 
@@ -87,7 +88,7 @@ pub const ConnectionPool = struct {
         if (self.available_connections.items.len > 0) {
             const conn = self.available_connections.orderedRemove(0);
             conn.is_in_use = true;
-            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+            const ts = time_utils.getTimespec();
             conn.last_used = ts.sec;
             return conn;
         }
@@ -97,7 +98,7 @@ pub const ConnectionPool = struct {
             const new_conn = try self.createConnection();
             try self.connections.append(self.allocator, new_conn);
             new_conn.is_in_use = true;
-            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+            const ts = time_utils.getTimespec();
             new_conn.last_used = ts.sec;
             self.current_connections += 1;
             return new_conn;
@@ -110,7 +111,7 @@ pub const ConnectionPool = struct {
 
         const conn = self.available_connections.orderedRemove(0);
         conn.is_in_use = true;
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         conn.last_used = ts.sec;
         return conn;
     }
@@ -125,7 +126,7 @@ pub const ConnectionPool = struct {
         }
 
         pooled_conn.is_in_use = false;
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         pooled_conn.last_used = ts.sec;
 
         try self.available_connections.append(self.allocator, pooled_conn);
@@ -151,7 +152,7 @@ pub const ConnectionPool = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         const current_time = ts.sec;
         var i: usize = 0;
 

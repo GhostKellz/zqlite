@@ -1,5 +1,20 @@
 const std = @import("std");
 const crypto = std.crypto;
+const linux = std.os.linux;
+
+/// Get random bytes using Linux getrandom syscall
+fn getRandomBytes(buf: []u8) void {
+    var offset: usize = 0;
+    while (offset < buf.len) {
+        const rc = linux.getrandom(buf.ptr + offset, buf.len - offset, 0);
+        const signed_rc = @as(isize, @bitCast(rc));
+        if (signed_rc < 0) {
+            // EINTR, retry
+            continue;
+        }
+        offset += @as(usize, @bitCast(signed_rc));
+    }
+}
 
 /// Simple encryption module for database files
 pub const Encryption = struct {
@@ -25,7 +40,7 @@ pub const Encryption = struct {
             @memcpy(&encryption.salt, provided_salt);
         } else {
             // Generate cryptographically secure random salt
-            crypto.random.bytes(&encryption.salt);
+            getRandomBytes(&encryption.salt);
         }
 
         // Derive key from password using PBKDF2 with random salt
@@ -102,7 +117,7 @@ pub const Encryption = struct {
 
         // Generate random nonce
         var nonce: [12]u8 = undefined;
-        crypto.random.bytes(&nonce);
+        getRandomBytes(&nonce);
 
         // Copy nonce to output
         @memcpy(output[0..12], &nonce);

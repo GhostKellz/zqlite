@@ -1,6 +1,7 @@
 const std = @import("std");
 const crypto = std.crypto;
 const Allocator = std.mem.Allocator;
+const time_utils = @import("../time_utils.zig");
 
 pub const HDWallet = struct {
     const Self = @This();
@@ -164,7 +165,7 @@ pub const HDWallet = struct {
         const seed = try seedFromMnemonic(mnemonic, passphrase);
         const master_key = try masterKeyFromSeed(seed);
 
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         const timestamp = ts.sec;
         const wallet_id = try std.fmt.allocPrint(allocator, "wallet_{d}", .{timestamp});
 

@@ -1,43 +1,57 @@
 const std = @import("std");
-
-/// Stub file handle for Zig 0.16 compatibility
-const FileHandle = struct {
-    pub fn writeAll(_: *FileHandle, _: []const u8) !void {}
-    pub fn getEndPos(_: *FileHandle) !u64 {
-        return 0;
-    }
-    pub fn setEndPos(_: *FileHandle, _: u64) !void {}
-    pub fn seekTo(_: *FileHandle, _: u64) !u64 {
-        return 0;
-    }
-    pub fn read(_: *FileHandle, _: []u8) !usize {
-        return 0;
-    }
-    pub fn sync(_: *FileHandle) !void {}
-    pub fn close(_: *FileHandle) void {}
-};
+const posix = std.posix;
+const builtin = @import("builtin");
+const native_os = builtin.os.tag;
 
 /// Write-Ahead Log for transaction safety and durability
 pub const WriteAheadLog = struct {
     allocator: std.mem.Allocator,
-    file: ?*FileHandle,
+    fd: ?posix.fd_t,
     is_transaction_active: bool,
     transaction_id: u64,
     log_entries: std.ArrayList(LogEntry),
+    wal_path: []const u8,
 
     const Self = @This();
 
     /// Initialize WAL
     pub fn init(allocator: std.mem.Allocator, db_path: []const u8) !*Self {
-        _ = db_path;
         var wal = try allocator.create(Self);
+        errdefer allocator.destroy(wal);
+
         wal.allocator = allocator;
+        wal.fd = null;
         wal.is_transaction_active = false;
         wal.transaction_id = 0;
         wal.log_entries = .{};
 
-        // Note: File I/O stubbed for Zig 0.16 compatibility
-        wal.file = null;
+        // Create WAL path: db_path + "-wal"
+        const wal_path = try std.fmt.allocPrint(allocator, "{s}-wal", .{db_path});
+        errdefer allocator.free(wal_path);
+        wal.wal_path = wal_path;
+
+        if (comptime native_os == .windows) {
+            allocator.free(wal_path);
+            allocator.destroy(wal);
+            return error.Unsupported;
+        }
+
+        const wal_path_z = try allocator.dupeZ(u8, wal_path);
+        defer allocator.free(wal_path_z);
+
+        // Open or create the WAL file (POSIX path)
+        const fd = posix.openat(posix.AT.FDCWD, wal_path_z, .{
+            .ACCMODE = .RDWR,
+            .CREAT = true,
+        }, 0o644) catch |err| {
+            allocator.free(wal_path);
+            allocator.destroy(wal);
+            return err;
+        };
+        wal.fd = fd;
+
+        // Recover from existing WAL if present
+        try wal.recover();
 
         return wal;
     }
@@ -50,7 +64,7 @@ pub const WriteAheadLog = struct {
 
         self.transaction_id += 1;
         self.is_transaction_active = true;
-        self.log_entries.clearRetainingCapacity();
+        self.clearLogEntries();
 
         // Write BEGIN record
         const begin_entry = LogEntry{
@@ -72,13 +86,19 @@ pub const WriteAheadLog = struct {
             return error.NoActiveTransaction;
         }
 
+        const old_data_copy = try self.allocator.dupe(u8, old_data);
+        errdefer self.allocator.free(old_data_copy);
+
+        const new_data_copy = try self.allocator.dupe(u8, new_data);
+        errdefer self.allocator.free(new_data_copy);
+
         const entry = LogEntry{
             .entry_type = .PageWrite,
             .transaction_id = self.transaction_id,
             .page_id = page_id,
             .offset = offset,
-            .old_data = try self.allocator.dupe(u8, old_data),
-            .new_data = try self.allocator.dupe(u8, new_data),
+            .old_data = old_data_copy,
+            .new_data = new_data_copy,
         };
 
         try self.log_entries.append(self.allocator, entry);
@@ -102,8 +122,10 @@ pub const WriteAheadLog = struct {
         };
 
         try self.writeLogEntry(commit_entry);
-        if (self.file) |file| {
-            try file.sync(); // Ensure commit is durable
+
+        // Sync to ensure commit is durable
+        if (self.fd) |fd| {
+            posix.fdatasync(fd) catch {};
         }
 
         self.is_transaction_active = false;
@@ -133,8 +155,6 @@ pub const WriteAheadLog = struct {
     }
 
     /// Checkpoint - apply WAL changes to main database
-    /// This reads all committed transactions from the WAL and applies their
-    /// page writes to the target pager, then truncates the WAL.
     pub fn checkpoint(self: *Self) !void {
         try self.checkpointToPager(null);
     }
@@ -145,74 +165,142 @@ pub const WriteAheadLog = struct {
             return error.TransactionActive;
         }
 
-        // Stubbed for Zig 0.16 compatibility
-        const file = self.file orelse return;
-        const file_size = try file.getEndPos();
-        if (file_size == 0) return; // No data to checkpoint
+        const file_size = self.getFileSize() catch return;
+        if (file_size == 0) return;
 
         // First pass: collect all committed transaction IDs
         var committed_transactions = std.AutoHashMap(u64, void).init(self.allocator);
         defer committed_transactions.deinit();
 
-        _ = try file.seekTo(0);
+        var position: i64 = 0;
         var buffer: [8192]u8 = undefined;
-        var position: u64 = 0;
 
-        while (position < file_size) {
-            _ = try file.seekTo(position);
-            const bytes_read = try file.read(buffer[0..]);
-            if (bytes_read == 0) break;
+        while (@as(u64, @intCast(position)) < file_size) {
+            const bytes_read = self.readAt(&buffer, position) catch break;
+            if (bytes_read < 25) break;
 
             var buffer_pos: usize = 0;
             while (buffer_pos + 25 <= bytes_read) {
-                const entry = LogEntry.deserialize(self.allocator, buffer[buffer_pos..]) catch break;
+                const entry = LogEntry.deserialize(self.allocator, buffer[buffer_pos..bytes_read]) catch |err| {
+                    if (err == error.BufferTooSmall and buffer_pos == 0 and bytes_read >= 25) {
+                        const old_data_len = std.mem.readInt(u32, buffer[17..21], .little);
+                        const new_data_len = std.mem.readInt(u32, buffer[21..25], .little);
+                        const full_entry_size = 25 + old_data_len + new_data_len;
+                        const remaining_file = file_size - @as(u64, @intCast(position));
+                        if (full_entry_size == 0 or full_entry_size > remaining_file) break;
+
+                        const large_buf = self.allocator.alloc(u8, full_entry_size) catch break;
+                        defer self.allocator.free(large_buf);
+
+                        const large_read = self.readAt(large_buf, position) catch break;
+                        if (large_read < full_entry_size) break;
+
+                        const large_entry = LogEntry.deserialize(self.allocator, large_buf) catch break;
+                        defer {
+                            if (large_entry.old_data.len > 0) self.allocator.free(large_entry.old_data);
+                            if (large_entry.new_data.len > 0) self.allocator.free(large_entry.new_data);
+                        }
+
+                        if (large_entry.entry_type == .Commit) {
+                            committed_transactions.put(large_entry.transaction_id, {}) catch break;
+                        }
+
+                        position += @as(i64, @intCast(full_entry_size));
+                        continue;
+                    }
+                    break;
+                };
                 defer {
-                    self.allocator.free(entry.old_data);
-                    self.allocator.free(entry.new_data);
+                    if (entry.old_data.len > 0) self.allocator.free(entry.old_data);
+                    if (entry.new_data.len > 0) self.allocator.free(entry.new_data);
                 }
 
                 if (entry.entry_type == .Commit) {
                     try committed_transactions.put(entry.transaction_id, {});
                 }
 
-                const entry_size = try self.getEntrySize(&entry);
+                const entry_size = getEntrySize(&entry);
+                if (entry_size == 0 or entry_size > (bytes_read - buffer_pos)) break;
                 buffer_pos += entry_size;
+                position += @as(i64, @intCast(entry_size));
             }
-            position += bytes_read;
+
+            if (buffer_pos == 0) break;
         }
 
         // Second pass: apply page writes from committed transactions
         if (target_pager) |pager_inst| {
-            _ = try file.seekTo(0);
             position = 0;
 
-            while (position < file_size) {
-                _ = try file.seekTo(position);
-                const bytes_read = try file.read(buffer[0..]);
-                if (bytes_read == 0) break;
+            while (@as(u64, @intCast(position)) < file_size) {
+                const bytes_read = self.readAt(&buffer, position) catch break;
+                if (bytes_read < 25) break;
 
                 var buffer_pos: usize = 0;
                 while (buffer_pos + 25 <= bytes_read) {
-                    const entry = LogEntry.deserialize(self.allocator, buffer[buffer_pos..]) catch break;
+                    const entry = LogEntry.deserialize(self.allocator, buffer[buffer_pos..bytes_read]) catch |err| {
+                        if (err == error.BufferTooSmall and buffer_pos == 0 and bytes_read >= 25) {
+                            const old_data_len = std.mem.readInt(u32, buffer[17..21], .little);
+                            const new_data_len = std.mem.readInt(u32, buffer[21..25], .little);
+                            const full_entry_size = 25 + old_data_len + new_data_len;
+                            const remaining_file = file_size - @as(u64, @intCast(position));
+                            if (full_entry_size == 0 or full_entry_size > remaining_file) break;
+
+                            const large_buf = self.allocator.alloc(u8, full_entry_size) catch break;
+                            defer self.allocator.free(large_buf);
+
+                            const large_read = self.readAt(large_buf, position) catch break;
+                            if (large_read < full_entry_size) break;
+
+                            const large_entry = LogEntry.deserialize(self.allocator, large_buf) catch break;
+                            defer {
+                                if (large_entry.old_data.len > 0) self.allocator.free(large_entry.old_data);
+                                if (large_entry.new_data.len > 0) self.allocator.free(large_entry.new_data);
+                            }
+
+                            if (large_entry.entry_type == .PageWrite and committed_transactions.contains(large_entry.transaction_id)) {
+                                const page = pager_inst.getPage(large_entry.page_id) catch {
+                                    position += @as(i64, @intCast(full_entry_size));
+                                    continue;
+                                };
+                                const end_offset = large_entry.offset + @as(u32, @intCast(large_entry.new_data.len));
+                                if (end_offset <= page.data.len) {
+                                    @memcpy(page.data[large_entry.offset..end_offset], large_entry.new_data);
+                                    pager_inst.markDirty(large_entry.page_id) catch {};
+                                }
+                            }
+
+                            position += @as(i64, @intCast(full_entry_size));
+                            continue;
+                        }
+                        break;
+                    };
                     defer {
-                        self.allocator.free(entry.old_data);
-                        self.allocator.free(entry.new_data);
+                        if (entry.old_data.len > 0) self.allocator.free(entry.old_data);
+                        if (entry.new_data.len > 0) self.allocator.free(entry.new_data);
                     }
 
-                    // Apply page writes from committed transactions
                     if (entry.entry_type == .PageWrite and committed_transactions.contains(entry.transaction_id)) {
-                        const page = try pager_inst.getPage(entry.page_id);
+                        const page = pager_inst.getPage(entry.page_id) catch {
+                            const entry_size = getEntrySize(&entry);
+                            position += @as(i64, @intCast(entry_size));
+                            buffer_pos += entry_size;
+                            continue;
+                        };
                         const end_offset = entry.offset + @as(u32, @intCast(entry.new_data.len));
                         if (end_offset <= page.data.len) {
                             @memcpy(page.data[entry.offset..end_offset], entry.new_data);
-                            try pager_inst.markDirty(entry.page_id);
+                            pager_inst.markDirty(entry.page_id) catch {};
                         }
                     }
 
-                    const entry_size = try self.getEntrySize(&entry);
+                    const entry_size = getEntrySize(&entry);
+                    if (entry_size == 0 or entry_size > (bytes_read - buffer_pos)) break;
                     buffer_pos += entry_size;
+                    position += @as(i64, @intCast(entry_size));
                 }
-                position += bytes_read;
+
+                if (buffer_pos == 0) break;
             }
 
             // Flush all dirty pages to disk
@@ -220,104 +308,138 @@ pub const WriteAheadLog = struct {
         }
 
         // Truncate WAL file after successful checkpoint
-        try file.setEndPos(0);
+        self.truncateFile();
     }
 
-    /// Get the size of a log entry for skipping
-    fn getEntrySize(self: *Self, entry: *const LogEntry) !usize {
-        _ = self;
-        // Calculate entry size: header + data lengths + data
+    /// Get the size of a log entry
+    fn getEntrySize(entry: *const LogEntry) usize {
         return 1 + 8 + 4 + 4 + 4 + 4 + entry.old_data.len + entry.new_data.len;
     }
 
     /// Recover from WAL on startup
     fn recover(self: *Self) !void {
-        // Stubbed for Zig 0.16 compatibility
-        const file = self.file orelse return;
-        const file_size = try file.getEndPos();
+        const file_size = self.getFileSize() catch return;
         if (file_size == 0) return;
 
-        _ = try file.seekTo(0);
         var buffer: [8192]u8 = undefined;
-        var position: u64 = 0;
+        var position: i64 = 0;
         var max_transaction_id: u64 = 0;
-        var incomplete_transactions: std.ArrayList(u64) = .{};
-        defer incomplete_transactions.deinit(self.allocator);
 
-        // First pass: find incomplete transactions
-        while (position < file_size) {
-            _ = try file.seekTo(position);
-            const bytes_read = try file.read(buffer[0..]);
-            if (bytes_read == 0) break;
+        while (@as(u64, @intCast(position)) < file_size) {
+            const bytes_read = self.readAt(&buffer, position) catch break;
+            if (bytes_read < 25) break;
 
             var buffer_pos: usize = 0;
+            while (buffer_pos + 25 <= bytes_read) {
+                const entry = LogEntry.deserialize(self.allocator, buffer[buffer_pos..bytes_read]) catch |err| {
+                    if (err == error.BufferTooSmall and buffer_pos == 0 and bytes_read >= 25) {
+                        const old_data_len = std.mem.readInt(u32, buffer[17..21], .little);
+                        const new_data_len = std.mem.readInt(u32, buffer[21..25], .little);
+                        const full_entry_size = 25 + old_data_len + new_data_len;
+                        const remaining_file = file_size - @as(u64, @intCast(position));
+                        if (full_entry_size == 0 or full_entry_size > remaining_file) break;
 
-            while (buffer_pos < bytes_read) {
-                const entry = LogEntry.deserialize(self.allocator, buffer[buffer_pos..]) catch break;
+                        const large_buf = self.allocator.alloc(u8, full_entry_size) catch break;
+                        defer self.allocator.free(large_buf);
+
+                        const large_read = self.readAt(large_buf, position) catch break;
+                        if (large_read < full_entry_size) break;
+
+                        const large_entry = LogEntry.deserialize(self.allocator, large_buf) catch break;
+                        defer {
+                            if (large_entry.old_data.len > 0) self.allocator.free(large_entry.old_data);
+                            if (large_entry.new_data.len > 0) self.allocator.free(large_entry.new_data);
+                        }
+
+                        max_transaction_id = @max(max_transaction_id, large_entry.transaction_id);
+                        position += @as(i64, @intCast(full_entry_size));
+                        continue;
+                    }
+                    break;
+                };
                 defer {
-                    self.allocator.free(entry.old_data);
-                    self.allocator.free(entry.new_data);
+                    if (entry.old_data.len > 0) self.allocator.free(entry.old_data);
+                    if (entry.new_data.len > 0) self.allocator.free(entry.new_data);
                 }
 
                 max_transaction_id = @max(max_transaction_id, entry.transaction_id);
 
-                switch (entry.entry_type) {
-                    .Begin => {
-                        try incomplete_transactions.append(self.allocator, entry.transaction_id);
-                    },
-                    .Commit, .Rollback => {
-                        // Remove from incomplete list
-                        for (incomplete_transactions.items, 0..) |tid, i| {
-                            if (tid == entry.transaction_id) {
-                                _ = incomplete_transactions.swapRemove(i);
-                                break;
-                            }
-                        }
-                    },
-                    .PageWrite => {
-                        // Just track for now
-                    },
-                }
-
-                const entry_size = try self.getEntrySize(&entry);
+                const entry_size = getEntrySize(&entry);
+                if (entry_size == 0 or entry_size > (bytes_read - buffer_pos)) break;
                 buffer_pos += entry_size;
+                position += @as(i64, @intCast(entry_size));
             }
 
-            position += bytes_read;
+            if (buffer_pos == 0) break;
         }
 
-        // Set next transaction ID
         self.transaction_id = max_transaction_id;
-
-        // Log recovery information
-        if (incomplete_transactions.items.len > 0) {
-            std.debug.print("WAL Recovery: Found {d} incomplete transactions\n", .{incomplete_transactions.items.len});
-            for (incomplete_transactions.items) |tid| {
-                std.debug.print("  - Transaction {d} will be rolled back\n", .{tid});
-            }
-        } else {
-            std.debug.print("WAL Recovery: All transactions completed successfully\n", .{});
-        }
     }
 
     /// Write a log entry to the WAL file
     fn writeLogEntry(self: *Self, entry: LogEntry) !void {
-        // Stubbed for Zig 0.16 compatibility
-        const file = self.file orelse return;
-
         // Serialize the log entry
-        var buffer: [1024]u8 = undefined;
-        const serialized = try entry.serialize(buffer[0..]);
+        const max_size = 25 + entry.old_data.len + entry.new_data.len;
+        const buffer = try self.allocator.alloc(u8, max_size);
+        defer self.allocator.free(buffer);
 
-        // Write to WAL file
-        _ = try file.writeAll(serialized);
+        const serialized = try entry.serialize(buffer);
+
+        // Append to WAL file (write at end)
+        const file_size = self.getFileSize() catch 0;
+        try self.writeAtAll(serialized, @as(i64, @intCast(file_size)));
+    }
+
+    fn getFileSize(self: *Self) !u64 {
+        if (self.fd) |fd_val| {
+            return getFdSize(fd_val);
+        }
+        return error.FileNotOpen;
+    }
+
+    fn readAt(self: *Self, buf: []u8, offset: i64) !usize {
+        if (self.fd) |fd_val| {
+            return preadAll(fd_val, buf, offset);
+        }
+        return error.FileNotOpen;
+    }
+
+    fn writeAtAll(self: *Self, buf: []const u8, offset: i64) !void {
+        if (self.fd) |fd_val| {
+            return pwriteAll(fd_val, buf, offset);
+        }
+        return error.FileNotOpen;
+    }
+
+    fn truncateFile(self: *Self) void {
+        if (self.fd) |wal_fd| {
+            if (comptime native_os == .windows) {
+                return;
+            } else if (comptime native_os == .linux) {
+                _ = std.os.linux.ftruncate(wal_fd, 0);
+            } else {
+                _ = std.c.ftruncate(wal_fd, 0);
+            }
+            return;
+        }
     }
 
     /// Clear log entries and free memory
     fn clearLogEntries(self: *Self) void {
         for (self.log_entries.items) |entry| {
-            self.allocator.free(entry.old_data);
-            self.allocator.free(entry.new_data);
+            if (entry.old_data.len > 0) {
+                // Check if this is an allocated slice (not a literal empty slice)
+                const old_ptr = @intFromPtr(entry.old_data.ptr);
+                if (old_ptr != 0) {
+                    self.allocator.free(entry.old_data);
+                }
+            }
+            if (entry.new_data.len > 0) {
+                const new_ptr = @intFromPtr(entry.new_data.ptr);
+                if (new_ptr != 0) {
+                    self.allocator.free(entry.new_data);
+                }
+            }
         }
         self.log_entries.clearRetainingCapacity();
     }
@@ -326,15 +448,119 @@ pub const WriteAheadLog = struct {
     pub fn deinit(self: *Self) void {
         self.clearLogEntries();
         self.log_entries.deinit(self.allocator);
-        if (self.file) |file| {
-            file.close();
+
+        if (self.fd) |fd| {
+            posix.close(fd);
         }
+
+        self.allocator.free(self.wal_path);
         self.allocator.destroy(self);
     }
 };
 
+/// Get file size (cross-platform with platform-specific implementations)
+fn getFdSize(fd: posix.fd_t) !u64 {
+    const SEEK_END = 2;
+    const SEEK_SET = 0;
+
+    if (comptime native_os == .windows) {
+        return error.Unsupported;
+    } else if (comptime native_os == .linux) {
+        const end_rc = std.os.linux.lseek(fd, 0, SEEK_END);
+        if (@as(isize, @bitCast(end_rc)) < 0) {
+            return error.SeekError;
+        }
+        const start_rc = std.os.linux.lseek(fd, 0, SEEK_SET);
+        if (@as(isize, @bitCast(start_rc)) < 0) {
+            return error.SeekError;
+        }
+        return end_rc;
+    } else if (comptime native_os.isDarwin()) {
+        // macOS/Darwin
+        const end_rc = std.c.lseek(fd, 0, SEEK_END);
+        if (end_rc < 0) return error.SeekError;
+        _ = std.c.lseek(fd, 0, SEEK_SET);
+        return @intCast(end_rc);
+    } else {
+        // Fallback for other POSIX systems
+        const end_rc = std.c.lseek(fd, 0, SEEK_END);
+        if (end_rc < 0) return error.SeekError;
+        _ = std.c.lseek(fd, 0, SEEK_SET);
+        return @intCast(end_rc);
+    }
+}
+
+/// Cross-platform pread
+fn preadAll(fd: posix.fd_t, buf: []u8, offset: i64) !usize {
+    var total_read: usize = 0;
+    while (total_read < buf.len) {
+        const current_offset = offset + @as(i64, @intCast(total_read));
+        const remaining = buf.len - total_read;
+
+        const bytes_read: usize = blk: {
+            if (comptime native_os == .windows) {
+                return error.Unsupported;
+            } else if (comptime native_os == .linux) {
+                const rc = std.os.linux.pread(fd, buf.ptr + total_read, remaining, current_offset);
+                const signed_rc = @as(isize, @bitCast(rc));
+                if (signed_rc < 0) {
+                    const errno: usize = @bitCast(-signed_rc);
+                    if (errno == 4) continue; // EINTR
+                    return error.ReadError;
+                }
+                break :blk @bitCast(signed_rc);
+            } else {
+                const rc = std.c.pread(fd, buf.ptr + total_read, remaining, current_offset);
+                if (rc < 0) {
+                    if (std.c._errno().* == 4) continue; // EINTR
+                    return error.ReadError;
+                }
+                break :blk @intCast(rc);
+            }
+        };
+
+        if (bytes_read == 0) break;
+        total_read += bytes_read;
+    }
+    return total_read;
+}
+
+/// Cross-platform pwrite
+fn pwriteAll(fd: posix.fd_t, buf: []const u8, offset: i64) !void {
+    var total_written: usize = 0;
+    while (total_written < buf.len) {
+        const current_offset = offset + @as(i64, @intCast(total_written));
+        const remaining = buf.len - total_written;
+
+        const bytes_written: usize = blk: {
+            if (comptime native_os == .windows) {
+                return error.Unsupported;
+            } else if (comptime native_os == .linux) {
+                const rc = std.os.linux.pwrite(fd, buf.ptr + total_written, remaining, current_offset);
+                const signed_rc = @as(isize, @bitCast(rc));
+                if (signed_rc < 0) {
+                    const errno: usize = @bitCast(-signed_rc);
+                    if (errno == 4) continue; // EINTR
+                    return error.WriteError;
+                }
+                break :blk @bitCast(signed_rc);
+            } else {
+                const rc = std.c.pwrite(fd, buf.ptr + total_written, remaining, current_offset);
+                if (rc < 0) {
+                    if (std.c._errno().* == 4) continue; // EINTR
+                    return error.WriteError;
+                }
+                break :blk @intCast(rc);
+            }
+        };
+
+        if (bytes_written == 0) return error.WriteError;
+        total_written += bytes_written;
+    }
+}
+
 /// WAL log entry types
-const LogEntryType = enum(u8) {
+pub const LogEntryType = enum(u8) {
     Begin = 1,
     PageWrite = 2,
     Commit = 3,
@@ -342,7 +568,7 @@ const LogEntryType = enum(u8) {
 };
 
 /// WAL log entry
-const LogEntry = struct {
+pub const LogEntry = struct {
     entry_type: LogEntryType,
     transaction_id: u64,
     page_id: u32,
@@ -351,10 +577,12 @@ const LogEntry = struct {
     new_data: []const u8,
 
     /// Serialize log entry to bytes
-    fn serialize(self: LogEntry, buffer: []u8) ![]const u8 {
+    pub fn serialize(self: LogEntry, buffer: []u8) ![]const u8 {
+        const required_size = 1 + 8 + 4 + 4 + 4 + 4 + self.old_data.len + self.new_data.len;
+        if (buffer.len < required_size) return error.BufferTooSmall;
+
         var pos: usize = 0;
 
-        // Write header
         buffer[pos] = @intFromEnum(self.entry_type);
         pos += 1;
 
@@ -367,30 +595,31 @@ const LogEntry = struct {
         std.mem.writeInt(u32, buffer[pos..][0..4], self.offset, .little);
         pos += 4;
 
-        // Write data lengths
         std.mem.writeInt(u32, buffer[pos..][0..4], @intCast(self.old_data.len), .little);
         pos += 4;
 
         std.mem.writeInt(u32, buffer[pos..][0..4], @intCast(self.new_data.len), .little);
         pos += 4;
 
-        // Write data
-        @memcpy(buffer[pos..][0..self.old_data.len], self.old_data);
-        pos += self.old_data.len;
+        if (self.old_data.len > 0) {
+            @memcpy(buffer[pos..][0..self.old_data.len], self.old_data);
+            pos += self.old_data.len;
+        }
 
-        @memcpy(buffer[pos..][0..self.new_data.len], self.new_data);
-        pos += self.new_data.len;
+        if (self.new_data.len > 0) {
+            @memcpy(buffer[pos..][0..self.new_data.len], self.new_data);
+            pos += self.new_data.len;
+        }
 
         return buffer[0..pos];
     }
 
     /// Deserialize log entry from bytes
-    fn deserialize(allocator: std.mem.Allocator, buffer: []const u8) !LogEntry {
+    pub fn deserialize(allocator: std.mem.Allocator, buffer: []const u8) !LogEntry {
         if (buffer.len < 25) return error.BufferTooSmall;
 
         var pos: usize = 0;
 
-        // Read header
         const entry_type: LogEntryType = @enumFromInt(buffer[pos]);
         pos += 1;
 
@@ -403,24 +632,30 @@ const LogEntry = struct {
         const offset = std.mem.readInt(u32, buffer[pos..][0..4], .little);
         pos += 4;
 
-        // Read data lengths
         const old_data_len = std.mem.readInt(u32, buffer[pos..][0..4], .little);
         pos += 4;
 
         const new_data_len = std.mem.readInt(u32, buffer[pos..][0..4], .little);
         pos += 4;
 
-        // Check buffer has enough data
         if (buffer.len < pos + old_data_len + new_data_len) return error.BufferTooSmall;
 
-        // Read data
-        const old_data = try allocator.alloc(u8, old_data_len);
-        const new_data = try allocator.alloc(u8, new_data_len);
+        var old_data: []const u8 = &.{};
+        var new_data: []const u8 = &.{};
 
-        @memcpy(old_data, buffer[pos..][0..old_data_len]);
-        pos += old_data_len;
+        if (old_data_len > 0) {
+            const old_data_alloc = try allocator.alloc(u8, old_data_len);
+            @memcpy(old_data_alloc, buffer[pos..][0..old_data_len]);
+            old_data = old_data_alloc;
+            pos += old_data_len;
+        }
 
-        @memcpy(new_data, buffer[pos..][0..new_data_len]);
+        if (new_data_len > 0) {
+            const new_data_alloc = try allocator.alloc(u8, new_data_len);
+            errdefer allocator.free(new_data_alloc);
+            @memcpy(new_data_alloc, buffer[pos..][0..new_data_len]);
+            new_data = new_data_alloc;
+        }
 
         return LogEntry{
             .entry_type = entry_type,
@@ -433,10 +668,72 @@ const LogEntry = struct {
     }
 };
 
-test "wal creation" {
-    try std.testing.expect(true); // Placeholder
+test "wal creation and basic operations" {
+    const allocator = std.testing.allocator;
+    const test_path = "/tmp/zqlite_wal_test.db";
+
+    // Clean up
+    std.fs.cwd().deleteFile(test_path) catch {};
+    std.fs.cwd().deleteFile("/tmp/zqlite_wal_test.db-wal") catch {};
+
+    const wal = try WriteAheadLog.init(allocator, test_path);
+    defer wal.deinit();
+
+    // Test transaction lifecycle
+    try wal.beginTransaction();
+    try std.testing.expect(wal.is_transaction_active);
+
+    try wal.logPageWrite(1, 0, "old", "new");
+    try wal.commit();
+    try std.testing.expect(!wal.is_transaction_active);
+
+    // Clean up
+    std.fs.cwd().deleteFile(test_path) catch {};
+    std.fs.cwd().deleteFile("/tmp/zqlite_wal_test.db-wal") catch {};
 }
 
-test "transaction lifecycle" {
-    try std.testing.expect(true); // Placeholder
+test "wal rollback" {
+    const allocator = std.testing.allocator;
+    const test_path = "/tmp/zqlite_wal_rollback_test.db";
+
+    std.fs.cwd().deleteFile(test_path) catch {};
+    std.fs.cwd().deleteFile("/tmp/zqlite_wal_rollback_test.db-wal") catch {};
+
+    const wal = try WriteAheadLog.init(allocator, test_path);
+    defer wal.deinit();
+
+    try wal.beginTransaction();
+    try wal.logPageWrite(1, 0, "before", "after");
+    try wal.rollback();
+
+    try std.testing.expect(!wal.is_transaction_active);
+
+    std.fs.cwd().deleteFile(test_path) catch {};
+    std.fs.cwd().deleteFile("/tmp/zqlite_wal_rollback_test.db-wal") catch {};
+}
+
+test "wal handles truncated entry safely" {
+    const allocator = std.testing.allocator;
+    const test_path = "/tmp/zqlite_wal_truncated.db";
+
+    std.fs.cwd().deleteFile(test_path) catch {};
+    std.fs.cwd().deleteFile("/tmp/zqlite_wal_truncated.db-wal") catch {};
+
+    const wal = try WriteAheadLog.init(allocator, test_path);
+    defer wal.deinit();
+
+    var header: [25]u8 = undefined;
+    header[0] = @intFromEnum(LogEntryType.PageWrite);
+    std.mem.writeInt(u64, header[1..9], 1, .little);
+    std.mem.writeInt(u32, header[9..13], 1, .little);
+    std.mem.writeInt(u32, header[13..17], 0, .little);
+    std.mem.writeInt(u32, header[17..21], 1024, .little);
+    std.mem.writeInt(u32, header[21..25], 1024, .little);
+
+    try wal.writeAtAll(&header, 0);
+
+    try wal.checkpoint();
+
+    std.fs.cwd().deleteFile(test_path) catch {};
+    std.fs.cwd().deleteFile("/tmp/zqlite_wal_truncated.db-wal") catch {};
 }

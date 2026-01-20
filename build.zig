@@ -322,6 +322,44 @@ pub fn build(b: *std.Build) void {
     const memory_leak_step = b.step("test-memory-leaks", "Run dedicated memory leak detection");
     memory_leak_step.dependOn(&run_memory_leak_test.step);
 
+    // Add window function test
+    const window_test = b.addExecutable(.{
+        .name = "window_test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/window/test_window.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    window_test.root_module.addImport("zqlite", lib.root_module);
+    window_test.root_module.addImport("zsync", zsync.module("zsync"));
+    window_test.root_module.addOptions("build_options", build_options);
+
+    const run_window_test = b.addRunArtifact(window_test);
+
+    const window_test_step = b.step("test-window", "Run window function tests");
+    window_test_step.dependOn(&run_window_test.step);
+
+    // Add comprehensive memory test (INSERT/SELECT/DELETE, JOINs, transactions, etc.)
+    const comprehensive_memory_test = b.addExecutable(.{
+        .name = "comprehensive_memory_test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/memory/comprehensive_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    comprehensive_memory_test.root_module.addImport("zqlite", lib.root_module);
+    comprehensive_memory_test.root_module.addImport("zsync", zsync.module("zsync"));
+    comprehensive_memory_test.root_module.addOptions("build_options", build_options);
+
+    const run_comprehensive_memory_test = b.addRunArtifact(comprehensive_memory_test);
+
+    const comprehensive_memory_test_step = b.step("test-comprehensive-memory", "Run comprehensive memory tests");
+    comprehensive_memory_test_step.dependOn(&run_comprehensive_memory_test.step);
+
     // Add SQL parser fuzzer
     const sql_parser_fuzzer = b.addExecutable(.{
         .name = "sql_parser_fuzzer",
@@ -340,6 +378,21 @@ pub fn build(b: *std.Build) void {
 
     const fuzz_parser_step = b.step("fuzz-parser", "Run SQL parser fuzzer");
     fuzz_parser_step.dependOn(&run_sql_parser_fuzzer.step);
+
+    // Add fuzz example test (separate from main tests to avoid harness protocol issues)
+    const fuzz_example = b.addTest(.{
+        .name = "fuzz_example",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fuzz/fuzz_example.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_fuzz_example = b.addRunArtifact(fuzz_example);
+
+    const fuzz_example_step = b.step("fuzz-example", "Run fuzz example test");
+    fuzz_example_step.dependOn(&run_fuzz_example.step);
 
     // Add logging test
     const logger_test = b.addExecutable(.{

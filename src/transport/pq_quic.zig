@@ -1,4 +1,5 @@
 const std = @import("std");
+const time_utils = @import("../time_utils.zig");
 
 /// ZQLite Post-Quantum QUIC Transport
 ///
@@ -357,7 +358,7 @@ pub const PQQuicTransport = struct {
         fn getNextPacketNumber(self: *PQConnection) u64 {
             // In real implementation, maintain packet number state
             _ = self;
-            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+            const ts = time_utils.getTimespec();
             const timestamp = ts.sec;
             return @as(u64, @intCast(timestamp));
         }
@@ -401,7 +402,7 @@ pub const PQQuicTransport = struct {
 
     /// Connect to server (client)
     pub fn connect(self: *Self, server_address: std.Io.net.IpAddress) !ConnectionId {
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         const timestamp = ts.sec;
         const conn_id = @as(ConnectionId, @intCast(timestamp));
         const connection = try PQConnection.init(self.allocator, conn_id, server_address);
@@ -423,7 +424,7 @@ pub const PQQuicTransport = struct {
         if (!self.is_server) return error.NotAServer;
 
         // In real implementation, would listen for incoming packets
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         const timestamp = ts.sec;
         const conn_id = @as(ConnectionId, @intCast(timestamp));
         const client_addr = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable;

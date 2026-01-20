@@ -4,6 +4,7 @@ const planner = @import("planner.zig");
 const storage = @import("../db/storage.zig");
 const db = @import("../db/connection.zig");
 const functions = @import("functions.zig");
+const window_functions = @import("window_functions.zig");
 
 /// Virtual machine for executing query plans
 pub const VirtualMachine = struct {
@@ -14,6 +15,12 @@ pub const VirtualMachine = struct {
     cte_context: std.StringHashMap(CTEResult),
     /// Current table being scanned (for column name resolution in projection)
     current_table: ?*storage.Table,
+    /// Table alias map: maps alias -> actual table name
+    table_aliases: std.StringHashMap([]const u8),
+    /// Maps alias -> Table pointer for column resolution
+    alias_to_table: std.StringHashMap(*storage.Table),
+    /// Maps alias/table name -> column offset in joined rows
+    alias_column_offset: std.StringHashMap(usize),
 
     const Self = @This();
 
@@ -65,6 +72,9 @@ pub const VirtualMachine = struct {
             .function_evaluator = functions.FunctionEvaluator.init(connection.allocator),
             .cte_context = std.StringHashMap(CTEResult).init(connection.allocator),
             .current_table = null,
+            .table_aliases = std.StringHashMap([]const u8).init(connection.allocator),
+            .alias_to_table = std.StringHashMap(*storage.Table).init(connection.allocator),
+            .alias_column_offset = std.StringHashMap(usize).init(connection.allocator),
         };
     }
 
@@ -72,6 +82,69 @@ pub const VirtualMachine = struct {
     pub fn deinitVM(self: *Self) void {
         self.clearCTEContext();
         self.cte_context.deinit();
+        self.clearTableAliases();
+        self.table_aliases.deinit();
+        self.alias_to_table.deinit();
+        self.alias_column_offset.deinit();
+    }
+
+    /// Clear table aliases
+    fn clearTableAliases(self: *Self) void {
+        var iter = self.table_aliases.iterator();
+        while (iter.next()) |entry| {
+            self.connection.allocator.free(entry.key_ptr.*);
+            self.connection.allocator.free(entry.value_ptr.*);
+        }
+        self.table_aliases.clearRetainingCapacity();
+
+        var alias_iter = self.alias_to_table.iterator();
+        while (alias_iter.next()) |entry| {
+            self.connection.allocator.free(entry.key_ptr.*);
+        }
+        self.alias_to_table.clearRetainingCapacity();
+
+        var offset_iter = self.alias_column_offset.iterator();
+        while (offset_iter.next()) |entry| {
+            self.connection.allocator.free(entry.key_ptr.*);
+        }
+        self.alias_column_offset.clearRetainingCapacity();
+    }
+
+    /// Register a table alias/name without memory leaks (checks for existing key)
+    fn registerTableAlias(self: *Self, name: []const u8, table: *storage.Table) !void {
+        // Check if key already exists to avoid memory leak
+        if (self.alias_to_table.getPtr(name)) |ptr| {
+            // Key exists, just update the value
+            ptr.* = table;
+        } else {
+            // New key, need to dupe it
+            const key = try self.connection.allocator.dupe(u8, name);
+            try self.alias_to_table.put(key, table);
+        }
+    }
+
+    /// Register a column offset without memory leaks (checks for existing key)
+    fn registerColumnOffset(self: *Self, name: []const u8, offset: usize) !void {
+        // Check if key already exists to avoid memory leak
+        if (self.alias_column_offset.getPtr(name)) |ptr| {
+            // Key exists, just update the value
+            ptr.* = offset;
+        } else {
+            // New key, need to dupe it
+            const key = try self.connection.allocator.dupe(u8, name);
+            try self.alias_column_offset.put(key, offset);
+        }
+    }
+
+    /// Parse table name with optional alias (e.g., "customers c" -> "customers", "c")
+    fn parseTableNameWithAlias(self: *Self, table_str: []const u8) !struct { name: []const u8, alias: ?[]const u8 } {
+        // Find space separator
+        if (std.mem.indexOf(u8, table_str, " ")) |space_idx| {
+            const name = try self.connection.allocator.dupe(u8, table_str[0..space_idx]);
+            const alias = try self.connection.allocator.dupe(u8, table_str[space_idx + 1 ..]);
+            return .{ .name = name, .alias = alias };
+        }
+        return .{ .name = try self.connection.allocator.dupe(u8, table_str), .alias = null };
     }
 
     /// Clear all CTE results
@@ -133,6 +206,8 @@ pub const VirtualMachine = struct {
             .CreateCTE => |*cte| try self.executeCreateCTE(cte, result),
             .Pragma => |*pragma| try self.executePragma(pragma, result),
             .Explain => |*explain| try self.executeExplain(explain, result),
+            .SetOperation => |*set_op| try self.executeSetOperation(set_op, result),
+            .Window => |*window| try self.executeWindow(window, result),
         }
     }
 
@@ -210,13 +285,23 @@ pub const VirtualMachine = struct {
             },
             .Pragma => |*pragma| try self.executePragma(pragma, result),
             .Explain => |*explain| try self.executeExplain(explain, result),
+            .SetOperation => {
+                // Nested set operations should be executed via executeStep
+                return error.NestedSetOperationNotSupported;
+            },
+            .Window => |*window| try self.executeWindow(window, result),
         }
     }
 
     /// Execute table scan
     fn executeTableScan(self: *Self, scan: *planner.TableScanStep, result: *ExecutionResult) !void {
+        // Parse table name and optional alias (e.g., "customers c" -> "customers", "c")
+        const parsed = try self.parseTableNameWithAlias(scan.table_name);
+        const actual_table_name = parsed.name;
+        defer self.connection.allocator.free(actual_table_name);
+
         // First check if this is a CTE reference
-        if (self.cte_context.get(scan.table_name)) |cte_result| {
+        if (self.cte_context.get(actual_table_name)) |cte_result| {
             // Use CTE results instead of table
             for (cte_result.rows) |row| {
                 // Clone the row for the result
@@ -226,13 +311,28 @@ pub const VirtualMachine = struct {
                 }
                 try result.rows.append(self.connection.allocator, storage.Row{ .values = cloned_values });
             }
+            if (parsed.alias) |alias| {
+                self.connection.allocator.free(alias);
+            }
             return;
         }
 
         // Executing table scan on actual table
-        const table = self.connection.storage_engine.getTable(scan.table_name) orelse {
+        const table = self.connection.storage_engine.getTable(actual_table_name) orelse {
+            if (parsed.alias) |alias| {
+                self.connection.allocator.free(alias);
+            }
             return error.TableNotFound;
         };
+
+        // Register table alias if present
+        if (parsed.alias) |alias| {
+            try self.registerTableAlias(alias, table);
+            self.connection.allocator.free(alias);
+        }
+
+        // Also register the table name itself for "tablename.column" references
+        try self.registerTableAlias(actual_table_name, table);
 
         // Track the current table for column name resolution in projection
         self.current_table = table;
@@ -293,13 +393,12 @@ pub const VirtualMachine = struct {
         // Create projected rows with only selected columns
         var projected_rows: std.ArrayList(storage.Row) = .{};
 
-        // Track which original indices we're using to properly handle memory
-        const num_cols = if (table) |t| t.schema.columns.len else project.columns.len;
-        var used_indices = try self.connection.allocator.alloc(bool, num_cols);
-        defer self.connection.allocator.free(used_indices);
-
         for (result.rows.items) |original_row| {
+            // Track which original indices we're using (sized based on actual row, not table schema)
+            var used_indices = try self.connection.allocator.alloc(bool, original_row.values.len);
+            defer self.connection.allocator.free(used_indices);
             @memset(used_indices, false);
+
             var projected_values: std.ArrayList(storage.Value) = .{};
 
             for (project.columns, 0..) |col_name, col_i| {
@@ -330,9 +429,24 @@ pub const VirtualMachine = struct {
                     }
                 }
 
-                // Find the column index by name in the table schema
+                // Check if this is a qualified column name (alias.column)
                 var col_idx: ?usize = null;
-                if (table) |t| {
+                if (std.mem.indexOf(u8, col_name, ".")) |dot_idx| {
+                    const alias = col_name[0..dot_idx];
+                    const column = col_name[dot_idx + 1 ..];
+
+                    // Look up the table by alias and get offset
+                    if (self.alias_to_table.get(alias)) |alias_table| {
+                        const col_offset = self.alias_column_offset.get(alias) orelse 0;
+                        for (alias_table.schema.columns, 0..) |col, idx| {
+                            if (std.mem.eql(u8, col.name, column)) {
+                                col_idx = col_offset + idx;
+                                break;
+                            }
+                        }
+                    }
+                } else if (table) |t| {
+                    // Simple column name - look up in current table
                     for (t.schema.columns, 0..) |col, idx| {
                         if (std.mem.eql(u8, col.name, col_name)) {
                             col_idx = idx;
@@ -743,8 +857,21 @@ pub const VirtualMachine = struct {
                 }
             }
 
-            const row = storage.Row{ .values = final_values };
-            try table.insert(row);
+            // Insert the row and get the row_id
+            const row_id = try table.insert(self.connection.allocator, final_values);
+
+            // Log undo entry if in transaction
+            if (self.connection.in_transaction) {
+                const table_name_copy = try self.connection.allocator.dupe(u8, insert.table_name);
+                try self.connection.logUndo(db.UndoEntry{
+                    .operation = .Insert,
+                    .table_name = table_name_copy,
+                    .row_id = row_id,
+                    .new_row_id = null,
+                    .old_values = null,
+                });
+            }
+
             result.affected_rows += 1;
         }
     }
@@ -797,7 +924,7 @@ pub const VirtualMachine = struct {
         result.affected_rows = 1;
     }
 
-    /// Execute update
+    /// Execute update using logical updates with transaction undo support
     fn executeUpdate(self: *Self, update: *planner.UpdateStep, result: *ExecutionResult) !void {
         const table = self.connection.storage_engine.getTable(update.table_name) orelse {
             return error.TableNotFound;
@@ -806,40 +933,30 @@ pub const VirtualMachine = struct {
         // Track the current table for column name resolution in condition evaluation
         self.current_table = table;
 
-        // Get all current rows
-        const all_rows = try table.select(self.connection.allocator);
+        // Get all current rows with their keys for proper update tracking
+        const all_rows = try table.selectWithKeys(self.connection.allocator);
         defer {
-            for (all_rows) |row| {
-                for (row.values) |value| {
+            for (all_rows) |item| {
+                for (item.row.values) |value| {
                     value.deinit(self.connection.allocator);
                 }
-                self.connection.allocator.free(row.values);
+                self.connection.allocator.free(item.row.values);
             }
             self.connection.allocator.free(all_rows);
         }
 
         var updated_count: u32 = 0;
-        var updated_rows: std.ArrayList(storage.Row) = .{};
-        defer {
-            for (updated_rows.items) |row| {
-                for (row.values) |value| {
-                    value.deinit(self.connection.allocator);
-                }
-                self.connection.allocator.free(row.values);
-            }
-            updated_rows.deinit(self.connection.allocator);
-        }
 
-        for (all_rows) |row| {
+        for (all_rows) |item| {
             // Check if row matches condition
             var matches = true;
             if (update.condition) |condition| {
-                matches = try self.evaluateCondition(&condition, &row);
+                matches = try self.evaluateCondition(&condition, &item.row);
             }
 
             if (matches) {
                 // Create updated row by cloning the original and applying changes
-                var updated_values = try self.connection.allocator.alloc(storage.Value, row.values.len);
+                var updated_values = try self.connection.allocator.alloc(storage.Value, item.row.values.len);
                 var values_cloned: usize = 0;
                 errdefer {
                     for (updated_values[0..values_cloned]) |value| {
@@ -848,7 +965,7 @@ pub const VirtualMachine = struct {
                     self.connection.allocator.free(updated_values);
                 }
 
-                for (row.values, 0..) |value, i| {
+                for (item.row.values, 0..) |value, i| {
                     updated_values[i] = try self.cloneValue(value);
                     values_cloned = i + 1;
                 }
@@ -870,95 +987,31 @@ pub const VirtualMachine = struct {
                     }
                 }
 
-                try updated_rows.append(self.connection.allocator, storage.Row{ .values = updated_values });
+                // Get the new row_id before updating (it will be table.row_count)
+                const new_row_id: i64 = @intCast(table.row_count);
+
+                // Log undo entry before updating (if in transaction)
+                if (self.connection.in_transaction) {
+                    const table_name_copy = try self.connection.allocator.dupe(u8, update.table_name);
+                    try self.connection.logUndo(db.UndoEntry{
+                        .operation = .Update,
+                        .table_name = table_name_copy,
+                        .row_id = item.key, // old row_id to restore
+                        .new_row_id = new_row_id, // new row_id to delete on rollback
+                        .old_values = null, // Using logical deletes, old row is still in btree
+                    });
+                }
+
+                // Perform logical update (marks old as deleted, inserts new)
+                try table.updateRow(self.connection.allocator, item.key, updated_values);
                 updated_count += 1;
-            } else {
-                // Keep the original row unchanged
-                var cloned_values = try self.connection.allocator.alloc(storage.Value, row.values.len);
-                var values_cloned: usize = 0;
-                errdefer {
-                    for (cloned_values[0..values_cloned]) |value| {
-                        value.deinit(self.connection.allocator);
-                    }
-                    self.connection.allocator.free(cloned_values);
-                }
-
-                for (row.values, 0..) |value, i| {
-                    cloned_values[i] = try self.cloneValue(value);
-                    values_cloned = i + 1;
-                }
-                try updated_rows.append(self.connection.allocator, storage.Row{ .values = cloned_values });
             }
-        }
-
-        // Replace the table data with updated rows
-        // For now, we'll recreate the table (in a real implementation, we'd have proper update methods)
-        const table_name = try self.connection.allocator.dupe(u8, update.table_name);
-        defer self.connection.allocator.free(table_name);
-
-        // Clone table schema before dropping the table to avoid use-after-free
-        var cloned_columns = try self.connection.allocator.alloc(storage.Column, table.schema.columns.len);
-        var columns_cloned: usize = 0;
-        errdefer {
-            // Clean up cloned columns on error
-            for (cloned_columns[0..columns_cloned]) |column| {
-                self.connection.allocator.free(column.name);
-                if (column.default_value) |default_value| {
-                    default_value.deinit(self.connection.allocator);
-                }
-            }
-            self.connection.allocator.free(cloned_columns);
-        }
-
-        for (table.schema.columns, 0..) |column, i| {
-            cloned_columns[i] = storage.Column{
-                .name = try self.connection.allocator.dupe(u8, column.name),
-                .data_type = column.data_type,
-                .is_primary_key = column.is_primary_key,
-                .is_nullable = column.is_nullable,
-                .default_value = if (column.default_value) |default_value|
-                    try self.cloneStorageDefaultValue(default_value)
-                else
-                    null,
-            };
-            columns_cloned = i + 1;
-        }
-
-        var cloned_schema = storage.TableSchema{
-            .columns = cloned_columns,
-        };
-
-        // Drop and recreate table with updated data
-        try self.connection.storage_engine.dropTable(update.table_name);
-        try self.connection.storage_engine.createTable(table_name, cloned_schema);
-
-        // Clean up temporary schema (storage engine has its own clone now)
-        cloned_schema.deinit(self.connection.allocator);
-
-        // Reinsert all rows
-        const new_table = self.connection.storage_engine.getTable(update.table_name).?;
-        for (updated_rows.items) |row| {
-            // Clone the row for insertion
-            var insert_values = try self.connection.allocator.alloc(storage.Value, row.values.len);
-            var values_cloned: usize = 0;
-            errdefer {
-                for (insert_values[0..values_cloned]) |value| {
-                    value.deinit(self.connection.allocator);
-                }
-                self.connection.allocator.free(insert_values);
-            }
-
-            for (row.values, 0..) |value, i| {
-                insert_values[i] = try self.cloneValue(value);
-                values_cloned = i + 1;
-            }
-            try new_table.insert(storage.Row{ .values = insert_values });
         }
 
         result.affected_rows = updated_count;
     }
 
-    /// Execute delete
+    /// Execute delete using logical deletes with transaction undo support
     fn executeDelete(self: *Self, delete: *planner.DeleteStep, result: *ExecutionResult) !void {
         const table = self.connection.storage_engine.getTable(delete.table_name) orelse {
             return error.TableNotFound;
@@ -967,120 +1020,43 @@ pub const VirtualMachine = struct {
         // Track the current table for column name resolution in condition evaluation
         self.current_table = table;
 
-        // Get all current rows
-        const all_rows = try table.select(self.connection.allocator);
+        // Get all current rows with their keys for logical deletion
+        const all_rows = try table.selectWithKeys(self.connection.allocator);
         defer {
-            for (all_rows) |row| {
-                for (row.values) |value| {
+            for (all_rows) |item| {
+                for (item.row.values) |value| {
                     value.deinit(self.connection.allocator);
                 }
-                self.connection.allocator.free(row.values);
+                self.connection.allocator.free(item.row.values);
             }
             self.connection.allocator.free(all_rows);
         }
 
         var deleted_count: u32 = 0;
-        var surviving_rows: std.ArrayList(storage.Row) = .{};
-        defer {
-            for (surviving_rows.items) |row| {
-                for (row.values) |value| {
-                    value.deinit(self.connection.allocator);
-                }
-                self.connection.allocator.free(row.values);
-            }
-            surviving_rows.deinit(self.connection.allocator);
-        }
 
-        for (all_rows) |row| {
+        for (all_rows) |item| {
             // Check if row matches delete condition
             var should_delete = true;
             if (delete.condition) |condition| {
-                should_delete = try self.evaluateCondition(&condition, &row);
+                should_delete = try self.evaluateCondition(&condition, &item.row);
             }
 
             if (should_delete) {
+                // Log undo entry before deleting (if in transaction)
+                if (self.connection.in_transaction) {
+                    const table_name_copy = try self.connection.allocator.dupe(u8, delete.table_name);
+                    try self.connection.logUndo(db.UndoEntry{
+                        .operation = .Delete,
+                        .table_name = table_name_copy,
+                        .row_id = item.key,
+                        .new_row_id = null,
+                        .old_values = null, // Using logical deletes, row is still in btree
+                    });
+                }
+
+                // Perform logical delete
+                try table.delete(self.connection.allocator, item.key);
                 deleted_count += 1;
-            } else {
-                // Keep this row - clone it for the surviving rows
-                var cloned_values = try self.connection.allocator.alloc(storage.Value, row.values.len);
-                var values_cloned: usize = 0;
-                errdefer {
-                    for (cloned_values[0..values_cloned]) |value| {
-                        value.deinit(self.connection.allocator);
-                    }
-                    self.connection.allocator.free(cloned_values);
-                }
-
-                for (row.values, 0..) |value, i| {
-                    cloned_values[i] = try self.cloneValue(value);
-                    values_cloned = i + 1;
-                }
-                try surviving_rows.append(self.connection.allocator, storage.Row{ .values = cloned_values });
-            }
-        }
-
-        // Replace the table data with surviving rows
-        if (deleted_count > 0) {
-            const table_name = try self.connection.allocator.dupe(u8, delete.table_name);
-            defer self.connection.allocator.free(table_name);
-
-            // Clone table schema before dropping the table to avoid use-after-free
-            var cloned_columns = try self.connection.allocator.alloc(storage.Column, table.schema.columns.len);
-            var columns_cloned: usize = 0;
-            errdefer {
-                // Clean up cloned columns on error
-                for (cloned_columns[0..columns_cloned]) |column| {
-                    self.connection.allocator.free(column.name);
-                    if (column.default_value) |default_value| {
-                        default_value.deinit(self.connection.allocator);
-                    }
-                }
-                self.connection.allocator.free(cloned_columns);
-            }
-
-            for (table.schema.columns, 0..) |column, i| {
-                cloned_columns[i] = storage.Column{
-                    .name = try self.connection.allocator.dupe(u8, column.name),
-                    .data_type = column.data_type,
-                    .is_primary_key = column.is_primary_key,
-                    .is_nullable = column.is_nullable,
-                    .default_value = if (column.default_value) |default_value|
-                        try self.cloneStorageDefaultValue(default_value)
-                    else
-                        null,
-                };
-                columns_cloned = i + 1;
-            }
-
-            var cloned_schema = storage.TableSchema{
-                .columns = cloned_columns,
-            };
-
-            // Drop and recreate table with remaining data
-            try self.connection.storage_engine.dropTable(delete.table_name);
-            try self.connection.storage_engine.createTable(table_name, cloned_schema);
-
-            // Clean up temporary schema (storage engine has its own clone now)
-            cloned_schema.deinit(self.connection.allocator);
-
-            // Reinsert surviving rows
-            const new_table = self.connection.storage_engine.getTable(delete.table_name).?;
-            for (surviving_rows.items) |row| {
-                // Clone the row for insertion
-                var insert_values = try self.connection.allocator.alloc(storage.Value, row.values.len);
-                var values_cloned: usize = 0;
-                errdefer {
-                    for (insert_values[0..values_cloned]) |value| {
-                        value.deinit(self.connection.allocator);
-                    }
-                    self.connection.allocator.free(insert_values);
-                }
-
-                for (row.values, 0..) |value, i| {
-                    insert_values[i] = try self.cloneValue(value);
-                    values_cloned = i + 1;
-                }
-                try new_table.insert(storage.Row{ .values = insert_values });
             }
         }
 
@@ -1490,6 +1466,30 @@ pub const VirtualMachine = struct {
     fn evaluateExpression(self: *Self, expression: *const ast.Expression, row: *const storage.Row) !storage.Value {
         return switch (expression.*) {
             .Column => |col_name| {
+                // Check if this is a qualified name (alias.column or table.column)
+                if (std.mem.indexOf(u8, col_name, ".")) |dot_idx| {
+                    const alias = col_name[0..dot_idx];
+                    const column = col_name[dot_idx + 1 ..];
+
+                    // Look up the table by alias
+                    if (self.alias_to_table.get(alias)) |table| {
+                        // Get the column offset for this alias (for joined rows)
+                        const col_offset = self.alias_column_offset.get(alias) orelse 0;
+
+                        for (table.schema.columns, 0..) |col, idx| {
+                            if (std.mem.eql(u8, col.name, column)) {
+                                const actual_idx = col_offset + idx;
+                                if (actual_idx < row.values.len) {
+                                    return try self.cloneValue(row.values[actual_idx]);
+                                } else {
+                                    return storage.Value.Null;
+                                }
+                            }
+                        }
+                    }
+                    // Alias not found - fall through to simple column lookup
+                }
+
                 // Look up column by name using current table schema
                 if (self.current_table) |table| {
                     for (table.schema.columns, 0..) |col, idx| {
@@ -1627,13 +1627,51 @@ pub const VirtualMachine = struct {
 
     /// Execute nested loop join (simple but works for all join types)
     fn executeNestedLoopJoin(self: *Self, join: *planner.NestedLoopJoinStep, result: *ExecutionResult) !void {
-        // Get tables
-        const left_table = self.connection.storage_engine.getTable(join.left_table) orelse {
+        // Clear any existing rows from previous steps (join reads directly from tables)
+        for (result.rows.items) |row| {
+            for (row.values) |value| {
+                value.deinit(self.connection.allocator);
+            }
+            self.connection.allocator.free(row.values);
+        }
+        result.rows.clearRetainingCapacity();
+
+        // Parse table names with aliases (e.g., "customers c" -> "customers", "c")
+        const left_parsed = try self.parseTableNameWithAlias(join.left_table);
+        defer self.connection.allocator.free(left_parsed.name);
+        defer if (left_parsed.alias) |a| self.connection.allocator.free(a);
+
+        const right_parsed = try self.parseTableNameWithAlias(join.right_table);
+        defer self.connection.allocator.free(right_parsed.name);
+        defer if (right_parsed.alias) |a| self.connection.allocator.free(a);
+
+        // Get tables using parsed names
+        const left_table = self.connection.storage_engine.getTable(left_parsed.name) orelse {
             return error.TableNotFound;
         };
-        const right_table = self.connection.storage_engine.getTable(join.right_table) orelse {
+        const right_table = self.connection.storage_engine.getTable(right_parsed.name) orelse {
             return error.TableNotFound;
         };
+
+        // Register aliases for column resolution
+        if (left_parsed.alias) |alias| {
+            try self.registerTableAlias(alias, left_table);
+            try self.registerColumnOffset(alias, 0);
+        }
+        // Also register by table name
+        try self.registerTableAlias(left_parsed.name, left_table);
+        try self.registerColumnOffset(left_parsed.name, 0);
+
+        // Right table offset starts after all left table columns
+        const right_offset = left_table.schema.columns.len;
+
+        if (right_parsed.alias) |alias| {
+            try self.registerTableAlias(alias, right_table);
+            try self.registerColumnOffset(alias, right_offset);
+        }
+        // Also register by table name
+        try self.registerTableAlias(right_parsed.name, right_table);
+        try self.registerColumnOffset(right_parsed.name, right_offset);
 
         // Get all rows from both tables
         const left_rows = try left_table.select(self.connection.allocator);
@@ -1735,13 +1773,49 @@ pub const VirtualMachine = struct {
 
     /// Execute hash join (optimized for equi-joins)
     fn executeHashJoin(self: *Self, join: *planner.HashJoinStep, result: *ExecutionResult) !void {
-        // Get tables
-        const left_table = self.connection.storage_engine.getTable(join.left_table) orelse {
+        // Clear any existing rows from previous steps (join reads directly from tables)
+        for (result.rows.items) |row| {
+            for (row.values) |value| {
+                value.deinit(self.connection.allocator);
+            }
+            self.connection.allocator.free(row.values);
+        }
+        result.rows.clearRetainingCapacity();
+
+        // Parse table names with aliases (e.g., "customers c" -> "customers", "c")
+        const left_parsed = try self.parseTableNameWithAlias(join.left_table);
+        defer self.connection.allocator.free(left_parsed.name);
+        defer if (left_parsed.alias) |a| self.connection.allocator.free(a);
+
+        const right_parsed = try self.parseTableNameWithAlias(join.right_table);
+        defer self.connection.allocator.free(right_parsed.name);
+        defer if (right_parsed.alias) |a| self.connection.allocator.free(a);
+
+        // Get tables using parsed names
+        const left_table = self.connection.storage_engine.getTable(left_parsed.name) orelse {
             return error.TableNotFound;
         };
-        const right_table = self.connection.storage_engine.getTable(join.right_table) orelse {
+        const right_table = self.connection.storage_engine.getTable(right_parsed.name) orelse {
             return error.TableNotFound;
         };
+
+        // Register aliases for column resolution
+        if (left_parsed.alias) |alias| {
+            try self.registerTableAlias(alias, left_table);
+            try self.registerColumnOffset(alias, 0);
+        }
+        try self.registerTableAlias(left_parsed.name, left_table);
+        try self.registerColumnOffset(left_parsed.name, 0);
+
+        // Right table offset starts after all left table columns
+        const right_offset = left_table.schema.columns.len;
+
+        if (right_parsed.alias) |alias| {
+            try self.registerTableAlias(alias, right_table);
+            try self.registerColumnOffset(alias, right_offset);
+        }
+        try self.registerTableAlias(right_parsed.name, right_table);
+        try self.registerColumnOffset(right_parsed.name, right_offset);
 
         // Get all rows from both tables
         const left_rows = try left_table.select(self.connection.allocator);
@@ -2687,6 +2761,442 @@ pub const VirtualMachine = struct {
         }
     }
 
+    /// Execute a basic query step (no CTEs or nested set operations - breaks recursion)
+    fn executeBasicStep(self: *Self, step: *planner.ExecutionStep, result: *ExecutionResult) !void {
+        switch (step.*) {
+            .TableScan => |*scan| try self.executeTableScan(scan, result),
+            .Filter => |*filter| try self.executeFilter(filter, result),
+            .Project => |*project| try self.executeProject(project, result),
+            .Limit => |*limit| try self.executeLimit(limit, result),
+            .NestedLoopJoin => |*join| try self.executeNestedLoopJoin(join, result),
+            .HashJoin => |*join| try self.executeHashJoin(join, result),
+            .Aggregate => |*agg| try self.executeAggregate(agg, result),
+            .GroupBy => |*group| try self.executeGroupBy(group, result),
+            .Window => |*window| try self.executeWindow(window, result),
+            else => return error.UnsupportedStepInSetOperation,
+        }
+    }
+
+    /// Execute set operation (UNION/INTERSECT/EXCEPT)
+    fn executeSetOperation(self: *Self, set_op: *planner.SetOperationStep, result: *ExecutionResult) !void {
+        const allocator = self.connection.allocator;
+
+        // Execute left side
+        var left_result = ExecutionResult{
+            .rows = .{},
+            .affected_rows = 0,
+            .connection = self.connection,
+        };
+        defer left_result.deinit();
+
+        for (set_op.left_steps) |*step| {
+            try self.executeBasicStep(step, &left_result);
+        }
+
+        // Execute right side
+        var right_result = ExecutionResult{
+            .rows = .{},
+            .affected_rows = 0,
+            .connection = self.connection,
+        };
+        defer right_result.deinit();
+
+        for (set_op.right_steps) |*step| {
+            try self.executeBasicStep(step, &right_result);
+        }
+
+        // Perform the set operation
+        switch (set_op.operation) {
+            .Union => {
+                // UNION removes duplicates
+                try self.unionRows(&left_result.rows, &right_result.rows, result, false);
+            },
+            .UnionAll => {
+                // UNION ALL keeps all rows
+                try self.unionRows(&left_result.rows, &right_result.rows, result, true);
+            },
+            .Intersect => {
+                // INTERSECT returns only rows in both
+                try self.intersectRows(&left_result.rows, &right_result.rows, result, false);
+            },
+            .IntersectAll => {
+                // INTERSECT ALL keeps duplicates
+                try self.intersectRows(&left_result.rows, &right_result.rows, result, true);
+            },
+            .Except => {
+                // EXCEPT returns rows in left but not in right
+                try self.exceptRows(&left_result.rows, &right_result.rows, result, false);
+            },
+            .ExceptAll => {
+                // EXCEPT ALL keeps duplicates
+                try self.exceptRows(&left_result.rows, &right_result.rows, result, true);
+            },
+        }
+
+        // Apply ORDER BY if specified
+        if (set_op.order_by) |order_by| {
+            try self.sortResultRows(result, order_by);
+        }
+
+        // Apply LIMIT/OFFSET if specified
+        if (set_op.offset) |offset| {
+            // Remove first 'offset' rows
+            const actual_offset = @min(offset, result.rows.items.len);
+            // Free the rows being removed
+            for (result.rows.items[0..actual_offset]) |row| {
+                for (row.values) |value| {
+                    value.deinit(allocator);
+                }
+                allocator.free(row.values);
+            }
+            // Shift remaining rows
+            if (actual_offset < result.rows.items.len) {
+                std.mem.copyForwards(storage.Row, result.rows.items[0..], result.rows.items[actual_offset..]);
+            }
+            result.rows.shrinkRetainingCapacity(result.rows.items.len - actual_offset);
+        }
+
+        if (set_op.limit) |limit| {
+            // Keep only first 'limit' rows
+            const actual_limit = @min(limit, result.rows.items.len);
+            // Free extra rows
+            for (result.rows.items[actual_limit..]) |row| {
+                for (row.values) |value| {
+                    value.deinit(allocator);
+                }
+                allocator.free(row.values);
+            }
+            result.rows.shrinkRetainingCapacity(actual_limit);
+        }
+    }
+
+    /// Union two row sets
+    fn unionRows(self: *Self, left: *std.ArrayList(storage.Row), right: *std.ArrayList(storage.Row), result: *ExecutionResult, keep_duplicates: bool) !void {
+        const allocator = self.connection.allocator;
+
+        // Add all left rows
+        for (left.items) |row| {
+            var cloned_values = try allocator.alloc(storage.Value, row.values.len);
+            for (row.values, 0..) |value, i| {
+                cloned_values[i] = try value.clone(allocator);
+            }
+            try result.rows.append(allocator, storage.Row{ .values = cloned_values });
+        }
+
+        // Add right rows (checking for duplicates if needed)
+        for (right.items) |row| {
+            if (!keep_duplicates) {
+                // Check if row already exists
+                var found = false;
+                for (result.rows.items) |existing| {
+                    if (self.rowsEqual(existing, row)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) continue;
+            }
+
+            var cloned_values = try allocator.alloc(storage.Value, row.values.len);
+            for (row.values, 0..) |value, i| {
+                cloned_values[i] = try value.clone(allocator);
+            }
+            try result.rows.append(allocator, storage.Row{ .values = cloned_values });
+        }
+    }
+
+    /// Intersect two row sets
+    fn intersectRows(self: *Self, left: *std.ArrayList(storage.Row), right: *std.ArrayList(storage.Row), result: *ExecutionResult, keep_duplicates: bool) !void {
+        const allocator = self.connection.allocator;
+
+        for (left.items) |left_row| {
+            // Check if this row exists in right
+            var found = false;
+            for (right.items) |right_row| {
+                if (self.rowsEqual(left_row, right_row)) {
+                    found = true;
+                    break;
+                }
+            }
+
+            if (found) {
+                // Check for duplicates in result if needed
+                if (!keep_duplicates) {
+                    var already_added = false;
+                    for (result.rows.items) |existing| {
+                        if (self.rowsEqual(existing, left_row)) {
+                            already_added = true;
+                            break;
+                        }
+                    }
+                    if (already_added) continue;
+                }
+
+                var cloned_values = try allocator.alloc(storage.Value, left_row.values.len);
+                for (left_row.values, 0..) |value, i| {
+                    cloned_values[i] = try value.clone(allocator);
+                }
+                try result.rows.append(allocator, storage.Row{ .values = cloned_values });
+            }
+        }
+    }
+
+    /// Except (difference) two row sets
+    fn exceptRows(self: *Self, left: *std.ArrayList(storage.Row), right: *std.ArrayList(storage.Row), result: *ExecutionResult, keep_duplicates: bool) !void {
+        const allocator = self.connection.allocator;
+
+        for (left.items) |left_row| {
+            // Check if this row exists in right
+            var found_in_right = false;
+            for (right.items) |right_row| {
+                if (self.rowsEqual(left_row, right_row)) {
+                    found_in_right = true;
+                    break;
+                }
+            }
+
+            if (!found_in_right) {
+                // Check for duplicates in result if needed
+                if (!keep_duplicates) {
+                    var already_added = false;
+                    for (result.rows.items) |existing| {
+                        if (self.rowsEqual(existing, left_row)) {
+                            already_added = true;
+                            break;
+                        }
+                    }
+                    if (already_added) continue;
+                }
+
+                var cloned_values = try allocator.alloc(storage.Value, left_row.values.len);
+                for (left_row.values, 0..) |value, i| {
+                    cloned_values[i] = try value.clone(allocator);
+                }
+                try result.rows.append(allocator, storage.Row{ .values = cloned_values });
+            }
+        }
+    }
+
+    /// Check if two rows are equal
+    fn rowsEqual(self: *Self, a: storage.Row, b: storage.Row) bool {
+        if (a.values.len != b.values.len) return false;
+
+        for (a.values, b.values) |va, vb| {
+            if (!self.valuesEqual(va, vb)) return false;
+        }
+        return true;
+    }
+
+    /// Execute window function step - applies window functions to the result set
+    fn executeWindow(self: *Self, window_step: *planner.WindowStep, result: *ExecutionResult) !void {
+        const allocator = self.connection.allocator;
+
+        if (result.rows.items.len == 0) return;
+
+        // Build mapping from column name to index in the RAW table rows
+        var raw_column_indices = std.StringHashMap(usize).init(allocator);
+        defer raw_column_indices.deinit();
+
+        if (self.current_table) |table| {
+            for (table.schema.columns, 0..) |col, i| {
+                try raw_column_indices.put(col.name, i);
+            }
+        }
+
+        // First, project the non-window columns from each row
+        // This transforms rows from [id, name, department, salary] to [name, salary]
+        var projected_rows: std.ArrayList(storage.Row) = .{};
+
+        for (result.rows.items) |original_row| {
+            // Extract only the projected columns
+            const num_projected = window_step.projected_columns.len;
+            const num_window_funcs = window_step.window_functions.len;
+            var new_values = try allocator.alloc(storage.Value, num_projected + num_window_funcs);
+
+            // Project each non-window column
+            for (window_step.projected_columns, 0..) |col_name, i| {
+                if (raw_column_indices.get(col_name)) |raw_idx| {
+                    if (raw_idx < original_row.values.len) {
+                        // Clone the value (since we'll free the original row)
+                        new_values[i] = try self.cloneValue(original_row.values[raw_idx]);
+                    } else {
+                        new_values[i] = storage.Value.Null;
+                    }
+                } else {
+                    new_values[i] = storage.Value.Null;
+                }
+            }
+
+            // Initialize window function slots to Null (will be filled below)
+            for (num_projected..num_projected + num_window_funcs) |i| {
+                new_values[i] = storage.Value.Null;
+            }
+
+            try projected_rows.append(allocator, storage.Row{ .values = new_values });
+
+            // Free the original row values
+            for (original_row.values) |value| {
+                value.deinit(allocator);
+            }
+            allocator.free(original_row.values);
+        }
+
+        // Replace result rows with projected rows
+        result.rows.deinit(allocator);
+        result.rows = projected_rows;
+
+        // Build column name to index mapping for the PROJECTED rows
+        // (now "salary" is at index 1, not index 3)
+        var column_indices = std.StringHashMap(usize).init(allocator);
+        defer column_indices.deinit();
+
+        for (window_step.projected_columns, 0..) |col_name, i| {
+            try column_indices.put(col_name, i);
+        }
+
+        // Create window executor
+        var executor = window_functions.WindowExecutor.init(allocator);
+
+        // Process each window function
+        for (window_step.window_functions, 0..) |window_func, wf_idx| {
+            const window_slot = window_step.projected_columns.len + wf_idx;
+
+            // Check if this window function has PARTITION BY
+            if (window_func.window_spec.partition_by) |partition_cols| {
+                // Get partition column indices
+                var partition_indices: std.ArrayList(usize) = .{};
+                defer partition_indices.deinit(allocator);
+
+                for (partition_cols) |col_name| {
+                    if (column_indices.get(col_name)) |idx| {
+                        try partition_indices.append(allocator, idx);
+                    }
+                }
+
+                // Find partition boundaries
+                const partitions = try self.findPartitionBoundaries(result.rows.items, partition_indices.items);
+                defer allocator.free(partitions);
+
+                // Process each partition
+                for (partitions) |partition| {
+                    var context = try window_functions.WindowContext.initWithOrderByAndPartition(
+                        allocator,
+                        result.rows.items,
+                        window_func.window_spec.order_by,
+                        column_indices,
+                        partition.start,
+                        partition.end,
+                    );
+                    defer context.deinit();
+
+                    // Execute window function for each row in this partition
+                    var i = partition.start;
+                    while (i < partition.end) : (i += 1) {
+                        context.current_row = i;
+                        const window_value = try executor.executeWindowFunction(window_func, &context);
+                        result.rows.items[i].values[window_slot].deinit(allocator);
+                        result.rows.items[i].values[window_slot] = window_value;
+                    }
+                }
+            } else {
+                // No PARTITION BY - treat all rows as one partition
+                var context = try window_functions.WindowContext.initWithOrderBy(
+                    allocator,
+                    result.rows.items,
+                    window_func.window_spec.order_by,
+                    column_indices,
+                );
+                defer context.deinit();
+
+                // Execute window function for each row
+                for (result.rows.items, 0..) |*row, i| {
+                    context.current_row = i;
+                    const window_value = try executor.executeWindowFunction(window_func, &context);
+                    row.values[window_slot].deinit(allocator);
+                    row.values[window_slot] = window_value;
+                }
+            }
+        }
+    }
+
+    /// Partition boundary info
+    const PartitionBoundary = struct {
+        start: usize,
+        end: usize,
+    };
+
+    /// Find partition boundaries based on partition column values
+    fn findPartitionBoundaries(self: *Self, rows: []storage.Row, partition_indices: []const usize) ![]PartitionBoundary {
+        const allocator = self.connection.allocator;
+
+        if (rows.len == 0) {
+            return try allocator.alloc(PartitionBoundary, 0);
+        }
+
+        var boundaries: std.ArrayList(PartitionBoundary) = .{};
+
+        var partition_start: usize = 0;
+        var i: usize = 1;
+
+        while (i < rows.len) : (i += 1) {
+            // Check if partition key changed
+            var key_changed = false;
+            for (partition_indices) |col_idx| {
+                if (col_idx < rows[i].values.len and col_idx < rows[partition_start].values.len) {
+                    if (!self.valuesEqual(rows[i].values[col_idx], rows[partition_start].values[col_idx])) {
+                        key_changed = true;
+                        break;
+                    }
+                }
+            }
+
+            if (key_changed) {
+                try boundaries.append(allocator, PartitionBoundary{ .start = partition_start, .end = i });
+                partition_start = i;
+            }
+        }
+
+        // Add final partition
+        try boundaries.append(allocator, PartitionBoundary{ .start = partition_start, .end = rows.len });
+
+        return try boundaries.toOwnedSlice(allocator);
+    }
+
+    /// Sort result rows by ORDER BY columns
+    fn sortResultRows(self: *Self, result: *ExecutionResult, order_by: []ast.OrderByClause) !void {
+        // Simple bubble sort for now (can optimize later)
+        const items = result.rows.items;
+        if (items.len <= 1) return;
+
+        var i: usize = 0;
+        while (i < items.len - 1) : (i += 1) {
+            var j: usize = 0;
+            while (j < items.len - 1 - i) : (j += 1) {
+                var should_swap = false;
+
+                // Compare by each ORDER BY clause
+                for (order_by) |clause| {
+                    // For simplicity, assume the column index is the order in the row
+                    // In a real implementation, we'd look up the column name
+                    const col_idx: usize = 0; // TODO: proper column lookup
+                    _ = clause;
+
+                    if (col_idx < items[j].values.len and col_idx < items[j + 1].values.len) {
+                        const cmp = self.compareValues(items[j].values[col_idx], items[j + 1].values[col_idx]);
+                        if (cmp == .gt) should_swap = true;
+                        if (cmp != .eq) break;
+                    }
+                }
+
+                if (should_swap) {
+                    const tmp = items[j];
+                    items[j] = items[j + 1];
+                    items[j + 1] = tmp;
+                }
+            }
+        }
+    }
+
     /// Generate a human-readable description of an execution step
     fn describeStep(self: *Self, step: *const planner.ExecutionStep, allocator: std.mem.Allocator) ![]const u8 {
         _ = self;
@@ -2712,6 +3222,8 @@ pub const VirtualMachine = struct {
             .CreateCTE => |cte| try std.fmt.allocPrint(allocator, "CREATE CTE {s}", .{cte.name}),
             .Pragma => |pragma| try std.fmt.allocPrint(allocator, "PRAGMA {s}", .{pragma.name}),
             .Explain => try allocator.dupe(u8, "EXPLAIN"),
+            .SetOperation => |set_op| try std.fmt.allocPrint(allocator, "SET OPERATION {s}", .{@tagName(set_op.operation)}),
+            .Window => try allocator.dupe(u8, "WINDOW"),
         };
     }
 };
@@ -2809,6 +3321,7 @@ const VmError = error{
 /// Execute a parsed statement (convenience function)
 pub fn execute(connection: *db.Connection, parsed: *const ast.Statement) !void {
     var vm = VirtualMachine.init(connection.allocator, connection);
+    defer vm.deinitVM();
 
     var query_planner = planner.Planner.init(connection.allocator);
     var plan = try query_planner.plan(parsed);

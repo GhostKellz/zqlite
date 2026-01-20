@@ -248,6 +248,49 @@ pub const BTree = struct {
         return results.toOwnedSlice(allocator);
     }
 
+    /// Key-Row pair for selectAllWithKeys
+    pub const KeyRowPair = struct {
+        key: u64,
+        row: storage.Row,
+    };
+
+    /// Select all rows with their keys (for delete filtering)
+    pub fn selectAllWithKeys(self: *Self, allocator: std.mem.Allocator) ![]KeyRowPair {
+        var results: std.ArrayList(KeyRowPair) = .{};
+        try self.collectAllLeafValuesWithKeys(self.root_page, &results, allocator);
+        return results.toOwnedSlice(allocator);
+    }
+
+    /// Collect all leaf values with their keys
+    fn collectAllLeafValuesWithKeys(self: *Self, page_id: u32, results: *std.ArrayList(KeyRowPair), allocator: std.mem.Allocator) !void {
+        var node = try self.readNode(page_id);
+        defer node.deinit(self.allocator);
+
+        if (node.is_leaf) {
+            for (0..node.key_count) |i| {
+                const original_row = node.values[i];
+                const key = node.keys[i];
+
+                // Clone the row
+                var cloned_values = try self.allocator.alloc(storage.Value, original_row.values.len);
+                for (original_row.values, 0..) |value, j| {
+                    cloned_values[j] = try value.clone(self.allocator);
+                }
+                try results.append(allocator, KeyRowPair{
+                    .key = key,
+                    .row = storage.Row{ .values = cloned_values },
+                });
+            }
+        } else {
+            // Traverse all children
+            for (0..node.key_count + 1) |i| {
+                if (i < node.children.len and node.children[i] != 0) {
+                    try self.collectAllLeafValuesWithKeys(node.children[i], results, allocator);
+                }
+            }
+        }
+    }
+
     /// Insert into a non-full node
     fn insertNonFull(self: *Self, page_id: u32, key: u64, value: storage.Row) !void {
         var node = try self.readNode(page_id);
@@ -411,10 +454,15 @@ pub const BTree = struct {
                         .FunctionCall => |func| storage.Value{ .FunctionCall = try self.cloneStorageFunctionCall(func) },
                         // PostgreSQL compatibility values
                         .JSON => |json| storage.Value{ .JSON = try self.allocator.dupe(u8, json) },
-                        .JSONB => |jsonb| storage.Value{ .JSONB = storage.JSONBValue.init(self.allocator, try jsonb.toString(self.allocator)) catch |err| blk: {
-                            std.debug.print("JSONB clone error: {}\n", .{err});
-                            break :blk storage.JSONBValue.init(self.allocator, "{}") catch unreachable;
-                        } },
+                        .JSONB => |jsonb| blk: {
+                            const json_str = jsonb.toString(self.allocator) catch {
+                                break :blk storage.Value.Null;
+                            };
+                            break :blk storage.Value{ .JSONB = storage.JSONBValue.init(self.allocator, json_str) catch {
+                                self.allocator.free(json_str);
+                                break :blk storage.Value.Null;
+                            } };
+                        },
                         .UUID => |uuid| storage.Value{ .UUID = uuid },
                         .Array => |array| storage.Value{
                             .Array = storage.ArrayValue{

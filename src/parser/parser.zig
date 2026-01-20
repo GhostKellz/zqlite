@@ -1,4 +1,5 @@
 const std = @import("std");
+const time_utils = @import("../time_utils.zig");
 const tokenizer = @import("tokenizer.zig");
 const ast = @import("ast.zig");
 
@@ -77,86 +78,28 @@ pub const Parser = struct {
         };
     }
 
-    /// Parse SELECT statement
+    /// Parse SELECT statement (may include UNION/INTERSECT/EXCEPT)
     fn parseSelect(self: *Self) !ast.Statement {
-        try self.expect(.Select);
+        // Parse the first SELECT
+        const left_select = try self.parseSimpleSelect();
 
-        // Parse columns
-        var columns: std.ArrayList(ast.Column) = .{};
-        defer columns.deinit(self.allocator);
+        // Check for UNION/INTERSECT/EXCEPT
+        const set_op = self.parseSetOperation() catch {
+            // No set operation, return the simple SELECT
+            return ast.Statement{ .Select = left_select };
+        };
 
-        if (std.meta.activeTag(self.current_token) == .Asterisk) {
-            try self.advance();
-            try columns.append(self.allocator, ast.Column{
-                .name = try self.allocator.dupe(u8, "*"),
-                .expression = ast.ColumnExpression{ .Simple = try self.allocator.dupe(u8, "*") },
-                .alias = null,
-            });
-        } else {
-            while (true) {
-                const column = try self.parseColumn();
-                try columns.append(self.allocator, column);
+        // We have a set operation, parse the right side
+        const left_ptr = try self.allocator.create(ast.SelectStatement);
+        left_ptr.* = left_select;
 
-                if (std.meta.activeTag(self.current_token) == .Comma) {
-                    try self.advance();
-                } else {
-                    break;
-                }
-            }
-        }
+        // Parse right side (could be another SELECT or compound)
+        // Note: parseSelect will call expect(.Select) internally
+        const right_stmt = try self.parseSelect();
+        const right_ptr = try self.allocator.create(ast.Statement);
+        right_ptr.* = right_stmt;
 
-        // Parse FROM clause
-        try self.expect(.From);
-        const table_name = try self.expectIdentifier();
-
-        // Parse optional JOIN clauses
-        var joins: std.ArrayList(ast.JoinClause) = .{};
-        defer joins.deinit(self.allocator);
-
-        while (true) {
-            const join_type = self.parseJoinType() catch break;
-            const join = try self.parseJoin(join_type);
-            try joins.append(self.allocator, join);
-        }
-
-        // Parse optional WHERE clause
-        var where_clause: ?ast.WhereClause = null;
-        if (std.meta.activeTag(self.current_token) == .Where) {
-            try self.advance();
-            where_clause = try self.parseWhere();
-        }
-
-        // Parse optional GROUP BY clause
-        var group_by: ?[][]const u8 = null;
-        if (std.meta.activeTag(self.current_token) == .Group) {
-            try self.advance();
-            try self.expect(.By);
-
-            var group_columns: std.ArrayList([]const u8) = .{};
-            defer group_columns.deinit(self.allocator);
-
-            while (true) {
-                const col = try self.expectIdentifier();
-                try group_columns.append(self.allocator, col);
-
-                if (std.meta.activeTag(self.current_token) == .Comma) {
-                    try self.advance();
-                } else {
-                    break;
-                }
-            }
-
-            group_by = try group_columns.toOwnedSlice(self.allocator);
-        }
-
-        // Parse optional HAVING clause
-        var having: ?ast.WhereClause = null;
-        if (std.meta.activeTag(self.current_token) == .Having) {
-            try self.advance();
-            having = try self.parseWhere();
-        }
-
-        // Parse optional ORDER BY clause
+        // Parse optional ORDER BY for the compound (applies to whole result)
         var order_by: ?[]ast.OrderByClause = null;
         if (std.meta.activeTag(self.current_token) == .Order) {
             try self.advance();
@@ -217,18 +160,223 @@ pub const Parser = struct {
         }
 
         return ast.Statement{
-            .Select = ast.SelectStatement{
-                .columns = try columns.toOwnedSlice(self.allocator),
-                .table = table_name,
-                .joins = try joins.toOwnedSlice(self.allocator),
-                .where_clause = where_clause,
-                .group_by = group_by,
-                .having = having,
+            .CompoundSelect = ast.CompoundSelectStatement{
+                .left = left_ptr,
+                .operation = set_op,
+                .right = right_ptr,
                 .order_by = order_by,
                 .limit = limit,
                 .offset = offset,
-                .window_definitions = null, // TODO: Parse WINDOW clause
             },
+        };
+    }
+
+    /// Parse a simple SELECT without set operations
+    fn parseSimpleSelect(self: *Self) !ast.SelectStatement {
+        try self.expect(.Select);
+
+        // Parse columns
+        var columns: std.ArrayList(ast.Column) = .{};
+        defer columns.deinit(self.allocator);
+
+        if (std.meta.activeTag(self.current_token) == .Asterisk) {
+            try self.advance();
+            try columns.append(self.allocator, ast.Column{
+                .name = try self.allocator.dupe(u8, "*"),
+                .expression = ast.ColumnExpression{ .Simple = try self.allocator.dupe(u8, "*") },
+                .alias = null,
+            });
+        } else {
+            while (true) {
+                const column = try self.parseColumn();
+                try columns.append(self.allocator, column);
+
+                if (std.meta.activeTag(self.current_token) == .Comma) {
+                    try self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Parse FROM clause
+        try self.expect(.From);
+        var table_name = try self.expectIdentifier();
+
+        // Check for optional table alias
+        if (self.current_token == .Identifier) {
+            const maybe_alias = self.current_token.Identifier;
+            // Make sure it's not a keyword that starts a new clause
+            if (!isClauseKeyword(maybe_alias)) {
+                const with_alias = try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ table_name, maybe_alias });
+                self.allocator.free(table_name);
+                table_name = with_alias;
+                try self.advance();
+            }
+        }
+
+        // Parse optional JOIN clauses
+        var joins: std.ArrayList(ast.JoinClause) = .{};
+        defer joins.deinit(self.allocator);
+
+        while (true) {
+            const join_type = self.parseJoinType() catch break;
+            const join = try self.parseJoin(join_type);
+            try joins.append(self.allocator, join);
+        }
+
+        // Parse optional WHERE clause
+        var where_clause: ?ast.WhereClause = null;
+        if (std.meta.activeTag(self.current_token) == .Where) {
+            try self.advance();
+            where_clause = try self.parseWhere();
+        }
+
+        // Parse optional GROUP BY clause
+        var group_by: ?[][]const u8 = null;
+        if (std.meta.activeTag(self.current_token) == .Group) {
+            try self.advance();
+            try self.expect(.By);
+
+            var group_columns: std.ArrayList([]const u8) = .{};
+            defer group_columns.deinit(self.allocator);
+
+            while (true) {
+                const col = try self.expectIdentifier();
+                try group_columns.append(self.allocator, col);
+
+                if (std.meta.activeTag(self.current_token) == .Comma) {
+                    try self.advance();
+                } else {
+                    break;
+                }
+            }
+
+            group_by = try group_columns.toOwnedSlice(self.allocator);
+        }
+
+        // Parse optional HAVING clause
+        var having: ?ast.WhereClause = null;
+        if (std.meta.activeTag(self.current_token) == .Having) {
+            try self.advance();
+            having = try self.parseWhere();
+        }
+
+        // For simple selects in compound statements, don't parse ORDER BY/LIMIT/OFFSET
+        // Those are handled at the compound level
+        // But we still need to parse them for standalone selects
+        var order_by: ?[]ast.OrderByClause = null;
+        var limit: ?u32 = null;
+        var offset: ?u32 = null;
+
+        // Only parse ORDER BY/LIMIT/OFFSET if not followed by a set operation
+        if (!self.isSetOperation()) {
+            if (std.meta.activeTag(self.current_token) == .Order) {
+                try self.advance();
+                try self.expect(.By);
+
+                var order_clauses: std.ArrayList(ast.OrderByClause) = .{};
+                defer order_clauses.deinit(self.allocator);
+
+                while (true) {
+                    const col = try self.expectIdentifier();
+                    var direction = ast.SortDirection.Asc;
+
+                    if (std.meta.activeTag(self.current_token) == .Asc) {
+                        try self.advance();
+                        direction = .Asc;
+                    } else if (std.meta.activeTag(self.current_token) == .Desc) {
+                        try self.advance();
+                        direction = .Desc;
+                    }
+
+                    try order_clauses.append(self.allocator, ast.OrderByClause{
+                        .column = col,
+                        .direction = direction,
+                    });
+
+                    if (std.meta.activeTag(self.current_token) == .Comma) {
+                        try self.advance();
+                    } else {
+                        break;
+                    }
+                }
+
+                order_by = try order_clauses.toOwnedSlice(self.allocator);
+            }
+
+            if (std.meta.activeTag(self.current_token) == .Limit) {
+                try self.advance();
+                if (self.current_token == .Integer) {
+                    limit = @intCast(self.current_token.Integer);
+                    try self.advance();
+                } else {
+                    return error.ExpectedNumber;
+                }
+            }
+
+            if (std.meta.activeTag(self.current_token) == .Offset) {
+                try self.advance();
+                if (self.current_token == .Integer) {
+                    offset = @intCast(self.current_token.Integer);
+                    try self.advance();
+                } else {
+                    return error.ExpectedNumber;
+                }
+            }
+        }
+
+        return ast.SelectStatement{
+            .columns = try columns.toOwnedSlice(self.allocator),
+            .table = table_name,
+            .joins = try joins.toOwnedSlice(self.allocator),
+            .where_clause = where_clause,
+            .group_by = group_by,
+            .having = having,
+            .order_by = order_by,
+            .limit = limit,
+            .offset = offset,
+            .window_definitions = null,
+        };
+    }
+
+    /// Check if current token is a set operation
+    fn isSetOperation(self: *Self) bool {
+        return switch (self.current_token) {
+            .Union, .Intersect, .Except => true,
+            else => false,
+        };
+    }
+
+    /// Parse set operation (UNION/INTERSECT/EXCEPT)
+    fn parseSetOperation(self: *Self) !ast.SetOperation {
+        return switch (self.current_token) {
+            .Union => {
+                try self.advance();
+                // Check for ALL
+                if (std.meta.activeTag(self.current_token) == .All) {
+                    try self.advance();
+                    return .UnionAll;
+                }
+                return .Union;
+            },
+            .Intersect => {
+                try self.advance();
+                if (std.meta.activeTag(self.current_token) == .All) {
+                    try self.advance();
+                    return .IntersectAll;
+                }
+                return .Intersect;
+            },
+            .Except => {
+                try self.advance();
+                if (std.meta.activeTag(self.current_token) == .All) {
+                    try self.advance();
+                    return .ExceptAll;
+                }
+                return .Except;
+            },
+            else => error.UnexpectedToken,
         };
     }
 
@@ -279,12 +427,26 @@ pub const Parser = struct {
     fn parseJoin(self: *Self, join_type: ast.JoinType) !ast.JoinClause {
         const table = try self.expectIdentifier();
 
+        // Check for optional table alias
+        var table_with_alias = table;
+        if (self.current_token == .Identifier) {
+            const alias = self.current_token.Identifier;
+            // Make sure it's not ON keyword
+            if (!std.mem.eql(u8, alias, "ON") and !std.mem.eql(u8, alias, "on")) {
+                // Store as "table alias" format for executor to handle
+                const with_alias = try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ table, alias });
+                self.allocator.free(table);
+                table_with_alias = with_alias;
+                try self.advance();
+            }
+        }
+
         try self.expect(.On);
         const condition = try self.parseCondition();
 
         return ast.JoinClause{
             .join_type = join_type,
-            .table = table,
+            .table = table_with_alias,
             .condition = condition,
         };
     }
@@ -814,6 +976,59 @@ pub const Parser = struct {
             };
         }
 
+        // Check for window functions: ROW_NUMBER, RANK, DENSE_RANK, PERCENT_RANK, CUME_DIST,
+        // NTILE, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE
+        const window_func_type: ?ast.WindowFunctionType = switch (std.meta.activeTag(self.current_token)) {
+            .Row_Number => .RowNumber,
+            .Rank => .Rank,
+            .Dense_Rank => .DenseRank,
+            .Percent_Rank => .PercentRank,
+            .Cume_Dist => .CumeDist,
+            .Ntile => .Ntile,
+            .Lag => .Lag,
+            .Lead => .Lead,
+            .First_Value => .FirstValue,
+            .Last_Value => .LastValue,
+            .Nth_Value => .NthValue,
+            else => null,
+        };
+
+        if (window_func_type) |func_type| {
+            const window_func = try self.parseWindowFunction(func_type);
+
+            var alias: ?[]const u8 = null;
+            // Check for AS alias
+            if (std.meta.activeTag(self.current_token) == .As) {
+                try self.advance(); // consume AS
+                alias = try self.expectIdentifier();
+            } else if (std.meta.activeTag(self.current_token) == .Identifier) {
+                const id = self.current_token.Identifier;
+                if (!isClauseKeyword(id)) {
+                    alias = try self.expectIdentifier();
+                }
+            }
+
+            const func_name = switch (func_type) {
+                .RowNumber => "ROW_NUMBER",
+                .Rank => "RANK",
+                .DenseRank => "DENSE_RANK",
+                .PercentRank => "PERCENT_RANK",
+                .CumeDist => "CUME_DIST",
+                .Ntile => "NTILE",
+                .Lag => "LAG",
+                .Lead => "LEAD",
+                .FirstValue => "FIRST_VALUE",
+                .LastValue => "LAST_VALUE",
+                .NthValue => "NTH_VALUE",
+            };
+
+            return ast.Column{
+                .name = try self.allocator.dupe(u8, func_name),
+                .expression = ast.ColumnExpression{ .Window = window_func },
+                .alias = alias,
+            };
+        }
+
         // Check for null-handling functions: COALESCE, NULLIF, IFNULL
         // and string functions: UPPER, LOWER, SUBSTR, LENGTH, TRIM
         if (std.meta.activeTag(self.current_token) == .Coalesce or
@@ -844,8 +1059,21 @@ pub const Parser = struct {
             };
         }
 
-        // Regular column parsing
-        const name = try self.expectIdentifier();
+        // Regular column parsing - handle qualified names (table.column)
+        const first_part = try self.expectIdentifier();
+        var name: []const u8 = first_part;
+
+        // Check for qualified name (table.column)
+        if (std.meta.activeTag(self.current_token) == .Dot) {
+            try self.advance(); // consume '.'
+            const second_part = try self.expectIdentifier();
+            // Create qualified name "table.column"
+            const qualified_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ first_part, second_part });
+            self.allocator.free(first_part);
+            self.allocator.free(second_part);
+            name = qualified_name;
+        }
+
         var alias: ?[]const u8 = null;
 
         // Check for AS alias or implicit alias
@@ -853,10 +1081,244 @@ pub const Parser = struct {
             try self.advance(); // consume AS
             alias = try self.expectIdentifier();
         } else if (std.meta.activeTag(self.current_token) == .Identifier) {
-            alias = try self.expectIdentifier();
+            // Only treat as alias if it's not a keyword that could start a new clause
+            const id = self.current_token.Identifier;
+            if (!isClauseKeyword(id)) {
+                alias = try self.expectIdentifier();
+            }
         }
 
         return ast.Column{ .name = name, .expression = ast.ColumnExpression{ .Simple = try self.allocator.dupe(u8, name) }, .alias = alias };
+    }
+
+    /// Check if an identifier is a SQL clause keyword
+    fn isClauseKeyword(id: []const u8) bool {
+        const keywords = [_][]const u8{ "FROM", "from", "WHERE", "where", "GROUP", "group", "ORDER", "order", "HAVING", "having", "LIMIT", "limit", "OFFSET", "offset", "JOIN", "join", "INNER", "inner", "LEFT", "left", "RIGHT", "right", "OUTER", "outer", "ON", "on", "AND", "and", "OR", "or" };
+        for (keywords) |kw| {
+            if (std.mem.eql(u8, id, kw)) return true;
+        }
+        return false;
+    }
+
+    /// Parse a window function expression (ROW_NUMBER, RANK, etc.)
+    fn parseWindowFunction(self: *Self, func_type: ast.WindowFunctionType) !ast.WindowFunction {
+        try self.advance(); // consume function token
+        try self.expect(.LeftParen); // expect '('
+
+        // Parse arguments (some window functions take arguments, e.g., LAG(column, offset, default))
+        var arguments: std.ArrayList(ast.FunctionArgument) = .{};
+        errdefer {
+            for (arguments.items) |arg| {
+                arg.deinit(self.allocator);
+            }
+            arguments.deinit(self.allocator);
+        }
+
+        while (std.meta.activeTag(self.current_token) != .RightParen) {
+            // Parse argument
+            const arg = switch (self.current_token) {
+                .Identifier => |id| blk: {
+                    const owned_id = try self.allocator.dupe(u8, id);
+                    try self.advance();
+                    break :blk ast.FunctionArgument{ .Column = owned_id };
+                },
+                .Integer => |val| blk: {
+                    try self.advance();
+                    break :blk ast.FunctionArgument{ .Literal = ast.Value{ .Integer = val } };
+                },
+                .Real => |val| blk: {
+                    try self.advance();
+                    break :blk ast.FunctionArgument{ .Literal = ast.Value{ .Real = val } };
+                },
+                .String => |val| blk: {
+                    const owned_val = try self.allocator.dupe(u8, val);
+                    try self.advance();
+                    break :blk ast.FunctionArgument{ .Literal = ast.Value{ .Text = owned_val } };
+                },
+                .Null => blk: {
+                    try self.advance();
+                    break :blk ast.FunctionArgument{ .Literal = ast.Value.Null };
+                },
+                else => break,
+            };
+
+            try arguments.append(self.allocator, arg);
+
+            if (std.meta.activeTag(self.current_token) == .Comma) {
+                try self.advance();
+            } else {
+                break;
+            }
+        }
+
+        try self.expect(.RightParen); // expect ')'
+        try self.expect(.Over); // expect OVER
+
+        // Parse window specification
+        const window_spec = try self.parseWindowSpecification();
+
+        return ast.WindowFunction{
+            .function_type = func_type,
+            .arguments = try arguments.toOwnedSlice(self.allocator),
+            .window_spec = window_spec,
+        };
+    }
+
+    /// Parse OVER clause window specification
+    fn parseWindowSpecification(self: *Self) !ast.WindowSpecification {
+        try self.expect(.LeftParen); // expect '('
+
+        const window_name: ?[]const u8 = null;
+        var partition_by: ?[][]const u8 = null;
+        var order_by: ?[]ast.OrderByClause = null;
+        var frame_clause: ?ast.FrameClause = null;
+
+        // Parse optional PARTITION BY
+        if (std.meta.activeTag(self.current_token) == .Partition) {
+            try self.advance(); // consume PARTITION
+            try self.expect(.By); // expect BY
+
+            var columns: std.ArrayList([]const u8) = .{};
+            errdefer {
+                for (columns.items) |col| {
+                    self.allocator.free(col);
+                }
+                columns.deinit(self.allocator);
+            }
+
+            while (true) {
+                const col = try self.expectIdentifier();
+                try columns.append(self.allocator, col);
+
+                if (std.meta.activeTag(self.current_token) == .Comma) {
+                    try self.advance();
+                } else {
+                    break;
+                }
+            }
+
+            partition_by = try columns.toOwnedSlice(self.allocator);
+        }
+
+        // Parse optional ORDER BY
+        if (std.meta.activeTag(self.current_token) == .Order) {
+            try self.advance(); // consume ORDER
+            try self.expect(.By); // expect BY
+
+            var order_clauses: std.ArrayList(ast.OrderByClause) = .{};
+            errdefer {
+                for (order_clauses.items) |clause| {
+                    self.allocator.free(clause.column);
+                }
+                order_clauses.deinit(self.allocator);
+            }
+
+            while (true) {
+                const col = try self.expectIdentifier();
+                var direction = ast.SortDirection.Asc;
+
+                if (std.meta.activeTag(self.current_token) == .Asc) {
+                    try self.advance();
+                    direction = .Asc;
+                } else if (std.meta.activeTag(self.current_token) == .Desc) {
+                    try self.advance();
+                    direction = .Desc;
+                }
+
+                try order_clauses.append(self.allocator, ast.OrderByClause{
+                    .column = col,
+                    .direction = direction,
+                });
+
+                if (std.meta.activeTag(self.current_token) == .Comma) {
+                    try self.advance();
+                } else {
+                    break;
+                }
+            }
+
+            order_by = try order_clauses.toOwnedSlice(self.allocator);
+        }
+
+        // Parse optional frame clause (ROWS/RANGE BETWEEN ... AND ...)
+        if (std.meta.activeTag(self.current_token) == .Rows or std.meta.activeTag(self.current_token) == .Range) {
+            frame_clause = try self.parseFrameClause();
+        }
+
+        try self.expect(.RightParen); // expect ')'
+
+        return ast.WindowSpecification{
+            .window_name = window_name,
+            .partition_by = partition_by,
+            .order_by = order_by,
+            .frame_clause = frame_clause,
+        };
+    }
+
+    /// Parse frame clause (ROWS/RANGE BETWEEN ... AND ...)
+    fn parseFrameClause(self: *Self) !ast.FrameClause {
+        const frame_type: ast.FrameType = switch (std.meta.activeTag(self.current_token)) {
+            .Rows => .Rows,
+            .Range => .Range,
+            else => return error.UnexpectedToken,
+        };
+        try self.advance(); // consume ROWS/RANGE
+
+        // Expect BETWEEN or just a single bound
+        var start_bound: ast.FrameBound = undefined;
+        var end_bound: ?ast.FrameBound = null;
+
+        if (std.meta.activeTag(self.current_token) == .Between) {
+            try self.advance(); // consume BETWEEN
+
+            start_bound = try self.parseFrameBound();
+
+            try self.expect(.And); // expect AND
+
+            end_bound = try self.parseFrameBound();
+        } else {
+            // Single bound (e.g., ROWS UNBOUNDED PRECEDING)
+            start_bound = try self.parseFrameBound();
+        }
+
+        return ast.FrameClause{
+            .frame_type = frame_type,
+            .start_bound = start_bound,
+            .end_bound = end_bound,
+        };
+    }
+
+    /// Parse a frame bound (UNBOUNDED PRECEDING, CURRENT ROW, etc.)
+    fn parseFrameBound(self: *Self) !ast.FrameBound {
+        if (std.meta.activeTag(self.current_token) == .Unbounded) {
+            try self.advance(); // consume UNBOUNDED
+            if (std.meta.activeTag(self.current_token) == .Preceding) {
+                try self.advance();
+                return .UnboundedPreceding;
+            } else if (std.meta.activeTag(self.current_token) == .Following) {
+                try self.advance();
+                return .UnboundedFollowing;
+            } else {
+                return error.UnexpectedToken;
+            }
+        } else if (std.meta.activeTag(self.current_token) == .Current) {
+            try self.advance(); // consume CURRENT
+            try self.expect(.Row); // expect ROW
+            return .CurrentRow;
+        } else if (std.meta.activeTag(self.current_token) == .Integer) {
+            try self.advance(); // consume the number
+            if (std.meta.activeTag(self.current_token) == .Preceding) {
+                try self.advance();
+                return .Preceding;
+            } else if (std.meta.activeTag(self.current_token) == .Following) {
+                try self.advance();
+                return .Following;
+            } else {
+                return error.UnexpectedToken;
+            }
+        } else {
+            return error.UnexpectedToken;
+        }
     }
 
     /// Parse a column definition in CREATE TABLE
@@ -1361,8 +1823,21 @@ pub const Parser = struct {
     fn parseExpression(self: *Self) !ast.Expression {
         return switch (self.current_token) {
             .Identifier => |id| {
-                const owned_id = try self.allocator.dupe(u8, id);
+                var owned_id = try self.allocator.dupe(u8, id);
                 try self.advance();
+
+                // Check for qualified name (table.column)
+                if (std.meta.activeTag(self.current_token) == .Dot) {
+                    try self.advance(); // consume '.'
+                    if (self.current_token == .Identifier) {
+                        const second_part = self.current_token.Identifier;
+                        const qualified_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ owned_id, second_part });
+                        self.allocator.free(owned_id);
+                        owned_id = qualified_name;
+                        try self.advance();
+                    }
+                }
+
                 return ast.Expression{ .Column = owned_id };
             },
             .QuestionMark => {
@@ -1413,7 +1888,7 @@ pub const Parser = struct {
                 // Handle CURRENT_TIMESTAMP as a special function
                 try self.advance();
                 // Generate current timestamp in ISO format
-                const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+                const ts = time_utils.getTimespec();
                 const timestamp = ts.sec;
                 const timestamp_str = try std.fmt.allocPrint(self.allocator, "{d}-01-01 12:00:00", .{1970 + @divFloor(timestamp, 31536000)});
                 return ast.Value{ .Text = timestamp_str };
@@ -1432,7 +1907,7 @@ pub const Parser = struct {
                             try self.advance(); // consume ')'
                         }
                         // Generate current timestamp in ISO format
-                        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+                        const ts = time_utils.getTimespec();
                         const timestamp = ts.sec;
                         const timestamp_str = try std.fmt.allocPrint(self.allocator, "{d}-01-01 12:00:00", .{1970 + @divFloor(timestamp, 31536000)});
                         return ast.Value{ .Text = timestamp_str };

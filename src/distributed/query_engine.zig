@@ -6,6 +6,7 @@ const parser = @import("../parser/parser.zig");
 const executor = @import("../executor/vm.zig");
 const transport = @import("../transport/transport.zig");
 const zsync = @import("zsync");
+const time_utils = @import("../time_utils.zig");
 
 /// Distributed Query Engine for Query Distribution and Execution
 /// Handles query planning, distribution, and result aggregation across cluster nodes
@@ -34,7 +35,7 @@ pub const DistributedQueryEngine = struct {
 
     /// Execute distributed query
     pub fn executeQuery(self: *Self, sql: []const u8) !DistributedQueryResult {
-        const ts_start = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts_start = time_utils.getTimespec();
         const start_time: i64 = @intCast(@divTrunc((@as(i128, ts_start.sec) * std.time.ns_per_s + ts_start.nsec), 1000));
 
         // Check cache first
@@ -59,7 +60,7 @@ pub const DistributedQueryEngine = struct {
             try self.query_cache.put(sql, result);
         }
 
-        const ts_end = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts_end = time_utils.getTimespec();
         const end_time: i64 = @intCast(@divTrunc((@as(i128, ts_end.sec) * std.time.ns_per_s + ts_end.nsec), 1000));
         const execution_time = end_time - start_time;
 
@@ -73,7 +74,7 @@ pub const DistributedQueryEngine = struct {
 
     /// Execute prepared statement
     pub fn executePrepared(self: *Self, statement_id: u64, parameters: []const storage.Value) !DistributedQueryResult {
-        const ts_start = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts_start = time_utils.getTimespec();
         const start_time: i64 = @intCast(@divTrunc((@as(i128, ts_start.sec) * std.time.ns_per_s + ts_start.nsec), 1000));
 
         // Get prepared statement
@@ -88,7 +89,7 @@ pub const DistributedQueryEngine = struct {
         // Execute plan
         const result = try self.executePlan(execution_plan);
 
-        const ts_end = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts_end = time_utils.getTimespec();
         const end_time: i64 = @intCast(@divTrunc((@as(i128, ts_end.sec) * std.time.ns_per_s + ts_end.nsec), 1000));
         const execution_time = end_time - start_time;
 
@@ -122,7 +123,7 @@ pub const DistributedQueryEngine = struct {
 
     /// Execute join query across nodes
     pub fn executeJoin(self: *Self, join_query: JoinQuery) !DistributedQueryResult {
-        const ts_start = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts_start = time_utils.getTimespec();
         const start_time: i64 = @intCast(@divTrunc((@as(i128, ts_start.sec) * std.time.ns_per_s + ts_start.nsec), 1000));
 
         // Create join execution plan
@@ -132,7 +133,7 @@ pub const DistributedQueryEngine = struct {
         // Execute join across nodes
         const result = try self.executeJoinPlan(join_plan);
 
-        const ts_end = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts_end = time_utils.getTimespec();
         const end_time: i64 = @intCast(@divTrunc((@as(i128, ts_end.sec) * std.time.ns_per_s + ts_end.nsec), 1000));
         const execution_time = end_time - start_time;
 
@@ -144,7 +145,7 @@ pub const DistributedQueryEngine = struct {
 
     /// Execute aggregation query
     pub fn executeAggregation(self: *Self, agg_query: AggregationQuery) !DistributedQueryResult {
-        const ts_start = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts_start = time_utils.getTimespec();
         const start_time: i64 = @intCast(@divTrunc((@as(i128, ts_start.sec) * std.time.ns_per_s + ts_start.nsec), 1000));
 
         // Create aggregation plan
@@ -154,7 +155,7 @@ pub const DistributedQueryEngine = struct {
         // Execute aggregation across nodes
         const result = try self.executeAggregationPlan(agg_plan);
 
-        const ts_end = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts_end = time_utils.getTimespec();
         const end_time: i64 = @intCast(@divTrunc((@as(i128, ts_end.sec) * std.time.ns_per_s + ts_end.nsec), 1000));
         const execution_time = end_time - start_time;
 

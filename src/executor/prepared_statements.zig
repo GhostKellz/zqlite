@@ -1,4 +1,5 @@
 const std = @import("std");
+const time_utils = @import("../time_utils.zig");
 const storage = @import("../db/storage.zig");
 const ast = @import("../parser/ast.zig");
 const query_cache = @import("../performance/query_cache.zig");
@@ -59,10 +60,10 @@ pub const PreparedStatement = struct {
 
     /// Execute the prepared statement with bound parameters
     pub fn execute(self: *Self, connection: anytype) !ExecutionResult {
-        const ts_start = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts_start = time_utils.getTimespec();
         const start_time: i64 = @intCast(@divTrunc((@as(i128, ts_start.sec) * std.time.ns_per_s + ts_start.nsec), 1000));
         defer {
-            const ts_end = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+            const ts_end = time_utils.getTimespec();
             const end_time: i64 = @intCast(@divTrunc((@as(i128, ts_end.sec) * std.time.ns_per_s + ts_end.nsec), 1000));
             self.total_execution_time_us += @intCast(end_time - start_time);
             self.execution_count += 1;
@@ -71,7 +72,7 @@ pub const PreparedStatement = struct {
         // Check cache first for SELECT statements
         if (self.isSelectStatement() and self.cache != null) {
             if (self.cache.?.get(self.sql_hash)) |cached_result| {
-                const ts_cached = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+                const ts_cached = time_utils.getTimespec();
                 const cached_time: i64 = @intCast(@divTrunc((@as(i128, ts_cached.sec) * std.time.ns_per_s + ts_cached.nsec), 1000));
                 return ExecutionResult{
                     .rows = try self.cloneRows(cached_result.rows),
@@ -88,7 +89,7 @@ pub const PreparedStatement = struct {
         else
             try self.executeStatement(connection);
 
-        const ts_result = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts_result = time_utils.getTimespec();
         const result_time: i64 = @intCast(@divTrunc((@as(i128, ts_result.sec) * std.time.ns_per_s + ts_result.nsec), 1000));
         result.execution_time_us = @intCast(result_time - start_time);
 

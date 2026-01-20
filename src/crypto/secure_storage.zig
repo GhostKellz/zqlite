@@ -1,6 +1,7 @@
 const std = @import("std");
 const crypto_interface = @import("interface.zig");
 const storage = @import("../db/storage.zig");
+const time_utils = @import("../time_utils.zig");
 
 /// 🚀 ZQLite Crypto Engine - Production-ready database encryption
 /// Features: ZCrypto integration, Modular crypto backends, Native Zig crypto fallback
@@ -439,7 +440,7 @@ pub const CryptoTransactionLog = struct {
     }
 
     pub fn addTransaction(self: *Self, operation: []const u8, data_hash: [32]u8) !void {
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         const entry = TransactionEntry{
             .timestamp = ts.sec,
             .operation = try self.allocator.dupe(u8, operation),

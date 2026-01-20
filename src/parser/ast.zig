@@ -17,6 +17,7 @@ pub const Statement = union(enum) {
     With: WithStatement, // Common Table Expressions
     Pragma: PragmaStatement, // PRAGMA statements for introspection
     Explain: ExplainStatement, // EXPLAIN / EXPLAIN QUERY PLAN
+    CompoundSelect: CompoundSelectStatement, // UNION/INTERSECT/EXCEPT
 
     pub fn deinit(self: *Statement, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -34,6 +35,42 @@ pub const Statement = union(enum) {
             .With => |*stmt| stmt.deinit(allocator),
             .Pragma => |*stmt| stmt.deinit(allocator),
             .Explain => |*stmt| stmt.deinit(allocator),
+            .CompoundSelect => |*stmt| stmt.deinit(allocator),
+        }
+    }
+};
+
+/// Set operation type for compound SELECT
+pub const SetOperation = enum {
+    Union,
+    UnionAll,
+    Intersect,
+    IntersectAll,
+    Except,
+    ExceptAll,
+};
+
+/// Compound SELECT statement (UNION/INTERSECT/EXCEPT)
+pub const CompoundSelectStatement = struct {
+    left: *SelectStatement,
+    operation: SetOperation,
+    right: *Statement, // Can be SelectStatement or another CompoundSelectStatement
+    order_by: ?[]OrderByClause,
+    limit: ?u32,
+    offset: ?u32,
+
+    pub fn deinit(self: *CompoundSelectStatement, allocator: std.mem.Allocator) void {
+        self.left.deinit(allocator);
+        allocator.destroy(self.left);
+
+        self.right.deinit(allocator);
+        allocator.destroy(self.right);
+
+        if (self.order_by) |order_by| {
+            for (order_by) |clause| {
+                allocator.free(clause.column);
+            }
+            allocator.free(order_by);
         }
     }
 };

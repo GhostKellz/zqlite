@@ -1,4 +1,5 @@
 const std = @import("std");
+const time_utils = @import("../time_utils.zig");
 const storage = @import("../db/storage.zig");
 
 /// Query result cache for improved performance using intrusive doubly-linked list
@@ -39,7 +40,7 @@ pub const QueryCache = struct {
             self.lru_list.prepend(&entry.lru_node);
 
             entry.access_count += 1;
-            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+            const ts = time_utils.getTimespec();
             entry.last_accessed = ts.sec;
 
             self.hit_count += 1;
@@ -52,7 +53,7 @@ pub const QueryCache = struct {
 
     /// Store query result in cache
     pub fn put(self: *Self, sql_hash: u64, sql: []const u8, result: []storage.Row) !void {
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         const timestamp = ts.sec;
 
         // Check if entry already exists
@@ -217,7 +218,7 @@ pub const QueryCache = struct {
 
     /// Remove expired entries based on TTL
     pub fn cleanupExpired(self: *Self, ttl_seconds: i64) !void {
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         const current_time = ts.sec;
         var entries_to_remove: std.ArrayList(*CacheEntry) = .{};
         defer entries_to_remove.deinit(self.allocator);

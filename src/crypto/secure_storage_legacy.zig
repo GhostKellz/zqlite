@@ -1,6 +1,7 @@
 const std = @import("std");
 const crypto_interface = @import("interface.zig");
 const storage = @import("../db/storage.zig");
+const time_utils = @import("../time_utils.zig");
 
 /// 🚀 ZQLite v0.6.0 Crypto Engine - Next-generation database encryption
 /// Features: Modular crypto backends, Native Zig crypto, Optional Shroud integration
@@ -536,7 +537,7 @@ pub const SecureTable = struct {
             secure_row.values[i] = try secure_value.decrypt(self.crypto_engine);
         }
 
-        try self.base_table.insert(secure_row);
+        try self.base_table.insertRow(secure_row);
     }
 
     pub fn deinit(self: *Self) void {
@@ -587,7 +588,7 @@ pub const CryptoTransactionLog = struct {
 
     /// Log a database operation with post-quantum cryptographic proof
     pub fn logOperation(self: *Self, table_name: []const u8, operation: []const u8, data: []const u8) !void {
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         const transaction_id = @as(u64, @intCast(ts.sec));
         const data_hash = try self.crypto_engine.hashData(data);
 
@@ -609,7 +610,7 @@ pub const CryptoTransactionLog = struct {
         // Create hybrid signature (classical + post-quantum)
         const signature = try self.crypto_engine.signTransaction(signing_data.items);
 
-        const ts2 = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts2 = time_utils.getTimespec();
         const entry = LogEntry{
             .transaction_id = transaction_id,
             .table_name = try self.allocator.dupe(u8, table_name),

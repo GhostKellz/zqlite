@@ -1,6 +1,7 @@
 const std = @import("std");
 const crypto = std.crypto;
 const Allocator = std.mem.Allocator;
+const time_utils = @import("../time_utils.zig");
 
 pub const EncryptedStorage = struct {
     const Self = @This();
@@ -154,7 +155,7 @@ pub const WalletStorage = struct {
     pub fn storeWallet(self: *Self, wallet_id: []const u8, name: []const u8, coin_type: u32, mnemonic: []const u8, password: []const u8) !void {
         const encrypted_seed = try EncryptedStorage.encryptMnemonic(self.allocator, mnemonic, password);
 
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         const timestamp = ts.sec;
         const stored_wallet = StoredWallet{
             .id = try self.allocator.dupe(u8, wallet_id),
@@ -172,7 +173,7 @@ pub const WalletStorage = struct {
         const stored_wallet = self.wallets.getPtr(wallet_id) orelse return error.WalletNotFound;
 
         // Update last access time
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         const timestamp = ts.sec;
         stored_wallet.last_access = timestamp;
 

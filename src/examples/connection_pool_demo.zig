@@ -42,7 +42,7 @@ pub fn main() !void {
         try connections.append(allocator, conn);
 
         // Insert data with each connection
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = zqlite.time_utils.getTimespec();
         const timestamp = ts.sec;
         const sql = try std.fmt.allocPrint(allocator, "INSERT INTO test_data VALUES ({}, 'data_{}', {});", .{ i, i, timestamp });
         defer allocator.free(sql);
@@ -87,7 +87,7 @@ pub fn main() !void {
         try stmt.bindParameter(0, zqlite.storage.Value{ .Integer = 100 });
         try stmt.bindParameter(1, zqlite.storage.Value{ .Text = try allocator.dupe(u8, "prepared_data") });
         defer allocator.free("prepared_data");
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = zqlite.time_utils.getTimespec();
         const timestamp = ts.sec;
         try stmt.bindParameter(2, zqlite.storage.Value{ .Integer = timestamp });
 

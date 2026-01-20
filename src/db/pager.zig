@@ -1,4 +1,7 @@
 const std = @import("std");
+const posix = std.posix;
+const builtin = @import("builtin");
+const native_os = builtin.os.tag;
 const encryption = @import("encryption.zig");
 
 /// Doubly-linked list node for O(1) LRU operations
@@ -175,29 +178,10 @@ const LRUCache = struct {
     }
 };
 
-/// Page-based storage manager
-/// Stub file handle for Zig 0.16 compatibility
-const FileHandle = struct {
-    pub fn seekTo(_: *FileHandle, _: usize) !usize {
-        return 0;
-    }
-    pub fn read(_: *FileHandle, _: []u8) !usize {
-        return 0;
-    }
-    pub fn write(_: *FileHandle, _: []const u8) !usize {
-        return 0;
-    }
-    pub fn writeAll(_: *FileHandle, _: []const u8) !void {}
-    pub fn getEndPos(_: *FileHandle) !u64 {
-        return 0;
-    }
-    pub fn sync(_: *FileHandle) !void {}
-    pub fn close(_: *FileHandle) void {}
-};
-
+/// Page-based storage manager using POSIX file descriptors
 pub const Pager = struct {
     allocator: std.mem.Allocator,
-    file: ?*FileHandle,
+    fd: ?posix.fd_t,
     cache: LRUCache,
     next_page_id: u32,
     page_size: u32,
@@ -207,13 +191,14 @@ pub const Pager = struct {
     encryption: encryption.Encryption,
 
     const Self = @This();
-    const DEFAULT_PAGE_SIZE = 4096;
+    pub const DEFAULT_PAGE_SIZE = 4096;
     const MAX_CACHED_PAGES = 1000;
 
     /// Initialize pager with file backing
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !*Self {
         var pager = try allocator.create(Self);
         pager.allocator = allocator;
+        pager.fd = null;
         pager.cache = LRUCache.init(allocator, MAX_CACHED_PAGES);
         pager.page_size = DEFAULT_PAGE_SIZE;
         pager.is_memory = false;
@@ -222,11 +207,30 @@ pub const Pager = struct {
         pager.cache_misses = 0;
         pager.encryption = encryption.Encryption.initPlain();
 
-        // Open or create the database file
-        // Note: File I/O currently stubbed for Zig 0.16 compatibility
-        // Note: File I/O currently stubbed for Zig 0.16 compatibility
-        pager.file = null;
-        _ = path;
+        if (comptime native_os == .windows) {
+            allocator.destroy(pager);
+            return error.Unsupported;
+        }
+
+        // Convert path to null-terminated string for posix
+        const path_z = try allocator.dupeZ(u8, path);
+        defer allocator.free(path_z);
+
+        // Open or create the database file using POSIX
+        const fd = posix.openat(posix.AT.FDCWD, path_z, .{
+            .ACCMODE = .RDWR,
+            .CREAT = true,
+        }, 0o644) catch |err| {
+            allocator.destroy(pager);
+            return err;
+        };
+        pager.fd = fd;
+
+        // Read existing page count from file size using lseek
+        const file_size = getFileSize(fd) catch 0;
+        if (file_size > 0) {
+            pager.next_page_id = @intCast(file_size / DEFAULT_PAGE_SIZE + 1);
+        }
 
         return pager;
     }
@@ -235,7 +239,7 @@ pub const Pager = struct {
     pub fn initMemory(allocator: std.mem.Allocator) !*Self {
         var pager = try allocator.create(Self);
         pager.allocator = allocator;
-        pager.file = null;
+        pager.fd = null;
         pager.cache = LRUCache.init(allocator, MAX_CACHED_PAGES);
         pager.page_size = DEFAULT_PAGE_SIZE;
         pager.is_memory = true;
@@ -295,14 +299,14 @@ pub const Pager = struct {
         };
 
         if (!self.is_memory) {
-            if (self.file) |file| {
-                const offset = (page_id - 1) * self.page_size;
-                _ = try file.seekTo(offset);
-
-                const bytes_read = try file.read(page.data);
-                if (bytes_read < self.page_size) { // Zero out remaining bytes if file is smaller
+            const offset: i64 = @as(i64, page_id - 1) * @as(i64, self.page_size);
+            if (self.fd) |fd| {
+                const bytes_read = try preadAll(fd, page.data, offset);
+                if (bytes_read < self.page_size) {
                     @memset(page.data[bytes_read..], 0);
                 }
+            } else {
+                @memset(page.data, 0);
             }
         } else {
             // In-memory: page doesn't exist yet, zero it out
@@ -345,17 +349,16 @@ pub const Pager = struct {
         }
 
         // Sync file to disk
-        if (self.file) |file| {
-            try file.sync();
+        if (self.fd) |fd| {
+            posix.fdatasync(fd) catch {};
         }
     }
 
-    /// Write a page to storage
+    /// Write a page to storage using pwrite
     fn writePage(self: *Self, page: *Page) !void {
-        if (self.file) |file| {
-            const offset = (page.id - 1) * self.page_size;
-            _ = try file.seekTo(offset);
-            _ = try file.writeAll(page.data);
+        const offset: i64 = @as(i64, page.id - 1) * @as(i64, self.page_size);
+        if (self.fd) |fd| {
+            try pwriteAll(fd, page.data, offset);
         }
     }
 
@@ -392,13 +395,80 @@ pub const Pager = struct {
         self.cache.deinit();
 
         // Close file
-        if (self.file) |file| {
-            file.close();
+        if (self.fd) |fd| {
+            posix.close(fd);
         }
 
         self.allocator.destroy(self);
     }
 };
+
+/// Get file size using lseek
+fn getFileSize(fd: posix.fd_t) !u64 {
+    const SEEK_END = 2;
+    const SEEK_SET = 0;
+
+    if (comptime native_os == .windows) {
+        return error.Unsupported;
+    }
+
+    const end_rc = std.os.linux.lseek(fd, 0, SEEK_END);
+    if (@as(isize, @bitCast(end_rc)) < 0) {
+        return error.SeekError;
+    }
+
+    const start_rc = std.os.linux.lseek(fd, 0, SEEK_SET);
+    if (@as(isize, @bitCast(start_rc)) < 0) {
+        return error.SeekError;
+    }
+
+    return end_rc;
+}
+
+/// POSIX pread - read at offset without changing file position
+fn preadAll(fd: posix.fd_t, buf: []u8, offset: i64) !usize {
+    var total_read: usize = 0;
+    while (total_read < buf.len) {
+        const rc = blk: {
+            if (comptime native_os == .windows) {
+                return error.Unsupported;
+            }
+            const read_rc = std.os.linux.pread(fd, buf.ptr + total_read, buf.len - total_read, offset + @as(i64, @intCast(total_read)));
+            break :blk read_rc;
+        };
+        const signed_rc = @as(isize, @bitCast(rc));
+        if (signed_rc < 0) {
+            if (@as(usize, @bitCast(-signed_rc)) == 4) continue; // EINTR
+            return error.ReadError;
+        }
+        const bytes_read: usize = @bitCast(signed_rc);
+        if (bytes_read == 0) break;
+        total_read += bytes_read;
+    }
+    return total_read;
+}
+
+/// POSIX pwrite - write at offset without changing file position
+fn pwriteAll(fd: posix.fd_t, buf: []const u8, offset: i64) !void {
+    var total_written: usize = 0;
+    while (total_written < buf.len) {
+        const rc = blk: {
+            if (comptime native_os == .windows) {
+                return error.Unsupported;
+            }
+            const write_rc = std.os.linux.pwrite(fd, buf.ptr + total_written, buf.len - total_written, offset + @as(i64, @intCast(total_written)));
+            break :blk write_rc;
+        };
+        const signed_rc = @as(isize, @bitCast(rc));
+        if (signed_rc < 0) {
+            if (@as(usize, @bitCast(-signed_rc)) == 4) continue; // EINTR
+            return error.WriteError;
+        }
+        const bytes_written: usize = @bitCast(signed_rc);
+        if (bytes_written == 0) return error.WriteError;
+        total_written += bytes_written;
+    }
+}
 
 /// Cache statistics
 pub const CacheStats = struct {
@@ -432,4 +502,34 @@ test "page allocation" {
     const page_id = try pager.allocatePage();
     try std.testing.expectEqual(@as(u32, 1), page_id);
     try std.testing.expectEqual(@as(u32, 2), pager.next_page_id);
+}
+
+test "file persistence" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const test_path = try std.fs.path.join(allocator, &.{ tmp_dir.path, "zqlite_pager_test.db" });
+    defer allocator.free(test_path);
+
+    // Create pager and write data
+    {
+        const pager = try Pager.init(allocator, test_path);
+        defer pager.deinit();
+
+        const page_id = try pager.allocatePage();
+        const page = try pager.getPage(page_id);
+        @memcpy(page.data[0..5], "hello");
+        page.is_dirty = true;
+        try pager.flush();
+    }
+
+    // Reopen and verify data persisted
+    {
+        const pager = try Pager.init(allocator, test_path);
+        defer pager.deinit();
+
+        const page = try pager.getPage(1);
+        try std.testing.expectEqualSlices(u8, "hello", page.data[0..5]);
+    }
 }

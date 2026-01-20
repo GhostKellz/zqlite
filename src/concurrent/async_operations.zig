@@ -174,6 +174,7 @@ pub const AsyncDatabase = struct {
         defer parsed.deinit(self.allocator);
 
         var virtual_machine = vm.VirtualMachine.init(self.allocator, conn);
+        defer virtual_machine.deinitVM();
         var planner = @import("../executor/planner.zig").Planner.init(self.allocator);
 
         var plan = planner.plan(&parsed) catch |err| {

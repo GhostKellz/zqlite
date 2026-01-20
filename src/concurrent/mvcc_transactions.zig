@@ -2,7 +2,7 @@ const std = @import("std");
 const storage = @import("../db/storage.zig");
 const crypto = @import("../crypto/secure_storage.zig");
 const zsync = @import("zsync");
-const Wyhash = std.hash.Wyhash;
+const time_utils = @import("../time_utils.zig");
 const Wyhash = std.hash.Wyhash;
 
 /// Version chain entry for MVCC
@@ -125,7 +125,7 @@ pub const MVCCTransactionManager = struct {
         const transaction_id = self.generateTransactionId();
         const start_version = self.version_counter.load(.acquire);
 
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         const transaction = try self.allocator.create(Transaction);
         transaction.* = Transaction{
             .id = transaction_id,
@@ -182,9 +182,12 @@ pub const MVCCTransactionManager = struct {
         }
 
         // Acquire write lock
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
+        const table_copy = try self.allocator.dupe(u8, table);
+        errdefer self.allocator.free(table_copy);
+
         const lock_info = LockInfo{
-            .table = try self.allocator.dupe(u8, table),
+            .table = table_copy,
             .row_id = row_id,
             .lock_type = .Write,
             .acquired_at = ts.sec,
@@ -224,22 +227,25 @@ pub const MVCCTransactionManager = struct {
             return error.TransactionNotActive;
         }
 
-        // Phase 1: Validation
-        const commit_version = self.version_counter.fetchAdd(1, .acq_rel) + 1;
-
         // Check for conflicts in read set
         if (try self.hasReadConflicts(transaction)) {
             transaction.state = .Aborted;
+            try self.releaseLocks(transaction);
+            try self.deadlock_detector.removeTransaction(transaction_id);
             return error.ReadConflict;
         }
 
         // Check for write conflicts
         if (try self.hasWriteConflicts(transaction)) {
             transaction.state = .Aborted;
+            try self.releaseLocks(transaction);
+            try self.deadlock_detector.removeTransaction(transaction_id);
             return error.WriteConflict;
         }
 
-        // Phase 2: Write phase
+        // Validation passed, increment version and apply writes
+        const commit_version = self.version_counter.fetchAdd(1, .acq_rel) + 1;
+
         self.global_lock.lock();
         defer self.global_lock.unlock();
 
@@ -259,7 +265,6 @@ pub const MVCCTransactionManager = struct {
             }
         }
 
-        // Phase 3: Commit
         transaction.state = .Committed;
         transaction.commit_version = commit_version;
 
@@ -267,7 +272,7 @@ pub const MVCCTransactionManager = struct {
         try self.committed_versions.put(transaction_id, commit_version);
 
         // Log the commit
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         const commit_entry = CommitLogEntry{
             .transaction_id = transaction_id,
             .commit_version = commit_version,
@@ -427,7 +432,7 @@ pub const MVCCTransactionManager = struct {
         const cloned_row = storage.Row{ .values = cloned_values };
 
         // Add new version to chain
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         try chain.addVersion(self.allocator, version, 0, cloned_row, ts.sec);
 
         // Write to underlying storage
@@ -452,7 +457,7 @@ pub const MVCCTransactionManager = struct {
         };
 
         // Add tombstone version (null data indicates deleted)
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         try chain.addVersion(self.allocator, version, 0, null, ts.sec);
     }
 
@@ -466,7 +471,7 @@ pub const MVCCTransactionManager = struct {
 
     /// Generate a unique transaction ID
     fn generateTransactionId(self: *Self) TransactionId {
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         return @as(TransactionId, @intCast(ts.sec)) * 1000 + @as(TransactionId, @intCast(self.transactions.count()));
     }
 

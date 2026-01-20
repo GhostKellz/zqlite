@@ -62,7 +62,7 @@ pub fn main() !void {
         std.debug.print("{}. Query: {s}\n", .{ i + 1, query });
 
         // First execution - cache miss
-        const ts_start = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts_start = zqlite.time_utils.getTimespec();
         const start_time = @as(i128, ts_start.sec) * std.time.ns_per_s + ts_start.nsec;
 
         // Hash the query for caching
@@ -99,13 +99,13 @@ pub fn main() !void {
                 allocator.free(row.values);
             }
 
-            const ts_final = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+            const ts_final = zqlite.time_utils.getTimespec();
             const final_time = @as(i128, ts_final.sec) * std.time.ns_per_s + ts_final.nsec;
             const execution_time = final_time - start_time;
             std.debug.print("   ⏱️  Execution time: {d:.2}ms\n", .{@as(f64, @floatFromInt(execution_time)) / std.time.ns_per_ms});
         } else {
             std.debug.print("   ✅ Cache HIT - Using cached result\n", .{});
-            const ts_cache = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+            const ts_cache = zqlite.time_utils.getTimespec();
             const cache_end_time = @as(i128, ts_cache.sec) * std.time.ns_per_s + ts_cache.nsec;
             const cache_time = cache_end_time - start_time;
             std.debug.print("   ⚡ Cache retrieval time: {d:.2}ms\n", .{@as(f64, @floatFromInt(cache_time)) / std.time.ns_per_ms});

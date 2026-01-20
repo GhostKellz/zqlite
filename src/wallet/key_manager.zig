@@ -3,6 +3,7 @@ const crypto = std.crypto;
 const Allocator = std.mem.Allocator;
 const hd_wallet = @import("hd_wallet.zig");
 const encrypted_storage = @import("encrypted_storage.zig");
+const time_utils = @import("../time_utils.zig");
 
 pub const KeyManager = struct {
     const Self = @This();
@@ -414,7 +415,7 @@ test "Key storage operations" {
     var key_storage = KeyStorage.init(allocator);
     defer key_storage.deinit();
 
-    const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+    const ts = time_utils.getTimespec();
     const timestamp = ts.sec;
     const stored_key = KeyStorage.StoredKey{
         .key_id = try allocator.dupe(u8, "test_key_123"),

@@ -1,4 +1,5 @@
 const std = @import("std");
+const time_utils = @import("../time_utils.zig");
 const storage = @import("../db/storage.zig");
 const ast = @import("../parser/ast.zig");
 const Allocator = std.mem.Allocator;
@@ -158,7 +159,7 @@ pub const FunctionEvaluator = struct {
         }
 
         // Return current timestamp as ISO 8601 string
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         const timestamp = ts.sec;
         const datetime_str = try self.formatTimestamp(timestamp);
         return storage.Value{ .Text = datetime_str };
@@ -224,7 +225,7 @@ pub const FunctionEvaluator = struct {
                 switch (value) {
                     .Text => |text| {
                         if (std.mem.eql(u8, text, "now")) {
-                            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+                            const ts = time_utils.getTimespec();
                             timestamp = ts.sec;
                         } else {
                             // Try to parse as datetime string
@@ -245,7 +246,7 @@ pub const FunctionEvaluator = struct {
 
     fn evalUnixepoch(self: *Self, arguments: []ast.FunctionArgument) !storage.Value {
         if (arguments.len == 0) {
-            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+            const ts = time_utils.getTimespec();
             return storage.Value{ .Integer = ts.sec };
         }
 
@@ -259,7 +260,7 @@ pub const FunctionEvaluator = struct {
                 switch (value) {
                     .Text => |text| {
                         if (std.mem.eql(u8, text, "now")) {
-                            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+                            const ts = time_utils.getTimespec();
                             return storage.Value{ .Integer = ts.sec };
                         } else {
                             const timestamp = try self.parseTimestamp(text);
@@ -275,7 +276,7 @@ pub const FunctionEvaluator = struct {
 
     fn evalJulianday(self: *Self, arguments: []ast.FunctionArgument) !storage.Value {
         if (arguments.len == 0) {
-            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+            const ts = time_utils.getTimespec();
             const timestamp = ts.sec;
             const julian_day = self.timestampToJulianDay(timestamp);
             return storage.Value{ .Real = julian_day };
@@ -292,7 +293,7 @@ pub const FunctionEvaluator = struct {
                     .Text => |text| {
                         var timestamp: i64 = undefined;
                         if (std.mem.eql(u8, text, "now")) {
-                            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+                            const ts = time_utils.getTimespec();
                             timestamp = ts.sec;
                         } else {
                             timestamp = try self.parseTimestamp(text);
@@ -313,7 +314,7 @@ pub const FunctionEvaluator = struct {
 
     fn evalDate(self: *Self, arguments: []ast.FunctionArgument) !storage.Value {
         if (arguments.len == 0) {
-            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+            const ts = time_utils.getTimespec();
             const timestamp = ts.sec;
             const date_str = try self.formatDate(timestamp);
             return storage.Value{ .Text = date_str };
@@ -330,7 +331,7 @@ pub const FunctionEvaluator = struct {
                     .Text => |text| {
                         var timestamp: i64 = undefined;
                         if (std.mem.eql(u8, text, "now")) {
-                            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+                            const ts = time_utils.getTimespec();
                             timestamp = ts.sec;
                         } else {
                             timestamp = try self.parseTimestamp(text);
@@ -351,7 +352,7 @@ pub const FunctionEvaluator = struct {
 
     fn evalTime(self: *Self, arguments: []ast.FunctionArgument) !storage.Value {
         if (arguments.len == 0) {
-            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+            const ts = time_utils.getTimespec();
             const timestamp = ts.sec;
             const time_str = try self.formatTime(timestamp);
             return storage.Value{ .Text = time_str };
@@ -368,7 +369,7 @@ pub const FunctionEvaluator = struct {
                     .Text => |text| {
                         var timestamp: i64 = undefined;
                         if (std.mem.eql(u8, text, "now")) {
-                            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+                            const ts = time_utils.getTimespec();
                             timestamp = ts.sec;
                         } else {
                             timestamp = try self.parseTimestamp(text);
@@ -393,7 +394,7 @@ pub const FunctionEvaluator = struct {
         }
 
         // Return current timestamp as ISO 8601 string
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         const timestamp = ts.sec;
         const datetime_str = try self.formatTimestamp(timestamp);
         return storage.Value{ .Text = datetime_str };
@@ -405,7 +406,7 @@ pub const FunctionEvaluator = struct {
         }
 
         // Return current date as YYYY-MM-DD string
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         const timestamp = ts.sec;
         const date_str = try self.formatDate(timestamp);
         return storage.Value{ .Text = date_str };
@@ -417,7 +418,7 @@ pub const FunctionEvaluator = struct {
         }
 
         // Return current time as HH:MM:SS string
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = time_utils.getTimespec();
         const timestamp = ts.sec;
         const time_str = try self.formatTime(timestamp);
         return storage.Value{ .Text = time_str };
@@ -490,7 +491,7 @@ pub const FunctionEvaluator = struct {
         _ = self;
         // Simplified parser - in production, use proper datetime parsing
         if (std.mem.eql(u8, datetime_str, "now")) {
-            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+            const ts = time_utils.getTimespec();
             return ts.sec;
         }
 
@@ -499,7 +500,7 @@ pub const FunctionEvaluator = struct {
             return timestamp;
         } else |_| {
             // For now, return current timestamp for unparseable strings
-            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+            const ts = time_utils.getTimespec();
             return ts.sec;
         }
     }
