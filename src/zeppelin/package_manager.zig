@@ -1,11 +1,12 @@
 const std = @import("std");
 const storage = @import("../db/storage.zig");
 const connection = @import("../db/connection.zig");
-const crypto = @import("../zqlite.zig").crypto;
+const zqlite = @import("../zqlite.zig");
+const crypto = zqlite.crypto;
 
-/// Get current time in milliseconds using POSIX clock
+/// Get current time in milliseconds using compat clock
 fn getMilliTimestamp() i64 {
-    const ts = std.posix.clock_gettime(.REALTIME) catch return 0;
+    const ts = zqlite.time_utils.getTimespec();
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
 }
 

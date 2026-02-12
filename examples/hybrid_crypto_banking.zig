@@ -152,7 +152,7 @@ const PostQuantumBank = struct {
             .public_key_pq = pq_key,
             .account_type = account_type,
             .created_at = blk: {
-                const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+                const ts = zqlite.time_utils.getTimespec();
                 break :blk ts.sec;
             },
         };
@@ -177,7 +177,7 @@ const PostQuantumBank = struct {
         std.debug.print("💸 Processing transfer: {s} → {s} (amount: {})\n", .{ from_account, to_account, amount });
 
         // Generate transaction ID
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = zqlite.time_utils.getTimespec();
         const timestamp = ts.sec;
         const tx_id = try std.fmt.allocPrint(self.allocator, "tx_{d}", .{timestamp});
         defer self.allocator.free(tx_id);
@@ -232,7 +232,7 @@ const PostQuantumBank = struct {
             .amount = amount,
             .signature = signature,
             .timestamp = blk: {
-                const ts2 = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+                const ts2 = zqlite.time_utils.getTimespec();
                 break :blk ts2.sec;
             },
             .tx_type = if (private_transfer) .PrivateTransfer else .Transfer,

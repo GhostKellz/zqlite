@@ -221,7 +221,10 @@ pub const BTree = struct {
         var root = try self.readNode(self.root_page);
         defer root.deinit(self.allocator);
 
-        if (root.isFull()) {
+        // Check both key count fullness AND size-based overflow
+        const needs_split = root.isFull() or (root.is_leaf and root.wouldOverflow(value));
+
+        if (needs_split) {
             // Split root
             const new_root_page = try self.pager.allocatePage();
             var new_root = try Node.initInternal(self.allocator, self.order);
@@ -271,10 +274,11 @@ pub const BTree = struct {
                 const original_row = node.values[i];
                 const key = node.keys[i];
 
-                // Clone the row
-                var cloned_values = try self.allocator.alloc(storage.Value, original_row.values.len);
+                // Clone the row using the PASSED allocator for consistency
+                // (caller will use same allocator to free)
+                var cloned_values = try allocator.alloc(storage.Value, original_row.values.len);
                 for (original_row.values, 0..) |value, j| {
-                    cloned_values[j] = try value.clone(self.allocator);
+                    cloned_values[j] = try value.clone(allocator);
                 }
                 try results.append(allocator, KeyRowPair{
                     .key = key,
@@ -297,9 +301,23 @@ pub const BTree = struct {
         defer node.deinit(self.allocator);
 
         if (node.is_leaf) {
-            // Insert into leaf
-            node.insertKey(key, value);
+            // Clone the value before inserting so the node owns its copy.
+            // This prevents double-free when writeNode fails: node.deinit will
+            // free the clone, and the caller can safely free their original.
+            const cloned_value = try self.cloneRow(value);
+            // Note: No errdefer needed - if writeNode fails, node.deinit (via defer above)
+            // will clean up the cloned_value since it's been inserted into the node.
+
+            // Insert the clone into leaf
+            node.insertKey(key, cloned_value);
             try self.writeNode(page_id, &node);
+
+            // Success: free the original value since we used a clone
+            // This maintains the "insert takes ownership" contract
+            for (value.values) |val| {
+                val.deinit(self.allocator);
+            }
+            self.allocator.free(value.values);
         } else {
             // Find child to insert into using binary search
             const search_result = node.binarySearchKey(key);
@@ -313,7 +331,10 @@ pub const BTree = struct {
             var child = try self.readNode(node.children[child_index]);
             defer child.deinit(self.allocator);
 
-            if (child.isFull()) {
+            // Check both key count fullness AND size-based overflow
+            const needs_split = child.isFull() or (child.is_leaf and child.wouldOverflow(value));
+
+            if (needs_split) {
                 try self.splitChild(&node, child_index);
                 // After split, check if we need to adjust child index
                 const new_search = node.binarySearchKey(key);
@@ -432,6 +453,7 @@ pub const BTree = struct {
     }
 
     /// Collect all values from leaf nodes (for table scans)
+    /// Uses passed allocator for all cloning for consistency with caller's deallocation
     fn collectAllLeafValues(self: *Self, page_id: u32, results: *std.ArrayList(storage.Row), allocator: std.mem.Allocator) !void {
         var node = try self.readNode(page_id);
         defer node.deinit(self.allocator);
@@ -442,24 +464,25 @@ pub const BTree = struct {
                 const original_row = node.values[i];
 
                 // Clone the entire row with proper memory management
-                var cloned_values = try self.allocator.alloc(storage.Value, original_row.values.len);
+                // Use PASSED allocator for consistency - caller will use same allocator to free
+                var cloned_values = try allocator.alloc(storage.Value, original_row.values.len);
                 for (original_row.values, 0..) |value, j| {
                     cloned_values[j] = switch (value) {
                         .Integer => |int| storage.Value{ .Integer = int },
                         .Real => |real| storage.Value{ .Real = real },
-                        .Text => |text| storage.Value{ .Text = try self.allocator.dupe(u8, text) },
-                        .Blob => |blob| storage.Value{ .Blob = try self.allocator.dupe(u8, blob) },
+                        .Text => |text| storage.Value{ .Text = try allocator.dupe(u8, text) },
+                        .Blob => |blob| storage.Value{ .Blob = try allocator.dupe(u8, blob) },
                         .Null => storage.Value.Null,
                         .Parameter => |param_index| storage.Value{ .Parameter = param_index },
-                        .FunctionCall => |func| storage.Value{ .FunctionCall = try self.cloneStorageFunctionCall(func) },
+                        .FunctionCall => |func| storage.Value{ .FunctionCall = try self.cloneStorageFunctionCallWithAllocator(func, allocator) },
                         // PostgreSQL compatibility values
-                        .JSON => |json| storage.Value{ .JSON = try self.allocator.dupe(u8, json) },
+                        .JSON => |json| storage.Value{ .JSON = try allocator.dupe(u8, json) },
                         .JSONB => |jsonb| blk: {
-                            const json_str = jsonb.toString(self.allocator) catch {
+                            const json_str = jsonb.toString(allocator) catch {
                                 break :blk storage.Value.Null;
                             };
-                            break :blk storage.Value{ .JSONB = storage.JSONBValue.init(self.allocator, json_str) catch {
-                                self.allocator.free(json_str);
+                            break :blk storage.Value{ .JSONB = storage.JSONBValue.init(allocator, json_str) catch {
+                                allocator.free(json_str);
                                 break :blk storage.Value.Null;
                             } };
                         },
@@ -468,12 +491,12 @@ pub const BTree = struct {
                             .Array = storage.ArrayValue{
                                 .element_type = array.element_type,
                                 .elements = blk: {
-                                    var cloned_elements = try self.allocator.alloc(storage.Value, array.elements.len);
+                                    var cloned_elements = try allocator.alloc(storage.Value, array.elements.len);
                                     for (array.elements, 0..) |elem, k| {
                                         // Recursively clone array elements (simplified - could cause stack overflow for deeply nested arrays)
                                         cloned_elements[k] = switch (elem) {
                                             .Integer => |int| storage.Value{ .Integer = int },
-                                            .Text => |text| storage.Value{ .Text = try self.allocator.dupe(u8, text) },
+                                            .Text => |text| storage.Value{ .Text = try allocator.dupe(u8, text) },
                                             .Real => |real| storage.Value{ .Real = real },
                                             else => storage.Value.Null, // Simplified - handle complex nested types as null
                                         };
@@ -486,7 +509,7 @@ pub const BTree = struct {
                         .Timestamp => |ts| storage.Value{ .Timestamp = ts },
                         .TimestampTZ => |tstz| storage.Value{ .TimestampTZ = storage.TimestampTZValue{
                             .timestamp = tstz.timestamp,
-                            .timezone = try self.allocator.dupe(u8, tstz.timezone),
+                            .timezone = try allocator.dupe(u8, tstz.timezone),
                         } },
                         .Date => |date| storage.Value{ .Date = date },
                         .Time => |time| storage.Value{ .Time = time },
@@ -494,7 +517,7 @@ pub const BTree = struct {
                         .Numeric => |numeric| storage.Value{ .Numeric = storage.NumericValue{
                             .precision = numeric.precision,
                             .scale = numeric.scale,
-                            .digits = try self.allocator.dupe(u8, numeric.digits),
+                            .digits = try allocator.dupe(u8, numeric.digits),
                             .is_negative = numeric.is_negative,
                         } },
                         .SmallInt => |si| storage.Value{ .SmallInt = si },
@@ -759,6 +782,24 @@ pub const BTree = struct {
         };
     }
 
+    /// Clone a storage function call with specified allocator (for consistent allocation/deallocation)
+    fn cloneStorageFunctionCallWithAllocator(self: *Self, function_call: storage.Column.FunctionCall, allocator: std.mem.Allocator) !storage.Column.FunctionCall {
+        _ = self;
+        var cloned_args = try allocator.alloc(storage.Column.FunctionArgument, function_call.arguments.len);
+        for (function_call.arguments, 0..) |arg, i| {
+            cloned_args[i] = switch (arg) {
+                .Literal => |literal| storage.Column.FunctionArgument{ .Literal = try literal.clone(allocator) },
+                .Column => |column| storage.Column.FunctionArgument{ .Column = try allocator.dupe(u8, column) },
+                .Parameter => |param_index| storage.Column.FunctionArgument{ .Parameter = param_index },
+            };
+        }
+
+        return storage.Column.FunctionCall{
+            .name = try allocator.dupe(u8, function_call.name),
+            .arguments = cloned_args,
+        };
+    }
+
     /// Clone a storage function argument
     fn cloneStorageFunctionArgument(self: *Self, arg: storage.Column.FunctionArgument) !storage.Column.FunctionArgument {
         return switch (arg) {
@@ -845,9 +886,57 @@ pub const Node = struct {
         };
     }
 
-    /// Check if node is full
+    /// Check if node is full (by key count)
     pub fn isFull(self: *const Self) bool {
         return self.key_count >= self.order - 1;
+    }
+
+    /// Estimate serialized size of a single row
+    fn estimateRowSize(row: storage.Row) usize {
+        var size: usize = 4; // Row value count (u32)
+        for (row.values) |val| {
+            size += switch (val) {
+                .Integer, .BigInt, .Timestamp, .Interval, .Time => 9, // tag + i64
+                .Real => 9, // tag + f64
+                .SmallInt => 3, // tag + i16
+                .Date => 5, // tag + i32
+                .Boolean => 2, // tag + bool
+                .Null => 1, // tag only
+                .Parameter => 5, // tag + u32
+                .Text => |t| 5 + t.len, // tag + len + data
+                .Blob => |b| 5 + b.len, // tag + len + data
+                .JSON => |j| 5 + j.len,
+                .UUID => 17, // tag + 16 bytes
+                else => 10, // Conservative estimate for other types
+            };
+        }
+        return size;
+    }
+
+    /// Estimate current serialized size of the node
+    fn estimateCurrentSize(self: *const Self) usize {
+        var size: usize = 9; // Header: is_leaf + key_count + order
+        size += self.key_count * 8; // Keys
+
+        if (self.is_leaf) {
+            for (self.values[0..self.key_count]) |row| {
+                size += estimateRowSize(row);
+            }
+        } else {
+            size += (self.key_count + 1) * 4; // Child pointers
+        }
+        return size;
+    }
+
+    /// Check if adding a row would exceed page capacity (4KB)
+    pub fn wouldOverflow(self: *const Self, new_row: storage.Row) bool {
+        const current = self.estimateCurrentSize();
+        const new_row_size = estimateRowSize(new_row);
+        const new_key_size: usize = 8; // u64 key
+        const page_size: usize = 4096;
+        const safety_margin: usize = 64; // Leave some margin for alignment etc
+
+        return current + new_row_size + new_key_size > page_size - safety_margin;
     }
 
     /// Binary search result structure

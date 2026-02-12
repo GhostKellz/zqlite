@@ -336,7 +336,7 @@ fn benchmarkCrypto(allocator: std.mem.Allocator) !void {
     const test_data = "benchmark_test_data_for_performance_measurement";
 
     // Benchmark encryption/decryption
-    const ts_start_time = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+    const ts_start_time = zqlite.time_utils.getTimespec();
     const start_time = @as(i128, ts_start_time.sec) * std.time.ns_per_s + ts_start_time.nsec;
 
     for (0..iterations) |_| {
@@ -347,7 +347,7 @@ fn benchmarkCrypto(allocator: std.mem.Allocator) !void {
         defer allocator.free(decrypted);
     }
 
-    const ts_end_time = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+    const ts_end_time = zqlite.time_utils.getTimespec();
     const end_time = @as(i128, ts_end_time.sec) * std.time.ns_per_s + ts_end_time.nsec;
     const duration_ms = @as(f64, @floatFromInt(end_time - start_time)) / 1_000_000.0;
     const ops_per_sec = @as(f64, @floatFromInt(iterations)) / (duration_ms / 1000.0);

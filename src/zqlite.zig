@@ -100,6 +100,9 @@ pub const database_errors = @import("error_handling/database_errors.zig");
 // Time utilities (safe timestamp functions)
 pub const time_utils = @import("time_utils.zig");
 
+// Compatibility shims for Zig 0.16 (mutex/condition/clock_gettime/Instant)
+pub const compat = @import("zsync/compat/thread.zig");
+
 // PQ-QUIC transport (profile: full, or -Dtransport=true)
 pub const transport = if (build_options.enable_transport)
     struct {
@@ -182,7 +185,7 @@ pub fn printBuildInfo() void {
 
 // Tests
 test "zqlite version info" {
-    try std.testing.expect(std.mem.eql(u8, version.VERSION_STRING, "1.5.0"));
+    try std.testing.expect(std.mem.eql(u8, version.VERSION_STRING, "1.5.2"));
 }
 
 test "build info contains version" {

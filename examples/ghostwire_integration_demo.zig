@@ -98,10 +98,7 @@ fn demonstratePeerRegistration(conn: *zqlite.Connection) !void {
         },
     };
 
-    const now = @as(f64, @floatFromInt(blk: {
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-        break :blk ts.sec;
-    }));
+    const now = @as(f64, @floatFromInt(zqlite.time_utils.getTimespec().sec));
 
     for (peers) |peer| {
         // Use parameterized queries for safety
@@ -137,7 +134,7 @@ fn demonstratePerformanceFeatures(conn: *zqlite.Connection) !void {
     );
 
     // Simulate fast ACL evaluation (this would use ZQLite's CIDR operators in real implementation)
-    const ts_start = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+    const ts_start = zqlite.time_utils.getTimespec();
     const start_time = @as(i128, ts_start.sec) * std.time.ns_per_s + ts_start.nsec;
 
     var acl_result = try conn.query(
@@ -147,7 +144,7 @@ fn demonstratePerformanceFeatures(conn: *zqlite.Connection) !void {
     );
     defer acl_result.deinit();
 
-    const ts_end = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+    const ts_end = zqlite.time_utils.getTimespec();
     const end_time = @as(i128, ts_end.sec) * std.time.ns_per_s + ts_end.nsec;
     const duration_us = @as(f64, @floatFromInt(end_time - start_time)) / 1000.0;
 

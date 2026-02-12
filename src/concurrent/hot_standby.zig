@@ -4,6 +4,7 @@ const mvcc = @import("mvcc_transactions.zig");
 const transport = @import("../transport/transport.zig");
 const zsync = @import("zsync");
 const time_utils = @import("../time_utils.zig");
+const zqlite = @import("../zqlite.zig");
 
 /// Hot Standby System for Zero-Downtime Failover
 /// Provides continuous replication and seamless failover capabilities
@@ -212,9 +213,9 @@ pub const HotStandby = struct {
         self.stopReplicatingToStandbys();
     }
 
-    /// Get current time in milliseconds using POSIX clock
+    /// Get current time in milliseconds using compat clock
     fn getMilliTimestamp() i64 {
-        const ts = std.posix.clock_gettime(.REALTIME) catch return 0;
+        const ts = zqlite.time_utils.getTimespec();
         return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
     }
 

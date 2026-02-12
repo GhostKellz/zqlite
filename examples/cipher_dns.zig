@@ -164,7 +164,7 @@ const CipherDNS = struct {
         if (!self.cache_enabled) return;
 
         var buf: [256]u8 = undefined;
-        const ts_timestamp = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts_timestamp = zqlite.time_utils.getTimespec();
         const timestamp = ts_timestamp.sec;
 
         if (std.mem.eql(u8, stat_type, "queries")) {

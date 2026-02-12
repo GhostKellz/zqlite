@@ -12,6 +12,7 @@ pub const PreparedStatement = struct {
     statement: ast.Statement,
     parameter_count: u32,
     parameter_types: []ParameterType,
+    parameters: []storage.Value,
     execution_plan: ?*ExecutionPlan,
     execution_count: u64,
     total_execution_time_us: u64,
@@ -28,6 +29,7 @@ pub const PreparedStatement = struct {
         stmt.statement = statement;
         stmt.parameter_count = 0;
         stmt.parameter_types = &[_]ParameterType{};
+        stmt.parameters = &[_]storage.Value{};
         stmt.execution_plan = null;
         stmt.execution_count = 0;
         stmt.total_execution_time_us = 0;
@@ -53,9 +55,8 @@ pub const PreparedStatement = struct {
             return error.ParameterTypeMismatch;
         }
 
-        // Store the bound parameter (simplified - in a real implementation,
-        // we'd have a parameter storage mechanism)
-        // TODO: Store the bound parameter
+        // Store the bound parameter value
+        self.parameters[index] = value;
     }
 
     /// Execute the prepared statement with bound parameters
@@ -111,6 +112,12 @@ pub const PreparedStatement = struct {
         if (self.parameter_count > 0) {
             self.parameter_types = try self.allocator.alloc(ParameterType, self.parameter_count);
             try self.inferParameterTypes();
+
+            // Allocate storage for bound parameters, initialized to Null
+            self.parameters = try self.allocator.alloc(storage.Value, self.parameter_count);
+            for (self.parameters) |*param| {
+                param.* = storage.Value.Null;
+            }
         }
 
         // Create execution plan for complex queries
@@ -359,12 +366,28 @@ pub const PreparedStatement = struct {
             self.allocator.free(self.parameter_types);
         }
 
+        if (self.parameters.len > 0) {
+            self.allocator.free(self.parameters);
+        }
+
         if (self.execution_plan) |plan| {
             plan.deinit(self.allocator);
             self.allocator.destroy(plan);
         }
 
         self.allocator.destroy(self);
+    }
+
+    /// Reset all bound parameters to Null (for reuse)
+    pub fn resetParameters(self: *Self) void {
+        for (self.parameters) |*param| {
+            param.* = storage.Value.Null;
+        }
+    }
+
+    /// Get bound parameters for execution
+    pub fn getParameters(self: *Self) []storage.Value {
+        return self.parameters;
     }
 };
 

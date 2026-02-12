@@ -10,6 +10,16 @@ const BenchResult = struct {
     passed: bool,
 };
 
+/// Get current time in nanoseconds using Zig 0.16 API
+fn getNanoTime() i128 {
+    var ts: std.posix.timespec = undefined;
+    const result = std.posix.system.clock_gettime(.REALTIME, &ts);
+    if (std.posix.errno(result) == .SUCCESS) {
+        return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+    }
+    return 0;
+}
+
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
@@ -27,16 +37,14 @@ pub fn main() !void {
     // Benchmark 1: Simple INSERTs
     {
         const num_ops: usize = 10;
-        const ts_start = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-        const start = @as(i128, ts_start.sec) * std.time.ns_per_s + ts_start.nsec;
+        const start = getNanoTime();
 
         var i: usize = 0;
         while (i < num_ops) : (i += 1) {
             try conn.execute("INSERT INTO bench (id, value) VALUES (1, 'test')");
         }
 
-        const ts_end = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-        const end_time = @as(i128, ts_end.sec) * std.time.ns_per_s + ts_end.nsec;
+        const end_time = getNanoTime();
         const duration_s = @as(f64, @floatFromInt(end_time - start)) / 1_000_000_000.0;
         const ops_per_sec = @as(f64, @floatFromInt(num_ops)) / duration_s;
         const min_threshold = 1000.0; // CI-friendly threshold
@@ -52,8 +60,7 @@ pub fn main() !void {
     // Benchmark 2: Bulk INSERTs
     {
         const num_ops: usize = 10;
-        const ts_start = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-        const start = @as(i128, ts_start.sec) * std.time.ns_per_s + ts_start.nsec;
+        const start = getNanoTime();
 
         try conn.execute("BEGIN TRANSACTION");
         var i: usize = 0;
@@ -62,8 +69,7 @@ pub fn main() !void {
         }
         try conn.execute("COMMIT");
 
-        const ts_end = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-        const end_time = @as(i128, ts_end.sec) * std.time.ns_per_s + ts_end.nsec;
+        const end_time = getNanoTime();
         const duration_s = @as(f64, @floatFromInt(end_time - start)) / 1_000_000_000.0;
         const ops_per_sec = @as(f64, @floatFromInt(num_ops)) / duration_s;
         const min_threshold = 500.0; // CI-friendly threshold
@@ -79,8 +85,7 @@ pub fn main() !void {
     // Benchmark 3: SELECT queries
     {
         const num_ops: usize = 50;
-        const ts_start = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-        const start = @as(i128, ts_start.sec) * std.time.ns_per_s + ts_start.nsec;
+        const start = getNanoTime();
 
         var i: usize = 0;
         while (i < num_ops) : (i += 1) {
@@ -88,8 +93,7 @@ pub fn main() !void {
             result.deinit();
         }
 
-        const ts_end = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-        const end_time = @as(i128, ts_end.sec) * std.time.ns_per_s + ts_end.nsec;
+        const end_time = getNanoTime();
         const duration_s = @as(f64, @floatFromInt(end_time - start)) / 1_000_000_000.0;
         const ops_per_sec = @as(f64, @floatFromInt(num_ops)) / duration_s;
         const min_threshold = 500.0; // CI-friendly threshold
@@ -105,16 +109,14 @@ pub fn main() !void {
     // Benchmark 4: UPDATEs
     {
         const num_ops: usize = 50;
-        const ts_start = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-        const start = @as(i128, ts_start.sec) * std.time.ns_per_s + ts_start.nsec;
+        const start = getNanoTime();
 
         var i: usize = 0;
         while (i < num_ops) : (i += 1) {
             try conn.execute("UPDATE bench SET value = 'updated' WHERE id = 1");
         }
 
-        const ts_end = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-        const end_time = @as(i128, ts_end.sec) * std.time.ns_per_s + ts_end.nsec;
+        const end_time = getNanoTime();
         const duration_s = @as(f64, @floatFromInt(end_time - start)) / 1_000_000_000.0;
         const ops_per_sec = @as(f64, @floatFromInt(num_ops)) / duration_s;
         const min_threshold = 50.0; // CI-friendly threshold

@@ -59,7 +59,7 @@ pub const User = struct {
             .username = username,
             .email = email,
             .created_at = blk: {
-                const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+                const ts = zqlite.time_utils.getTimespec();
                 break :blk ts.sec;
             },
             .active = true,
@@ -89,7 +89,7 @@ pub const SecureFile = struct {
         std.crypto.random.bytes(&file_id);
         std.crypto.random.bytes(&encryption_key_id);
 
-        const ts_now = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts_now = zqlite.time_utils.getTimespec();
         const now = ts_now.sec;
 
         return SecureFile{
@@ -121,7 +121,7 @@ pub const FilePermission = struct {
     /// Check if permission is still valid
     pub fn isValid(self: *const FilePermission) bool {
         if (self.expires_at) |expires| {
-            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+            const ts = zqlite.time_utils.getTimespec();
             return ts.sec < expires;
         }
         return true;
@@ -153,7 +153,7 @@ pub const AuditLog = struct {
             .ip_address = ip_address,
             .user_agent = "ZQLite-SecureStorage/1.0.0",
             .timestamp = blk: {
-                const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+                const ts = zqlite.time_utils.getTimespec();
                 break :blk ts.sec;
             },
             .success = success,
@@ -347,7 +347,7 @@ pub const SecureStorageSystem = struct {
             .access_level = .admin,
             .granted_by = user_id,
             .granted_at = blk: {
-                const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+                const ts = zqlite.time_utils.getTimespec();
                 break :blk ts.sec;
             },
             .expires_at = null,
@@ -536,11 +536,11 @@ pub fn main() !void {
         .access_level = .read_only,
         .granted_by = alice.user_id,
         .granted_at = blk: {
-            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+            const ts = zqlite.time_utils.getTimespec();
             break :blk ts.sec;
         },
         .expires_at = blk: {
-            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+            const ts = zqlite.time_utils.getTimespec();
             break :blk ts.sec + (24 * 60 * 60);
         }, // 24 hours
     };

@@ -94,7 +94,7 @@ const NextGenDatabase = struct {
         defer self.allocator.free(encrypted_api_key);
 
         var buf: [1024]u8 = undefined;
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = zqlite.time_utils.getTimespec();
         const timestamp = ts.sec;
         const sql = try std.fmt.bufPrint(buf[0..], "INSERT INTO ai_agents (name, encrypted_config, api_keys, created_at) VALUES ('{s}', 'encrypted', 'encrypted', {})", .{ name, timestamp });
 
@@ -108,7 +108,7 @@ const NextGenDatabase = struct {
         defer self.allocator.free(encrypted_cert);
 
         var buf: [512]u8 = undefined;
-        const ts2 = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts2 = zqlite.time_utils.getTimespec();
         const timestamp2 = ts2.sec;
         const sql = try std.fmt.bufPrint(buf[0..], "INSERT INTO vpn_connections (client_id, encrypted_cert, connection_time, ip_address, data_transferred) VALUES ('{s}', 'encrypted', {}, '{s}', 0)", .{ client_id, timestamp2, ip_address });
 
@@ -122,7 +122,7 @@ const NextGenDatabase = struct {
         defer self.allocator.free(encrypted_key);
 
         var buf: [512]u8 = undefined;
-        const ts3 = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts3 = zqlite.time_utils.getTimespec();
         const timestamp3 = ts3.sec;
         const sql = try std.fmt.bufPrint(buf[0..], "INSERT INTO crypto_wallets (address, encrypted_private_key, balance, created_at) VALUES ('{s}', 'encrypted', {}, {})", .{ address, balance, timestamp3 });
 

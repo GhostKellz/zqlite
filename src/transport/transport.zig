@@ -4,6 +4,8 @@ const std = @import("std");
 pub const PQQuicTransport = @import("pq_quic.zig").PQQuicTransport;
 pub const PQDatabaseTransport = @import("pq_quic.zig").PQDatabaseTransport;
 
+const zqlite = @import("../zqlite.zig");
+
 /// ZQLite Transport Layer
 /// High-performance networking with optional post-quantum features
 pub const Transport = struct {
@@ -78,8 +80,8 @@ pub const Transport = struct {
     }
 
     pub fn connect(self: *Self, server_address: std.Io.net.IpAddress) !ConnectionId {
-        // Use POSIX clock for timestamp-based connection ID
-        const ts = std.posix.clock_gettime(.REALTIME) catch return error.TimeUnavailable;
+        // Use compat clock for timestamp-based connection ID
+        const ts = zqlite.time_utils.getTimespec();
         const conn_id: ConnectionId = @intCast(ts.sec);
         const connection = try Connection.init(self.allocator, conn_id, server_address);
         connection.state = .connected;

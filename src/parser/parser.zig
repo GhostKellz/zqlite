@@ -831,15 +831,27 @@ pub const Parser = struct {
     fn parseUpdate(self: *Self) !ast.Statement {
         try self.expect(.Update);
         const table_name = try self.expectIdentifier();
+        errdefer self.allocator.free(table_name);
+
         try self.expect(.Set);
 
         var assignments: std.ArrayList(ast.Assignment) = .{};
-        defer assignments.deinit(self.allocator);
+        errdefer {
+            // Clean up any already-parsed assignments on error
+            for (assignments.items) |assignment| {
+                self.allocator.free(assignment.column);
+                assignment.value.deinit(self.allocator);
+            }
+            assignments.deinit(self.allocator);
+        }
 
         while (true) {
             const column = try self.expectIdentifier();
+            errdefer self.allocator.free(column);
+
             try self.expect(.Equal);
             const value = try self.parseValue();
+            // value is now owned by assignment, no errdefer needed for it
 
             try assignments.append(self.allocator, ast.Assignment{
                 .column = column,
@@ -858,6 +870,9 @@ pub const Parser = struct {
             try self.advance();
             where_clause = try self.parseWhere();
         }
+        errdefer {
+            if (where_clause) |*wc| wc.deinit(self.allocator);
+        }
 
         return ast.Statement{
             .Update = ast.UpdateStatement{
@@ -873,11 +888,15 @@ pub const Parser = struct {
         try self.expect(.Delete);
         try self.expect(.From);
         const table_name = try self.expectIdentifier();
+        errdefer self.allocator.free(table_name);
 
         var where_clause: ?ast.WhereClause = null;
         if (std.meta.activeTag(self.current_token) == .Where) {
             try self.advance();
             where_clause = try self.parseWhere();
+        }
+        errdefer {
+            if (where_clause) |*wc| wc.deinit(self.allocator);
         }
 
         return ast.Statement{

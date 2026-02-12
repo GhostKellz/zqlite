@@ -49,7 +49,7 @@ pub const VPNPeer = struct {
 
     /// Check if peer is currently active
     pub fn isActive(self: *const VPNPeer) bool {
-        const ts_now = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts_now = zqlite.time_utils.getTimespec();
         const now = ts_now.sec;
         return (now - self.last_handshake) < 300; // 5 minutes
     }
@@ -58,7 +58,7 @@ pub const VPNPeer = struct {
     pub fn updateStats(self: *VPNPeer, tx: u64, rx: u64) void {
         self.bytes_tx += tx;
         self.bytes_rx += rx;
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = zqlite.time_utils.getTimespec();
 
         self.last_handshake = ts.sec;
     }
@@ -74,7 +74,7 @@ pub const VPNRoute = struct {
 
     /// Check if route is still valid
     pub fn isValid(self: *const VPNRoute) bool {
-        const ts_now = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts_now = zqlite.time_utils.getTimespec();
         const now = ts_now.sec;
         return (now - self.created_at) < 3600; // 1 hour validity
     }
@@ -154,7 +154,7 @@ pub const GhostMeshServer = struct {
             .public_key = peer_public_key,
             .allowed_ips = allowed_ips,
             .last_handshake = blk: {
-                const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+                const ts = zqlite.time_utils.getTimespec();
                 break :blk ts.sec;
             },
             .bytes_tx = 0,
@@ -182,7 +182,7 @@ pub const GhostMeshServer = struct {
 
         if (self.peers.getPtr(peer_id)) |peer_ptr| {
             peer_ptr.status = .online;
-            const ts2 = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+            const ts2 = zqlite.time_utils.getTimespec();
 
             peer_ptr.last_handshake = ts2.sec;
         }
@@ -217,7 +217,7 @@ pub const GhostMeshServer = struct {
             .metric = metric,
             .interface = "ghost0",
             .created_at = blk: {
-                const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+                const ts = zqlite.time_utils.getTimespec();
                 break :blk ts.sec;
             },
         };

@@ -841,8 +841,16 @@ pub const AsyncTransactionPool = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        _ = self; // TODO: Add cleanup if needed
-        // zsync handles cleanup automatically
+        // AsyncTransactionPool owns minimal heap resources:
+        // - mvcc_manager: Reference only (not owned, passed in from caller)
+        // - io: zsync.ThreadPoolIo is stack-allocated, zsync handles internal cleanup
+        // - semaphore: std.Thread.Semaphore is stack-allocated
+        // - active_transactions: atomic counter, no cleanup needed
+        //
+        // zsync automatically manages thread pool lifecycle and pending tasks.
+        // If future implementations add owned resources (e.g., task queues,
+        // allocated contexts), cleanup should be added here.
+        _ = self;
     }
 };
 

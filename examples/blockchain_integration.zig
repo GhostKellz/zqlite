@@ -333,7 +333,7 @@ pub const BlockchainDB = struct {
             .previous_hash = std.mem.zeroes([32]u8),
             .merkle_root = std.mem.zeroes([32]u8),
             .timestamp = blk: {
-                const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+                const ts = zqlite.time_utils.getTimespec();
                 break :blk ts.sec;
             },
             .difficulty = 1,
@@ -490,7 +490,7 @@ pub fn main() !void {
         .nonce = 0,
         .signature = std.mem.zeroes([64]u8),
         .timestamp = blk: {
-            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+            const ts = zqlite.time_utils.getTimespec();
             break :blk ts.sec;
         },
         .data = "Payment to Bob",
@@ -506,7 +506,7 @@ pub fn main() !void {
         .nonce = 0,
         .signature = std.mem.zeroes([64]u8),
         .timestamp = blk: {
-            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+            const ts = zqlite.time_utils.getTimespec();
             break :blk ts.sec;
         },
         .data = "Payment to Charlie",
@@ -521,7 +521,7 @@ pub fn main() !void {
         .previous_hash = blockchain.genesis_hash,
         .merkle_root = undefined,
         .timestamp = blk: {
-            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+            const ts = zqlite.time_utils.getTimespec();
             break :blk ts.sec;
         },
         .difficulty = 1,

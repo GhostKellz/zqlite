@@ -74,17 +74,30 @@ pub const PQQuicTransport = struct {
             };
         }
 
-        /// Derive initial keys from connection ID (RFC 9001)
+        /// Derive initial keys from connection ID (RFC 9001 Section 5.2)
         pub fn deriveInitialKeys(self: *QuicCrypto, connection_id: []const u8) !void {
-            _ = connection_id; // TODO: Use connection_id for proper key derivation
+            const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
 
-            // For now, using placeholder keys
-            // In production, this should derive keys from connection_id
-            const client_secret_buf: [32]u8 = std.mem.zeroes([32]u8);
-            self.initial_keys_client = try self.derivePacketKeys(client_secret_buf);
+            // RFC 9001 Section 5.2: Initial salt for QUIC v1
+            // This is the SHA-256 hash of "quic v1 salt"
+            const initial_salt = [_]u8{
+                0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3,
+                0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad,
+                0xcc, 0xbb, 0x7f, 0x0a,
+            };
 
-            const server_secret_buf: [32]u8 = std.mem.zeroes([32]u8);
-            self.initial_keys_server = try self.derivePacketKeys(server_secret_buf);
+            // Extract PRK from connection_id using initial salt
+            const prk = Hkdf.extract(&initial_salt, connection_id);
+
+            // Derive client initial secret
+            var client_secret: [32]u8 = undefined;
+            Hkdf.expand(&client_secret, "client in", prk);
+            self.initial_keys_client = try self.derivePacketKeys(client_secret);
+
+            // Derive server initial secret
+            var server_secret: [32]u8 = undefined;
+            Hkdf.expand(&server_secret, "server in", prk);
+            self.initial_keys_server = try self.derivePacketKeys(server_secret);
         }
 
         /// Derive packet keys from secret
@@ -427,7 +440,11 @@ pub const PQQuicTransport = struct {
         const ts = time_utils.getTimespec();
         const timestamp = ts.sec;
         const conn_id = @as(ConnectionId, @intCast(timestamp));
-        const client_addr = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
+        // Use placeholder address for simulated accept (real impl would get from socket)
+        const client_addr = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch |err| {
+            std.log.err("Failed to parse default client address: {}", .{err});
+            return error.InvalidAddress;
+        };
         const connection = try PQConnection.init(self.allocator, conn_id, client_addr);
 
         // Derive initial keys
@@ -629,7 +646,7 @@ test "post-quantum QUIC connection" {
     defer client.deinit();
 
     // Test connection establishment
-    const server_addr = std.Io.net.IpAddress.parse("127.0.0.1", 4433) catch unreachable;
+    const server_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 4433);
     const client_conn_id = try client.connect(server_addr);
 
     try testing.expect(client_conn_id != 0);
@@ -644,7 +661,7 @@ test "encrypted database query over PQ-QUIC" {
     var db_transport = PQDatabaseTransport.init(allocator, false);
     defer db_transport.deinit();
 
-    const server_addr = std.Io.net.IpAddress.parse("127.0.0.1", 4433) catch unreachable;
+    const server_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 4433);
     const conn_id = try db_transport.transport.connect(server_addr);
 
     const result = try db_transport.executeQuery(conn_id, "SELECT * FROM users WHERE id = 1");

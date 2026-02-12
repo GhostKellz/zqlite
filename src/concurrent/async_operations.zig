@@ -1,7 +1,9 @@
 const std = @import("std");
 const zsync = @import("zsync");
+const compat = @import("../zsync/compat/thread.zig");
 const storage = @import("../db/storage.zig");
 const connection = @import("../db/connection.zig");
+const time_utils = @import("../time_utils.zig");
 
 // Enhanced zsync v0.5.4 features
 const IoUringConfig = struct {
@@ -366,7 +368,7 @@ pub const AsyncDatabase = struct {
 
 /// Get current time in milliseconds using POSIX clock
 fn getMilliTimestamp() i64 {
-    const ts = std.posix.clock_gettime(.REALTIME) catch return 0;
+    const ts = time_utils.getTimespec();
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
 }
 
@@ -376,7 +378,7 @@ const ConnectionPool = struct {
     connections: std.ArrayList(*connection.Connection),
     connection_health: std.ArrayList(ConnectionHealth),
     available: std.Thread.Semaphore,
-    mutex: std.Thread.Mutex,
+    mutex: compat.Mutex = .{},
     health_check_interval_ms: u64,
     last_health_check: i64,
 
@@ -411,7 +413,7 @@ const ConnectionPool = struct {
             .connections = connections,
             .connection_health = health_info,
             .available = std.Thread.Semaphore{ .permits = pool_size },
-            .mutex = std.Thread.Mutex{},
+            .mutex = .init,
             .health_check_interval_ms = 300000, // 5 minutes
             .last_health_check = current_time,
         };

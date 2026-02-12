@@ -5,6 +5,35 @@ All notable changes to ZQLite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.2] - 2026-02-12
+
+### Fixed
+- **ORDER BY column lookup bug** - Now properly resolves column names instead of always sorting by first column
+- **Prepared statement parameter storage** - Parameters are now correctly stored and available for execution
+- **Query callback implementation** - Thread-safe query with callback now iterates through result rows
+
+### Added
+- **Phase1 Engine** - Two-phase commit coordinator for distributed transactions
+  - Lock acquisition and validation
+  - Vote collection from participants
+  - Timeout handling and recovery
+  - Integration with MVCC transaction manager
+
+### Changed
+- **PQ-QUIC key derivation** - Now uses RFC 9001 compliant HKDF with connection_id instead of placeholder zeros
+- **Post-quantum crypto fallback** - Gracefully falls back to Ed25519 with warning when PQ crypto unavailable
+- **MVCC AsyncTransactionPool** - Documented resource ownership in deinit
+- **Transport error handling** - Replaced `catch unreachable` with proper error propagation in pq_quic.zig
+
+### Added Documentation
+- **EXPERIMENTAL.md** - Comprehensive documentation of experimental feature limitations and roadmap
+
+### Tests
+- **Cluster manager integration tests** - Added 7 new tests covering node lifecycle, load balancing, health monitoring, query routing, memory cleanup, and shard management
+
+### Compatibility
+- Updated for Zig 0.16.0-dev.2535
+
 ## [1.3.5] - 2025-12-01
 
 ### Changed
@@ -100,3 +129,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Basic embedded SQL database
 - Core storage engine
 - Simple query parser
+## [1.5.2] - 2026-02-12
+
+### Added
+- Compatibility shims for Zig 0.16 removed APIs (mutex/condition, clock_gettime, Instant) exposed via `zqlite.compat`.
+
+### Changed
+- Switched all examples and core modules to use the compat clock helpers instead of `std.posix.clock_gettime`.
+- Centralized compat exports in `src/zqlite.zig` for easier consumption by modules and standalone tests.
+
+### Fixed
+- Logger and time utilities now operate on Zig 0.16.0-dev using the compat clock.
+- Ensured `zig test` targets succeed after the clock/mutex API removals.

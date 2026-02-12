@@ -57,7 +57,7 @@ pub const RateLimiter = struct {
     window_size_ns: i128,
     max_requests: u32,
     requests: std.AutoHashMap(u64, RequestWindow),
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex = .init,
 
     const RequestWindow = struct {
         count: u32,
@@ -171,7 +171,7 @@ pub const AuditLogger = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(AuditEntry),
     max_entries: usize,
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex = .init,
     file: ?std.fs.File,
 
     const Self = @This();

@@ -27,14 +27,14 @@ pub const ClientConnection = struct {
 
     /// Check if connection is still active
     pub fn isActive(self: *const ClientConnection) bool {
-        const ts_now = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts_now = zqlite.time_utils.getTimespec();
         const now = ts_now.sec;
         return (now - self.last_activity) < 1800; // 30 minutes timeout
     }
 
     /// Update activity timestamp
     pub fn updateActivity(self: *ClientConnection) void {
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts = zqlite.time_utils.getTimespec();
 
         self.last_activity = ts.sec;
     }
@@ -95,7 +95,7 @@ pub const ZQLiteServer = struct {
             .connections = std.HashMap(u64, ClientConnection, std.HashMap.Sha256Context, std.hash_map.default_max_load_percentage).init(allocator),
             .connection_counter = 0,
             .server_started = blk: {
-                const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+                const ts = zqlite.time_utils.getTimespec();
                 break :blk ts.sec;
             },
             .total_queries = 0,
@@ -176,11 +176,11 @@ pub const ZQLiteServer = struct {
             .connection_id = connection_id,
             .client_address = client_address,
             .connected_at = blk: {
-                const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+                const ts = zqlite.time_utils.getTimespec();
                 break :blk ts.sec;
             },
             .last_activity = blk: {
-                const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+                const ts = zqlite.time_utils.getTimespec();
                 break :blk ts.sec;
             },
             .authenticated = false,
@@ -276,7 +276,7 @@ pub const ZQLiteServer = struct {
 
     /// Get server statistics
     pub fn getServerStats(self: *Self) ServerStats {
-        const ts_now = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
+        const ts_now = zqlite.time_utils.getTimespec();
         const uptime = ts_now.sec - self.server_started;
 
         return ServerStats{

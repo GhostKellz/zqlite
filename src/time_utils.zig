@@ -1,9 +1,11 @@
 const std = @import("std");
 
+const compat = @import("./zsync/compat/thread.zig");
+
 /// Get current timestamp in nanoseconds since epoch
 /// Returns 0 on error (fallback for systems where clock_gettime fails)
 pub fn getTimestampNanos() i128 {
-    const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch {
+    const ts = compat.clock_gettime(compat.CLOCK.REALTIME) catch {
         return 0;
     };
     return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
@@ -17,7 +19,7 @@ pub fn getTimestampMillis() i64 {
 
 /// Get current timestamp in seconds since epoch
 pub fn getTimestampSecs() i64 {
-    const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch {
+    const ts = compat.clock_gettime(compat.CLOCK.REALTIME) catch {
         return 0;
     };
     return ts.sec;
@@ -25,9 +27,9 @@ pub fn getTimestampSecs() i64 {
 
 /// Get timespec struct directly (for code that needs both sec and nsec)
 /// Returns zero timespec on error
-pub fn getTimespec() std.posix.timespec {
-    return std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch {
-        return std.posix.timespec{ .sec = 0, .nsec = 0 };
+pub fn getTimespec() compat.timespec {
+    return compat.clock_gettime(compat.CLOCK.REALTIME) catch {
+        return compat.timespec{ .sec = 0, .nsec = 0 };
     };
 }
 

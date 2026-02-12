@@ -1,9 +1,10 @@
 const std = @import("std");
 const storage = @import("../db/storage.zig");
+const zqlite = @import("../zqlite.zig");
 
 /// Get current time in milliseconds using POSIX clock
 fn getMilliTimestamp() i64 {
-    const ts = std.posix.clock_gettime(.REALTIME) catch return 0;
+    const ts = zqlite.time_utils.getTimespec();
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
 }
 

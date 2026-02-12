@@ -1,13 +1,14 @@
 const std = @import("std");
 const zqlite = @import("../zqlite.zig");
+const compat = @import("../zsync/compat/thread.zig");
 
 /// Thread-safe connection pool for concurrent database access
 pub const ConnectionPool = struct {
     allocator: std.mem.Allocator,
     connections: std.ArrayList(*zqlite.db.Connection),
     available: std.ArrayList(bool),
-    mutex: std.Thread.Mutex,
-    condition: std.Thread.Condition,
+    mutex: compat.Mutex = .{},
+    condition: compat.Condition = .{},
     database_path: []const u8,
     max_connections: u32,
     is_memory: bool,
@@ -21,8 +22,8 @@ pub const ConnectionPool = struct {
             .allocator = allocator,
             .connections = .{},
             .available = .{},
-            .mutex = std.Thread.Mutex{},
-            .condition = std.Thread.Condition{},
+            .mutex = .{},
+            .condition = .{},
             .database_path = try allocator.dupe(u8, database_path),
             .max_connections = max_connections,
             .is_memory = std.mem.eql(u8, database_path, ":memory:"),
@@ -47,8 +48,9 @@ pub const ConnectionPool = struct {
 
     /// Acquire a connection from the pool (blocks if none available)
     pub fn acquire(self: *Self) !*zqlite.db.Connection {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const io = std.io.getStdIo();
+        self.mutex.lock(io) catch unreachable;
+        defer self.mutex.unlock(io);
 
         while (true) {
             // Look for available connection
@@ -60,14 +62,15 @@ pub const ConnectionPool = struct {
             }
 
             // No connections available, wait
-            self.condition.wait(&self.mutex);
+            self.condition.wait(io, &self.mutex);
         }
     }
 
     /// Try to acquire a connection without blocking
     pub fn tryAcquire(self: *Self) ?*zqlite.db.Connection {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const io = std.io.getStdIo();
+        self.mutex.lock(io) catch unreachable;
+        defer self.mutex.unlock(io);
 
         // Look for available connection
         for (self.available.items, 0..) |is_available, i| {
@@ -164,13 +167,18 @@ pub const ThreadSafeDatabase = struct {
     }
 
     /// Execute SQL query with callback (thread-safe)
+    /// The callback is invoked for each row in the result set
     pub fn query(self: *Self, sql: []const u8, callback: anytype) !void {
         const conn = try self.pool.acquire();
         defer self.pool.release(conn);
 
-        // TODO: Implement query with callback
-        try conn.execute(sql);
-        _ = callback;
+        var result_set = try conn.query(sql);
+        defer result_set.deinit();
+
+        // Iterate through rows and invoke callback for each
+        while (result_set.next()) |row| {
+            callback(row);
+        }
     }
 
     /// Begin transaction (thread-safe)
@@ -239,9 +247,9 @@ pub const TransactionHandle = struct {
 
 /// Read-Write lock for fine-grained concurrency control
 pub const RWLock = struct {
-    mutex: std.Thread.Mutex,
-    read_condition: std.Thread.Condition,
-    write_condition: std.Thread.Condition,
+    mutex: compat.Mutex = .{},
+    read_condition: compat.Condition = .{},
+    write_condition: compat.Condition = .{},
     readers: u32,
     writers: u32,
     write_requests: u32,
@@ -251,9 +259,9 @@ pub const RWLock = struct {
     /// Initialize RW lock
     pub fn init() Self {
         return Self{
-            .mutex = std.Thread.Mutex{},
-            .read_condition = std.Thread.Condition{},
-            .write_condition = std.Thread.Condition{},
+            .mutex = .{},
+            .read_condition = .{},
+            .write_condition = .{},
             .readers = 0,
             .writers = 0,
             .write_requests = 0,

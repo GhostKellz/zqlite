@@ -789,11 +789,15 @@ pub const VirtualMachine = struct {
             // Build final values array for all table columns
             var final_values = try self.connection.allocator.alloc(storage.Value, table.schema.columns.len);
             var values_initialized: usize = 0;
+            var ownership_transferred = false;
             errdefer {
-                for (final_values[0..values_initialized]) |value| {
-                    value.deinit(self.connection.allocator);
+                // Only cleanup if ownership wasn't transferred to the table
+                if (!ownership_transferred) {
+                    for (final_values[0..values_initialized]) |value| {
+                        value.deinit(self.connection.allocator);
+                    }
+                    self.connection.allocator.free(final_values);
                 }
-                self.connection.allocator.free(final_values);
             }
 
             // Initialize all values to null first
@@ -859,6 +863,7 @@ pub const VirtualMachine = struct {
 
             // Insert the row and get the row_id
             const row_id = try table.insert(self.connection.allocator, final_values);
+            ownership_transferred = true; // Table now owns final_values
 
             // Log undo entry if in transaction
             if (self.connection.in_transaction) {
@@ -3176,14 +3181,20 @@ pub const VirtualMachine = struct {
 
                 // Compare by each ORDER BY clause
                 for (order_by) |clause| {
-                    // For simplicity, assume the column index is the order in the row
-                    // In a real implementation, we'd look up the column name
-                    const col_idx: usize = 0; // TODO: proper column lookup
-                    _ = clause;
+                    // Look up column index from table schema
+                    const col_idx: usize = if (self.current_table) |t|
+                        self.findColumnIndex(t, clause.column) orelse 0
+                    else
+                        0;
 
                     if (col_idx < items[j].values.len and col_idx < items[j + 1].values.len) {
                         const cmp = self.compareValues(items[j].values[col_idx], items[j + 1].values[col_idx]);
-                        if (cmp == .gt) should_swap = true;
+                        // Respect sort direction (ASC vs DESC)
+                        const should_swap_this = if (clause.direction == .Desc)
+                            cmp == .lt
+                        else
+                            cmp == .gt;
+                        if (should_swap_this) should_swap = true;
                         if (cmp != .eq) break;
                     }
                 }

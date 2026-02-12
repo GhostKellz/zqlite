@@ -666,3 +666,184 @@ test "cluster scaling operations" {
     try testing.expect(cluster.metrics.active_nodes == 3);
     try testing.expect(cluster.metrics.scale_down_operations == 1);
 }
+
+test "cluster node lifecycle with shard redistribution" {
+    const testing = std.testing;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var cluster = try ClusterManager.init(allocator, "test_cluster", "primary");
+    defer cluster.deinit();
+
+    // Add multiple nodes
+    try cluster.addNode("node2", "192.168.1.2", 8081);
+    try cluster.addNode("node3", "192.168.1.3", 8082);
+    try cluster.addNode("node4", "192.168.1.4", 8083);
+
+    try testing.expect(cluster.metrics.active_nodes == 4);
+    try testing.expect(cluster.metrics.nodes_added == 3);
+
+    // Verify health status includes all nodes
+    const health = cluster.getClusterHealth();
+    try testing.expect(health.total_nodes == 4);
+
+    // Remove a node - shards should redistribute
+    try cluster.removeNode("node3");
+
+    try testing.expect(cluster.metrics.active_nodes == 3);
+    try testing.expect(cluster.metrics.nodes_removed == 1);
+
+    // Verify remaining nodes
+    try testing.expect(cluster.nodes.get("node2") != null);
+    try testing.expect(cluster.nodes.get("node3") == null);
+    try testing.expect(cluster.nodes.get("node4") != null);
+}
+
+test "cluster load balancer round-robin fairness" {
+    const testing = std.testing;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var cluster = try ClusterManager.init(allocator, "test_cluster", "node1");
+    defer cluster.deinit();
+
+    // Add nodes for load balancing
+    try cluster.addNode("node2", "127.0.0.2", 8081);
+    try cluster.addNode("node3", "127.0.0.3", 8082);
+
+    // Verify load balancer has correct node count
+    try testing.expect(cluster.load_balancer.nodes.items.len == 3);
+
+    // Test round-robin selection
+    var selection_counts = [_]u32{ 0, 0, 0 };
+    var i: usize = 0;
+    while (i < 9) : (i += 1) {
+        const node = cluster.load_balancer.getNextNode();
+        if (node) |n| {
+            // Count selections by checking which node was returned
+            if (std.mem.eql(u8, n.id, "node1")) {
+                selection_counts[0] += 1;
+            } else if (std.mem.eql(u8, n.id, "node2")) {
+                selection_counts[1] += 1;
+            } else if (std.mem.eql(u8, n.id, "node3")) {
+                selection_counts[2] += 1;
+            }
+        }
+    }
+
+    // Each node should be selected 3 times in 9 iterations
+    try testing.expect(selection_counts[0] == 3);
+    try testing.expect(selection_counts[1] == 3);
+    try testing.expect(selection_counts[2] == 3);
+}
+
+test "cluster health monitor with mixed node states" {
+    const testing = std.testing;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var cluster = try ClusterManager.init(allocator, "test_cluster", "node1");
+    defer cluster.deinit();
+
+    // Add nodes with different initial states
+    try cluster.addNode("node2", "127.0.0.2", 8081);
+    try cluster.addNode("node3", "127.0.0.3", 8082);
+    try cluster.addNode("node4", "127.0.0.4", 8083);
+
+    // Manually set different health states
+    if (cluster.nodes.get("node2")) |node| {
+        node.status = .Unhealthy;
+    }
+    if (cluster.nodes.get("node3")) |node| {
+        node.status = .Maintenance;
+    }
+
+    const health = cluster.getClusterHealth();
+
+    // Total nodes = 4 (including local)
+    try testing.expect(health.total_nodes == 4);
+
+    // Check that health percentage accounts for states
+    // Healthy: node1 (local) + node4 = 2
+    // Unhealthy: node2 = 1
+    // Maintenance: node3 = 1 (excluded from health calculation)
+    try testing.expect(health.healthy_nodes >= 1);
+}
+
+test "cluster query routing by type" {
+    const testing = std.testing;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var cluster = try ClusterManager.init(allocator, "test_cluster", "primary");
+    defer cluster.deinit();
+
+    // Add replica nodes
+    try cluster.addNode("replica1", "127.0.0.2", 8081);
+    try cluster.addNode("replica2", "127.0.0.3", 8082);
+
+    // Test read query routing
+    const read_targets = try cluster.determineTargetNodes(.Read);
+    defer allocator.free(read_targets);
+    // Read queries can go to any node
+    try testing.expect(read_targets.len >= 1);
+
+    // Test write query routing
+    const write_targets = try cluster.determineTargetNodes(.Write);
+    defer allocator.free(write_targets);
+    // Write queries should target primary (and replicas for replication)
+    try testing.expect(write_targets.len >= 1);
+}
+
+test "cluster memory cleanup with node operations" {
+    // This test verifies no memory leaks during cluster operations
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .stack_trace_frames = 10 }){};
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked == .leak) {
+            @panic("Memory leak detected in cluster operations!");
+        }
+    }
+    const allocator = gpa.allocator();
+
+    // Perform many add/remove cycles
+    var cluster = try ClusterManager.init(allocator, "test_cluster", "node1");
+    defer cluster.deinit();
+
+    var i: u32 = 0;
+    while (i < 10) : (i += 1) {
+        const node_id = try std.fmt.allocPrint(allocator, "temp_node_{d}", .{i});
+        defer allocator.free(node_id);
+
+        try cluster.addNode(node_id, "127.0.0.1", 8080 + @as(u16, @intCast(i)));
+    }
+
+    // Remove all temp nodes
+    i = 0;
+    while (i < 10) : (i += 1) {
+        const node_id = try std.fmt.allocPrint(allocator, "temp_node_{d}", .{i});
+        defer allocator.free(node_id);
+
+        cluster.removeNode(node_id) catch {}; // Ignore errors if already removed
+    }
+
+    // Verify we're back to just the primary
+    try std.testing.expect(cluster.metrics.active_nodes == 1);
+}
+
+test "cluster shard manager initialization" {
+    const testing = std.testing;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var cluster = try ClusterManager.init(allocator, "test_cluster", "node1");
+    defer cluster.deinit();
+
+    // Verify shard manager is initialized with default shard count
+    try testing.expect(cluster.shard_manager.total_shards == 1024);
+}

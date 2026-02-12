@@ -65,22 +65,26 @@ pub const CryptoEngine = struct {
     }
 
     /// Generate secure keypair (classical or hybrid)
+    /// Note: Full post-quantum (ML-KEM-768) support requires Shroud library integration.
+    /// Currently falls back to Ed25519 when PQ crypto is requested but unavailable.
     pub fn generateKeyPair(self: *Self) !KeyPair {
         if (self.crypto.hasPQCrypto() and self.hybrid_mode) {
-            return error.PostQuantumNotImplemented; // TODO: Implement with Shroud
-        } else {
-            // Use native Ed25519 for classical crypto
-            const keypair = std.crypto.sign.Ed25519.KeyPair.create(null) catch |err| {
-                std.log.err("Failed to generate Ed25519 keypair: {}", .{err});
-                return err;
-            };
-
-            return KeyPair{
-                .public_key = keypair.public_key.bytes,
-                .secret_key = keypair.secret_key.bytes,
-                .is_hybrid = false,
-            };
+            // Post-quantum hybrid mode requested but Shroud library not integrated
+            // Fall back to classical Ed25519 with a warning
+            std.log.warn("Post-quantum crypto requested but not available (requires Shroud library). Falling back to Ed25519.", .{});
         }
+
+        // Use native Ed25519 for classical crypto (or as PQ fallback)
+        const keypair = std.crypto.sign.Ed25519.KeyPair.create(null) catch |err| {
+            std.log.err("Failed to generate Ed25519 keypair: {}", .{err});
+            return err;
+        };
+
+        return KeyPair{
+            .public_key = keypair.public_key.bytes,
+            .secret_key = keypair.secret_key.bytes,
+            .is_hybrid = false,
+        };
     }
 
     /// Encrypt data with master key

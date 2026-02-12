@@ -1,4 +1,30 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+const compat = if (builtin.is_test) struct {
+    pub const Mutex = struct {
+        state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+
+        pub fn lock(self: *Mutex) void {
+            while (true) {
+                if (self.state.compareExchangeWeak(0, 1, .acq_rel, .acquire) == .success) return;
+                std.atomic.spinLoopHint();
+            }
+        }
+
+        pub fn unlock(self: *Mutex) void {
+            self.state.store(0, .release);
+        }
+    };
+
+    pub const timespec = std.posix.timespec;
+    pub const CLOCK = enum { REALTIME };
+    pub fn clock_gettime(_: CLOCK) error{}!timespec {
+        var ts: timespec = undefined;
+        if (std.os.linux.clock_gettime(.REALTIME, &ts) != 0) return error{};
+        return ts;
+    }
+} else @import("root").compat;
 
 /// Production-grade structured logging system for Zig 0.16
 /// Features: JSON/text formats, log levels, thread-safe, scoped loggers
@@ -45,7 +71,7 @@ pub const LoggerConfig = struct {
 pub const Logger = struct {
     allocator: std.mem.Allocator,
     config: LoggerConfig,
-    mutex: std.Thread.Mutex,
+    mutex: compat.Mutex = .{},
 
     const Self = @This();
 
@@ -53,7 +79,7 @@ pub const Logger = struct {
         return Self{
             .allocator = allocator,
             .config = config,
-            .mutex = std.Thread.Mutex{},
+            .mutex = .{},
         };
     }
 
@@ -125,8 +151,8 @@ pub const Logger = struct {
     }
 
     fn getTimestamp() []const u8 {
-        // Get current timestamp in ISO 8601 format using POSIX clock
-        const ts = std.posix.clock_gettime(.REALTIME) catch return "UNKNOWN";
+        // Get current timestamp in ISO 8601 format using compat clock
+        const ts = compat.clock_gettime(compat.CLOCK.REALTIME) catch return "UNKNOWN";
         const timestamp_ms: i64 = @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
         const seconds = @divFloor(timestamp_ms, 1000);
         const milliseconds = @mod(timestamp_ms, 1000);
@@ -208,7 +234,7 @@ pub const Logger = struct {
 
 /// Global logger instance
 var global_logger: ?Logger = null;
-var global_logger_mutex: std.Thread.Mutex = .{};
+var global_logger_mutex: compat.Mutex = .{};
 
 pub fn initGlobalLogger(allocator: std.mem.Allocator, config: LoggerConfig) void {
     global_logger_mutex.lock();

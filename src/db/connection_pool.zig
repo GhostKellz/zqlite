@@ -1,5 +1,6 @@
 const std = @import("std");
 const time_utils = @import("../time_utils.zig");
+const compat = @import("../zsync/compat/thread.zig");
 const connection = @import("connection.zig");
 const storage = @import("storage.zig");
 
@@ -8,8 +9,9 @@ pub const ConnectionPool = struct {
     allocator: std.mem.Allocator,
     connections: std.ArrayList(*PooledConnection),
     available_connections: std.ArrayList(*PooledConnection),
-    mutex: std.Thread.Mutex,
-    condition: std.Thread.Condition,
+    // Use compat blocking primitives to avoid requiring Io context
+    mutex: compat.Mutex = .{},
+    condition: compat.Condition = .{},
     max_connections: u32,
     min_connections: u32,
     current_connections: u32,
@@ -25,8 +27,8 @@ pub const ConnectionPool = struct {
         pool.allocator = allocator;
         pool.connections = std.ArrayList(*PooledConnection){};
         pool.available_connections = std.ArrayList(*PooledConnection){};
-        pool.mutex = std.Thread.Mutex{};
-        pool.condition = std.Thread.Condition{};
+        pool.mutex = .{};
+        pool.condition = .{};
         pool.max_connections = max_connections;
         pool.min_connections = min_connections;
         pool.current_connections = 0;
