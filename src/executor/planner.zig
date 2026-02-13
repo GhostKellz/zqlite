@@ -33,6 +33,9 @@ pub const Planner = struct {
             .Pragma => |*pragma| try self.planPragma(pragma),
             .Explain => |*explain| try self.planExplain(explain),
             .CompoundSelect => |*compound| try self.planCompoundSelect(compound),
+            .Attach => |*attach| try self.planAttach(attach),
+            .Detach => |*detach| try self.planDetach(detach),
+            .CreateVirtualTable => |*create_vt| try self.planCreateVirtualTable(create_vt),
         };
     }
 
@@ -102,6 +105,15 @@ pub const Planner = struct {
                 try steps.append(self.allocator, ExecutionStep{
                     .Aggregate = AggregateStep{
                         .aggregates = try aggregates.toOwnedSlice(self.allocator),
+                    },
+                });
+            }
+
+            // HAVING clause (filter after aggregation)
+            if (select.having) |having| {
+                try steps.append(self.allocator, ExecutionStep{
+                    .Having = HavingStep{
+                        .condition = try self.cloneCondition(&having.condition),
                     },
                 });
             }
@@ -198,6 +210,11 @@ pub const Planner = struct {
                 }
                 non_window_columns.deinit(self.allocator);
             }
+        }
+
+        // DISTINCT step (remove duplicate rows)
+        if (select.distinct) {
+            try steps.append(self.allocator, ExecutionStep.Distinct);
         }
 
         // Limit step
@@ -406,7 +423,7 @@ pub const Planner = struct {
         for (update.assignments) |assignment| {
             try assignments.append(self.allocator, UpdateAssignment{
                 .column = try self.allocator.dupe(u8, assignment.column),
-                .value = try self.cloneValue(assignment.value),
+                .expr = try self.cloneExpression(assignment.expr),
             });
         }
 
@@ -561,10 +578,10 @@ pub const Planner = struct {
         return switch (condition.*) {
             .Comparison => |*comp| ast.Condition{
                 .Comparison = ast.ComparisonCondition{
-                    .left = try self.cloneExpression(&comp.left),
+                    .left = try self.cloneExpression(comp.left),
                     .operator = comp.operator,
-                    .right = try self.cloneExpression(&comp.right),
-                    .extra = if (comp.extra) |extra| try self.cloneExpression(&extra) else null,
+                    .right = try self.cloneExpression(comp.right),
+                    .extra = if (comp.extra) |extra| try self.cloneExpression(extra) else null,
                 },
             },
             .Logical => |*logical| {
@@ -585,12 +602,130 @@ pub const Planner = struct {
         };
     }
 
-    /// Clone an expression
-    fn cloneExpression(self: *Self, expression: *const ast.Expression) !ast.Expression {
-        return switch (expression.*) {
+    /// Clone an expression (handles columns, literals, parameters, binary ops, subqueries, and IN lists)
+    fn cloneExpression(self: *Self, expr: ast.Expression) !ast.Expression {
+        return switch (expr) {
             .Column => |col| ast.Expression{ .Column = try self.allocator.dupe(u8, col) },
             .Literal => |value| ast.Expression{ .Literal = try self.cloneAstValue(value) },
             .Parameter => |param_index| ast.Expression{ .Parameter = param_index },
+            .BinaryOp => |bin| blk: {
+                const left_ptr = try self.allocator.create(ast.Expression);
+                left_ptr.* = try self.cloneExpression(bin.left.*);
+
+                const right_ptr = try self.allocator.create(ast.Expression);
+                right_ptr.* = try self.cloneExpression(bin.right.*);
+
+                break :blk ast.Expression{
+                    .BinaryOp = ast.BinaryExpr{
+                        .left = left_ptr,
+                        .op = bin.op,
+                        .right = right_ptr,
+                    },
+                };
+            },
+            .Subquery => |subquery| blk: {
+                const cloned_subquery = try self.allocator.create(ast.SelectStatement);
+                cloned_subquery.* = try self.cloneSelectStatement(subquery.*);
+                break :blk ast.Expression{ .Subquery = cloned_subquery };
+            },
+            .InList => |list| blk: {
+                var cloned_list = try self.allocator.alloc(ast.Value, list.len);
+                for (list, 0..) |val, i| {
+                    cloned_list[i] = try self.cloneAstValue(val);
+                }
+                break :blk ast.Expression{ .InList = cloned_list };
+            },
+        };
+    }
+
+    /// Clone a SelectStatement (for subqueries)
+    pub fn cloneSelectStatement(self: *Self, stmt: ast.SelectStatement) anyerror!ast.SelectStatement {
+        // Clone columns
+        var cloned_columns = try self.allocator.alloc(ast.Column, stmt.columns.len);
+        for (stmt.columns, 0..) |col, i| {
+            cloned_columns[i] = ast.Column{
+                .name = try self.allocator.dupe(u8, col.name),
+                .expression = try self.cloneColumnExpression(col.expression),
+                .alias = if (col.alias) |a| try self.allocator.dupe(u8, a) else null,
+            };
+        }
+
+        // Clone table name
+        const cloned_table: ?[]const u8 = if (stmt.table) |t| try self.allocator.dupe(u8, t) else null;
+
+        // Clone joins
+        var cloned_joins = try self.allocator.alloc(ast.JoinClause, stmt.joins.len);
+        for (stmt.joins, 0..) |join, i| {
+            cloned_joins[i] = ast.JoinClause{
+                .join_type = join.join_type,
+                .table = try self.allocator.dupe(u8, join.table),
+                .condition = try self.cloneCondition(&join.condition),
+            };
+        }
+
+        // Clone where clause
+        const cloned_where: ?ast.WhereClause = if (stmt.where_clause) |where|
+            ast.WhereClause{ .condition = try self.cloneCondition(&where.condition) }
+        else
+            null;
+
+        // Clone group by
+        var cloned_group_by: ?[][]const u8 = null;
+        if (stmt.group_by) |group_by| {
+            var cols = try self.allocator.alloc([]const u8, group_by.len);
+            for (group_by, 0..) |col, i| {
+                cols[i] = try self.allocator.dupe(u8, col);
+            }
+            cloned_group_by = cols;
+        }
+
+        // Clone having clause
+        const cloned_having: ?ast.WhereClause = if (stmt.having) |having|
+            ast.WhereClause{ .condition = try self.cloneCondition(&having.condition) }
+        else
+            null;
+
+        // Clone order by
+        var cloned_order_by: ?[]ast.OrderByClause = null;
+        if (stmt.order_by) |order_by| {
+            var clauses = try self.allocator.alloc(ast.OrderByClause, order_by.len);
+            for (order_by, 0..) |clause, i| {
+                clauses[i] = ast.OrderByClause{
+                    .column = try self.allocator.dupe(u8, clause.column),
+                    .direction = clause.direction,
+                };
+            }
+            cloned_order_by = clauses;
+        }
+
+        return ast.SelectStatement{
+            .columns = cloned_columns,
+            .table = cloned_table,
+            .joins = cloned_joins,
+            .where_clause = cloned_where,
+            .group_by = cloned_group_by,
+            .having = cloned_having,
+            .order_by = cloned_order_by,
+            .limit = stmt.limit,
+            .offset = stmt.offset,
+            .window_definitions = null, // TODO: Clone window definitions if needed
+            .distinct = stmt.distinct,
+        };
+    }
+
+    /// Clone a ColumnExpression
+    fn cloneColumnExpression(self: *Self, expr: ast.ColumnExpression) !ast.ColumnExpression {
+        return switch (expr) {
+            .Simple => |name| ast.ColumnExpression{ .Simple = try self.allocator.dupe(u8, name) },
+            .Aggregate => |agg| ast.ColumnExpression{
+                .Aggregate = ast.AggregateFunction{
+                    .function_type = agg.function_type,
+                    .column = if (agg.column) |col| try self.allocator.dupe(u8, col) else null,
+                },
+            },
+            .Window => |window| ast.ColumnExpression{ .Window = try self.cloneWindowFunction(window) },
+            .FunctionCall => |func| ast.ColumnExpression{ .FunctionCall = try self.cloneFunctionCall(func) },
+            .Case => |case_expr| ast.ColumnExpression{ .Case = try self.cloneCaseExpression(case_expr) },
         };
     }
 
@@ -823,6 +958,64 @@ pub const Planner = struct {
         };
     }
 
+    /// Plan ATTACH DATABASE statement
+    fn planAttach(self: *Self, attach: *const ast.AttachStatement) !ExecutionPlan {
+        var steps: std.ArrayList(ExecutionStep) = .{};
+
+        try steps.append(self.allocator, ExecutionStep{
+            .Attach = AttachStep{
+                .file_path = try self.allocator.dupe(u8, attach.file_path),
+                .schema_name = try self.allocator.dupe(u8, attach.schema_name),
+            },
+        });
+
+        return ExecutionPlan{
+            .steps = try steps.toOwnedSlice(self.allocator),
+            .allocator = self.allocator,
+        };
+    }
+
+    /// Plan DETACH DATABASE statement
+    fn planDetach(self: *Self, detach: *const ast.DetachStatement) !ExecutionPlan {
+        var steps: std.ArrayList(ExecutionStep) = .{};
+
+        try steps.append(self.allocator, ExecutionStep{
+            .Detach = DetachStep{
+                .schema_name = try self.allocator.dupe(u8, detach.schema_name),
+            },
+        });
+
+        return ExecutionPlan{
+            .steps = try steps.toOwnedSlice(self.allocator),
+            .allocator = self.allocator,
+        };
+    }
+
+    /// Plan CREATE VIRTUAL TABLE statement (FTS5)
+    fn planCreateVirtualTable(self: *Self, create_vt: *const ast.CreateVirtualTableStatement) !ExecutionPlan {
+        var steps: std.ArrayList(ExecutionStep) = .{};
+
+        // Duplicate column names
+        var columns = try self.allocator.alloc([]const u8, create_vt.columns.len);
+        for (create_vt.columns, 0..) |col, i| {
+            columns[i] = try self.allocator.dupe(u8, col);
+        }
+
+        try steps.append(self.allocator, ExecutionStep{
+            .CreateVirtualTable = CreateVirtualTableStep{
+                .table_name = try self.allocator.dupe(u8, create_vt.table_name),
+                .module_name = try self.allocator.dupe(u8, create_vt.module_name),
+                .columns = columns,
+                .if_not_exists = create_vt.if_not_exists,
+            },
+        });
+
+        return ExecutionPlan{
+            .steps = try steps.toOwnedSlice(self.allocator),
+            .allocator = self.allocator,
+        };
+    }
+
     /// Plan EXPLAIN / EXPLAIN QUERY PLAN statement
     fn planExplain(self: *Self, explain: *const ast.ExplainStatement) anyerror!ExecutionPlan {
         var steps: std.ArrayList(ExecutionStep) = .{};
@@ -967,6 +1160,7 @@ pub const ExecutionPlan = struct {
 /// Individual execution steps
 pub const ExecutionStep = union(enum) {
     TableScan: TableScanStep,
+    IndexScan: IndexScanStep, // Index-based lookup (query optimizer)
     Filter: FilterStep,
     Project: ProjectStep,
     Limit: LimitStep,
@@ -989,10 +1183,16 @@ pub const ExecutionStep = union(enum) {
     Explain: ExplainStep, // EXPLAIN / EXPLAIN QUERY PLAN
     SetOperation: SetOperationStep, // UNION/INTERSECT/EXCEPT
     Window: WindowStep, // Window functions (ROW_NUMBER, RANK, etc.)
+    Having: HavingStep, // HAVING clause (filter after GROUP BY)
+    Distinct, // SELECT DISTINCT (remove duplicate rows)
+    Attach: AttachStep, // ATTACH DATABASE
+    Detach: DetachStep, // DETACH DATABASE
+    CreateVirtualTable: CreateVirtualTableStep, // CREATE VIRTUAL TABLE (FTS5)
 
     pub fn deinit(self: *ExecutionStep, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .TableScan => |*step| step.deinit(allocator),
+            .IndexScan => |*step| step.deinit(allocator),
             .Filter => |*step| step.deinit(allocator),
             .Project => |*step| step.deinit(allocator),
             .Limit => {},
@@ -1015,6 +1215,11 @@ pub const ExecutionStep = union(enum) {
             .Explain => |*step| step.deinit(allocator),
             .SetOperation => |*step| step.deinit(allocator),
             .Window => |*step| step.deinit(allocator),
+            .Having => |*step| step.deinit(allocator),
+            .Distinct => {},
+            .Attach => |*step| step.deinit(allocator),
+            .Detach => |*step| step.deinit(allocator),
+            .CreateVirtualTable => |*step| step.deinit(allocator),
         }
     }
 };
@@ -1028,11 +1233,35 @@ pub const TableScanStep = struct {
     }
 };
 
+/// Index scan step (query optimizer - uses index for WHERE clause)
+pub const IndexScanStep = struct {
+    table_name: []const u8,
+    index_name: []const u8,
+    column_name: []const u8,
+    lookup_value: storage.Value, // The value to look up in the index
+
+    pub fn deinit(self: *IndexScanStep, allocator: std.mem.Allocator) void {
+        allocator.free(self.table_name);
+        allocator.free(self.index_name);
+        allocator.free(self.column_name);
+        self.lookup_value.deinit(allocator);
+    }
+};
+
 /// Filter step (WHERE clause)
 pub const FilterStep = struct {
     condition: ast.Condition,
 
     pub fn deinit(self: *FilterStep, allocator: std.mem.Allocator) void {
+        self.condition.deinit(allocator);
+    }
+};
+
+/// Having step (HAVING clause - filter after GROUP BY)
+pub const HavingStep = struct {
+    condition: ast.Condition,
+
+    pub fn deinit(self: *HavingStep, allocator: std.mem.Allocator) void {
         self.condition.deinit(allocator);
     }
 };
@@ -1121,9 +1350,8 @@ pub const UpdateStep = struct {
 
     pub fn deinit(self: *UpdateStep, allocator: std.mem.Allocator) void {
         allocator.free(self.table_name);
-        for (self.assignments) |assignment| {
-            allocator.free(assignment.column);
-            assignment.value.deinit(allocator);
+        for (self.assignments) |*assignment| {
+            @constCast(assignment).deinit(allocator);
         }
         allocator.free(self.assignments);
         if (self.condition) |*cond| {
@@ -1186,7 +1414,12 @@ pub const DropTableStep = struct {
 /// Update assignment
 pub const UpdateAssignment = struct {
     column: []const u8,
-    value: storage.Value,
+    expr: ast.Expression, // Can be literal, column reference, or arithmetic expression
+
+    pub fn deinit(self: *UpdateAssignment, allocator: std.mem.Allocator) void {
+        allocator.free(self.column);
+        @constCast(&self.expr).deinit(allocator);
+    }
 };
 
 /// Nested loop join step (for small tables or when no indexes available)
@@ -1324,6 +1557,50 @@ pub const ExplainStep = struct {
             step.deinit(allocator);
         }
         allocator.free(self.inner_steps);
+    }
+};
+
+/// ATTACH DATABASE step
+pub const AttachStep = struct {
+    /// Path to the database file
+    file_path: []const u8,
+    /// Schema name (alias) for the attached database
+    schema_name: []const u8,
+
+    pub fn deinit(self: *AttachStep, allocator: std.mem.Allocator) void {
+        allocator.free(self.file_path);
+        allocator.free(self.schema_name);
+    }
+};
+
+/// DETACH DATABASE step
+pub const DetachStep = struct {
+    /// Schema name to detach
+    schema_name: []const u8,
+
+    pub fn deinit(self: *DetachStep, allocator: std.mem.Allocator) void {
+        allocator.free(self.schema_name);
+    }
+};
+
+/// CREATE VIRTUAL TABLE step (FTS5)
+pub const CreateVirtualTableStep = struct {
+    /// Table name
+    table_name: []const u8,
+    /// Module name (e.g., "fts5")
+    module_name: []const u8,
+    /// Column names to index
+    columns: [][]const u8,
+    /// IF NOT EXISTS flag
+    if_not_exists: bool,
+
+    pub fn deinit(self: *CreateVirtualTableStep, allocator: std.mem.Allocator) void {
+        allocator.free(self.table_name);
+        allocator.free(self.module_name);
+        for (self.columns) |col| {
+            allocator.free(col);
+        }
+        allocator.free(self.columns);
     }
 };
 

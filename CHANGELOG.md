@@ -5,6 +5,56 @@ All notable changes to ZQLite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.3] - 2026-02-12
+
+### Added
+- **Full-text search (FTS5)** - CREATE VIRTUAL TABLE ... USING fts5
+  - FTSIndex with inverted index for fast term lookups
+  - MATCH operator for full-text search queries
+  - Case-insensitive tokenization and term matching
+  - Multi-term AND search semantics
+- **ATTACH DATABASE** - Multi-database support
+  - ATTACH DATABASE 'file.db' AS schema_name
+  - DETACH DATABASE schema_name
+  - Schema-qualified table access across attached databases
+  - Automatic cleanup of attached databases on connection close
+- **Subquery support** - WHERE col IN (SELECT ...) and scalar subqueries in expressions
+  - IN clause now supports both value lists and subqueries
+  - Scalar subqueries for dynamic value comparisons
+- **HAVING clause** - Filter aggregated results after GROUP BY
+- **SELECT DISTINCT** - Remove duplicate rows from query results
+- **Aggregate functions** - STDDEV, VARIANCE (population standard deviation and variance)
+  - STDDEV_POP/STDEV aliases for standard deviation
+  - VAR_POP alias for variance
+  - GROUP_CONCAT now properly recognized as token
+- **Query optimizer** - IndexScan execution step infrastructure
+  - Index-based row lookup instead of full table scans
+  - Fallback to table scan when index unavailable
+  - Value-to-key conversion for index queries
+
+### Changed
+- Parser extended to handle DISTINCT keyword after SELECT
+- Planner adds Distinct execution step for deduplication
+- Query plan cache integration with Connection for improved performance
+- Connection struct now manages attached databases HashMap
+
+### Fixed
+- **Memory leak fixes** - Added comprehensive errdefer cleanup throughout:
+  - FTSIndex.create: proper cleanup on partial initialization failure
+  - executeCreateVirtualTable: cleanup column allocations on error
+  - attachDatabase: cleanup connection and key on HashMap insertion failure
+  - parseCreateVirtualTable: cleanup table_name and module_name on parse errors
+  - parseAttach: cleanup file_path on parse errors
+  - executeIndexScan: cleanup cloned values on partial clone failure
+  - executeTableScanFallback: cleanup cloned values on partial clone failure
+
+### Technical
+- Added Expression variants: Subquery, InList for flexible IN clause parsing
+- Added HavingStep execution in VM after GROUP BY aggregation
+- Hash-based row deduplication in executeDistinct with support for all Value types
+- FTSIndex struct with inverted index using StringHashMap
+- CreateVirtualTableStatement and CreateVirtualTableStep for FTS table creation
+
 ## [1.5.2] - 2026-02-12
 
 ### Fixed

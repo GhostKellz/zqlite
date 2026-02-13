@@ -26,7 +26,7 @@
 │                    Core Database Engine                     │
 │  ┌─────────────────┐ ┌─────────────────┐ ┌──────────────┐ │
 │  │   SQL Parser   │ │    B+ Trees     │ │     WAL      │ │
-│  │   & Executor   │ │   + Indexes     │ │   Logging    │ │
+│  │   & Executor   │ │  + FTS Indexes  │ │   Logging    │ │
 │  └─────────────────┘ └─────────────────┘ └──────────────┘ │
 ├─────────────────────────────────────────────────────────────┤
 │                    Storage & Memory                         │
@@ -38,12 +38,12 @@
 
 ```
 src/
-├── db/           # Storage engine (B-tree, WAL, pager, connection)
-├── parser/       # SQL tokenizer, AST, parser
-├── executor/     # Query planner, VM, prepared statements
+├── db/           # Storage engine (B-tree, WAL, pager, FTS indexes, connection)
+├── parser/       # SQL tokenizer, AST, parser (FTS5, ATTACH, MATCH support)
+├── executor/     # Query planner, VM, prepared statements, window functions
 ├── crypto/       # Encryption, secure storage, ZNS adapter
 ├── transport/    # PQ-QUIC transport layer
-├── concurrent/   # Async operations, thread safety
+├── concurrent/   # Async operations, thread safety, MVCC, 2PC coordinator
 ├── shell/        # CLI interface
 └── ffi/          # C API bindings
 ```

@@ -74,6 +74,8 @@ pub const Parser = struct {
             .Drop => try self.parseDrop(),
             .Pragma => try self.parsePragma(),
             .Explain => try self.parseExplain(),
+            .Attach => try self.parseAttach(),
+            .Detach => try self.parseDetach(),
             else => error.UnexpectedToken,
         };
     }
@@ -174,6 +176,12 @@ pub const Parser = struct {
     /// Parse a simple SELECT without set operations
     fn parseSimpleSelect(self: *Self) !ast.SelectStatement {
         try self.expect(.Select);
+
+        // Check for DISTINCT
+        const is_distinct = std.meta.activeTag(self.current_token) == .Distinct;
+        if (is_distinct) {
+            try self.advance();
+        }
 
         // Parse columns
         var columns: std.ArrayList(ast.Column) = .{};
@@ -337,6 +345,7 @@ pub const Parser = struct {
             .limit = limit,
             .offset = offset,
             .window_definitions = null,
+            .distinct = is_distinct,
         };
     }
 
@@ -647,6 +656,63 @@ pub const Parser = struct {
         };
     }
 
+    /// Parse ATTACH DATABASE statement
+    /// Syntax: ATTACH DATABASE 'filename' AS schema_name
+    fn parseAttach(self: *Self) !ast.Statement {
+        try self.expect(.Attach);
+
+        // Optional DATABASE keyword
+        if (std.meta.activeTag(self.current_token) == .Database) {
+            try self.advance();
+        }
+
+        // Get file path (string literal)
+        var file_path: []const u8 = undefined;
+        if (self.current_token == .String) {
+            file_path = try self.allocator.dupe(u8, self.current_token.String);
+            try self.advance();
+        } else if (self.current_token == .Identifier) {
+            // Allow :memory: as identifier
+            file_path = try self.expectIdentifier();
+        } else {
+            return error.ExpectedString;
+        }
+        errdefer self.allocator.free(file_path);
+
+        // Expect AS keyword
+        try self.expect(.As);
+
+        // Get schema name
+        const schema_name = try self.expectIdentifier();
+
+        return ast.Statement{
+            .Attach = ast.AttachStatement{
+                .file_path = file_path,
+                .schema_name = schema_name,
+            },
+        };
+    }
+
+    /// Parse DETACH DATABASE statement
+    /// Syntax: DETACH DATABASE schema_name
+    fn parseDetach(self: *Self) !ast.Statement {
+        try self.expect(.Detach);
+
+        // Optional DATABASE keyword
+        if (std.meta.activeTag(self.current_token) == .Database) {
+            try self.advance();
+        }
+
+        // Get schema name
+        const schema_name = try self.expectIdentifier();
+
+        return ast.Statement{
+            .Detach = ast.DetachStatement{
+                .schema_name = schema_name,
+            },
+        };
+    }
+
     /// Parse EXPLAIN / EXPLAIN QUERY PLAN statement
     fn parseExplain(self: *Self) anyerror!ast.Statement {
         try self.expect(.Explain);
@@ -694,6 +760,10 @@ pub const Parser = struct {
         if (std.meta.activeTag(self.current_token) == .Table) {
             try self.advance();
             return try self.parseCreateTable();
+        } else if (std.meta.activeTag(self.current_token) == .Virtual) {
+            try self.advance();
+            try self.expect(.Table);
+            return try self.parseCreateVirtualTable();
         } else if (std.meta.activeTag(self.current_token) == .Index) {
             return try self.parseCreateIndex();
         } else if (std.meta.activeTag(self.current_token) == .Unique) {
@@ -703,6 +773,63 @@ pub const Parser = struct {
         }
 
         return error.UnexpectedToken;
+    }
+
+    /// Parse CREATE VIRTUAL TABLE statement (FTS5)
+    /// Syntax: CREATE VIRTUAL TABLE table_name USING fts5(col1, col2, ...)
+    fn parseCreateVirtualTable(self: *Self) !ast.Statement {
+        // Optional IF NOT EXISTS
+        var if_not_exists = false;
+        if (std.meta.activeTag(self.current_token) == .If) {
+            try self.advance();
+            try self.expect(.Not);
+            try self.expect(.Exists);
+            if_not_exists = true;
+        }
+
+        // Table name
+        const table_name = try self.expectIdentifier();
+        errdefer self.allocator.free(table_name);
+
+        // USING keyword
+        try self.expect(.Using);
+
+        // Module name (fts5, fts4, etc.)
+        const module_name = try self.expectIdentifier();
+        errdefer self.allocator.free(module_name);
+
+        // Column list (col1, col2, ...)
+        try self.expect(.LeftParen);
+
+        var columns: std.ArrayList([]const u8) = .{};
+        errdefer {
+            for (columns.items) |col| {
+                self.allocator.free(col);
+            }
+            columns.deinit(self.allocator);
+        }
+
+        while (true) {
+            const col_name = try self.expectIdentifier();
+            try columns.append(self.allocator, col_name);
+
+            if (std.meta.activeTag(self.current_token) == .Comma) {
+                try self.advance();
+            } else {
+                break;
+            }
+        }
+
+        try self.expect(.RightParen);
+
+        return ast.Statement{
+            .CreateVirtualTable = ast.CreateVirtualTableStatement{
+                .table_name = table_name,
+                .module_name = module_name,
+                .columns = try columns.toOwnedSlice(self.allocator),
+                .if_not_exists = if_not_exists,
+            },
+        };
     }
 
     /// Parse CREATE INDEX statement
@@ -838,9 +965,8 @@ pub const Parser = struct {
         var assignments: std.ArrayList(ast.Assignment) = .{};
         errdefer {
             // Clean up any already-parsed assignments on error
-            for (assignments.items) |assignment| {
-                self.allocator.free(assignment.column);
-                assignment.value.deinit(self.allocator);
+            for (assignments.items) |*assignment| {
+                assignment.deinit(self.allocator);
             }
             assignments.deinit(self.allocator);
         }
@@ -850,12 +976,12 @@ pub const Parser = struct {
             errdefer self.allocator.free(column);
 
             try self.expect(.Equal);
-            const value = try self.parseValue();
-            // value is now owned by assignment, no errdefer needed for it
+            const expr = try self.parseExpression();
+            // expr is now owned by assignment, no errdefer needed for it
 
             try assignments.append(self.allocator, ast.Assignment{
                 .column = column,
-                .value = value,
+                .expr = expr,
             });
 
             if (std.meta.activeTag(self.current_token) == .Comma) {
@@ -909,13 +1035,16 @@ pub const Parser = struct {
 
     /// Parse a column in SELECT
     fn parseColumn(self: *Self) !ast.Column {
-        // Check for aggregate functions like COUNT(*), SUM(col), AVG(col), MIN(col), MAX(col)
+        // Check for aggregate functions like COUNT(*), SUM(col), AVG(col), MIN(col), MAX(col), STDDEV, VARIANCE, GROUP_CONCAT
         const agg_type: ?ast.AggregateFunctionType = switch (std.meta.activeTag(self.current_token)) {
             .Count => .Count,
             .Sum => .Sum,
             .Avg => .Avg,
             .Min => .Min,
             .Max => .Max,
+            .Stddev => .Stddev,
+            .Variance => .Variance,
+            .GroupConcat => .GroupConcat,
             else => null,
         };
 
@@ -926,6 +1055,9 @@ pub const Parser = struct {
                 .Avg => "AVG",
                 .Min => "MIN",
                 .Max => "MAX",
+                .Stddev => "STDDEV",
+                .Variance => "VARIANCE",
+                .GroupConcat => "GROUP_CONCAT",
                 else => "AGGREGATE",
             };
 
@@ -1773,7 +1905,7 @@ pub const Parser = struct {
                 },
                 .In => blk: {
                     try self.advance();
-                    const right = try self.parseExpression();
+                    const right = try self.parseInClauseContent();
                     break :blk ast.ComparisonCondition{
                         .left = left,
                         .operator = .NotIn,
@@ -1810,6 +1942,17 @@ pub const Parser = struct {
             };
         }
 
+        // Check for IN (handles subqueries and value lists)
+        if (std.meta.activeTag(self.current_token) == .In) {
+            try self.advance();
+            const right = try self.parseInClauseContent();
+            return ast.ComparisonCondition{
+                .left = left,
+                .operator = .In,
+                .right = right,
+            };
+        }
+
         // Regular comparison operator
         const op = try self.parseComparisonOperator();
         const right = try self.parseExpression();
@@ -1831,15 +1974,16 @@ pub const Parser = struct {
             .GreaterThan => ast.ComparisonOperator.GreaterThan,
             .GreaterThanOrEqual => ast.ComparisonOperator.GreaterThanOrEqual,
             .Like => ast.ComparisonOperator.Like,
-            .In => ast.ComparisonOperator.In,
+            .Match => ast.ComparisonOperator.Match, // FTS MATCH operator
+            // Note: IN is handled separately in parseComparison
             else => return error.ExpectedOperator,
         };
         try self.advance();
         return op;
     }
 
-    /// Parse expression (column or literal)
-    fn parseExpression(self: *Self) !ast.Expression {
+    /// Parse a primary expression (column, literal, parameter, or subquery)
+    fn parsePrimaryExpression(self: *Self) !ast.Expression {
         return switch (self.current_token) {
             .Identifier => |id| {
                 var owned_id = try self.allocator.dupe(u8, id);
@@ -1865,11 +2009,102 @@ pub const Parser = struct {
                 try self.advance();
                 return ast.Expression{ .Parameter = param_index };
             },
+            .LeftParen => {
+                try self.advance(); // consume '('
+                // Check if this is a subquery
+                if (std.meta.activeTag(self.current_token) == .Select) {
+                    const subquery = try self.allocator.create(ast.SelectStatement);
+                    subquery.* = try self.parseSimpleSelect();
+                    try self.expect(.RightParen);
+                    return ast.Expression{ .Subquery = subquery };
+                }
+                // Otherwise parse as grouped expression or value list
+                const value = try self.parseValue();
+                try self.expect(.RightParen);
+                return ast.Expression{ .Literal = value };
+            },
             else => {
                 const value = try self.parseValue();
                 return ast.Expression{ .Literal = value };
             },
         };
+    }
+
+    /// Parse IN clause content: either (SELECT ...) or (value1, value2, ...)
+    fn parseInClauseContent(self: *Self) !ast.Expression {
+        try self.expect(.LeftParen);
+
+        // Check if this is a subquery
+        if (std.meta.activeTag(self.current_token) == .Select) {
+            const subquery = try self.allocator.create(ast.SelectStatement);
+            subquery.* = try self.parseSimpleSelect();
+            try self.expect(.RightParen);
+            return ast.Expression{ .Subquery = subquery };
+        }
+
+        // Otherwise parse as value list
+        var values: std.ArrayList(ast.Value) = .{};
+        errdefer {
+            for (values.items) |*val| {
+                val.deinit(self.allocator);
+            }
+            values.deinit(self.allocator);
+        }
+
+        const first_value = try self.parseValue();
+        try values.append(self.allocator, first_value);
+
+        while (std.meta.activeTag(self.current_token) == .Comma) {
+            try self.advance(); // consume ','
+            const value = try self.parseValue();
+            try values.append(self.allocator, value);
+        }
+
+        try self.expect(.RightParen);
+        return ast.Expression{ .InList = try values.toOwnedSlice(self.allocator) };
+    }
+
+    /// Check if current token is an arithmetic operator
+    fn isArithmeticOp(self: *Self) ?ast.ArithmeticOp {
+        return switch (self.current_token) {
+            .Plus => .Add,
+            .Minus => .Subtract,
+            .Asterisk => .Multiply,
+            .Divide => .Divide,
+            .Modulo => .Modulo,
+            else => null,
+        };
+    }
+
+    /// Parse expression with support for arithmetic operators (column + 1, etc.)
+    fn parseExpression(self: *Self) !ast.Expression {
+        var left = try self.parsePrimaryExpression();
+        errdefer left.deinit(self.allocator);
+
+        // Check for arithmetic operator
+        if (self.isArithmeticOp()) |op| {
+            try self.advance(); // consume operator
+
+            var right = try self.parsePrimaryExpression();
+            errdefer right.deinit(self.allocator);
+
+            // Allocate left and right on heap for BinaryExpr
+            const left_ptr = try self.allocator.create(ast.Expression);
+            left_ptr.* = left;
+
+            const right_ptr = try self.allocator.create(ast.Expression);
+            right_ptr.* = right;
+
+            return ast.Expression{
+                .BinaryOp = ast.BinaryExpr{
+                    .left = left_ptr,
+                    .op = op,
+                    .right = right_ptr,
+                },
+            };
+        }
+
+        return left;
     }
 
     /// Parse value literal

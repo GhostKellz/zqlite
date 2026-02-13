@@ -469,6 +469,7 @@ test "prepared statement creation and analysis" {
         .limit = null,
         .offset = null,
         .window_definitions = null,
+        .distinct = false,
     };
 
     const statement = ast.Statement{ .Select = select_stmt };

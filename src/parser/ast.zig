@@ -18,6 +18,9 @@ pub const Statement = union(enum) {
     Pragma: PragmaStatement, // PRAGMA statements for introspection
     Explain: ExplainStatement, // EXPLAIN / EXPLAIN QUERY PLAN
     CompoundSelect: CompoundSelectStatement, // UNION/INTERSECT/EXCEPT
+    Attach: AttachStatement, // ATTACH DATABASE
+    Detach: DetachStatement, // DETACH DATABASE
+    CreateVirtualTable: CreateVirtualTableStatement, // CREATE VIRTUAL TABLE (FTS5)
 
     pub fn deinit(self: *Statement, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -36,6 +39,9 @@ pub const Statement = union(enum) {
             .Pragma => |*stmt| stmt.deinit(allocator),
             .Explain => |*stmt| stmt.deinit(allocator),
             .CompoundSelect => |*stmt| stmt.deinit(allocator),
+            .Attach => |*stmt| stmt.deinit(allocator),
+            .Detach => |*stmt| stmt.deinit(allocator),
+            .CreateVirtualTable => |*stmt| stmt.deinit(allocator),
         }
     }
 };
@@ -99,6 +105,26 @@ pub const ExplainStatement = struct {
     }
 };
 
+/// ATTACH DATABASE statement
+pub const AttachStatement = struct {
+    file_path: []const u8, // Path to database file (or ':memory:')
+    schema_name: []const u8, // Alias for the attached database
+
+    pub fn deinit(self: *AttachStatement, allocator: std.mem.Allocator) void {
+        allocator.free(self.file_path);
+        allocator.free(self.schema_name);
+    }
+};
+
+/// DETACH DATABASE statement
+pub const DetachStatement = struct {
+    schema_name: []const u8, // Schema name to detach
+
+    pub fn deinit(self: *DetachStatement, allocator: std.mem.Allocator) void {
+        allocator.free(self.schema_name);
+    }
+};
+
 /// SELECT statement AST
 pub const SelectStatement = struct {
     columns: []Column,
@@ -111,6 +137,7 @@ pub const SelectStatement = struct {
     limit: ?u32,
     offset: ?u32,
     window_definitions: ?[]WindowDefinition, // PostgreSQL window functions
+    distinct: bool, // SELECT DISTINCT
 
     pub fn deinit(self: *SelectStatement, allocator: std.mem.Allocator) void {
         for (self.columns) |*column| {
@@ -222,6 +249,23 @@ pub const CreateTableStatement = struct {
     }
 };
 
+/// CREATE VIRTUAL TABLE statement AST (for FTS5)
+pub const CreateVirtualTableStatement = struct {
+    table_name: []const u8,
+    module_name: []const u8, // e.g. "fts5"
+    columns: [][]const u8, // Column names to index
+    if_not_exists: bool,
+
+    pub fn deinit(self: *CreateVirtualTableStatement, allocator: std.mem.Allocator) void {
+        allocator.free(self.table_name);
+        allocator.free(self.module_name);
+        for (self.columns) |col| {
+            allocator.free(col);
+        }
+        allocator.free(self.columns);
+    }
+};
+
 /// UPDATE statement AST
 pub const UpdateStatement = struct {
     table: []const u8,
@@ -230,9 +274,9 @@ pub const UpdateStatement = struct {
 
     pub fn deinit(self: *UpdateStatement, allocator: std.mem.Allocator) void {
         allocator.free(self.table);
-        for (self.assignments) |assignment| {
+        for (self.assignments) |*assignment| {
             allocator.free(assignment.column);
-            assignment.value.deinit(allocator);
+            assignment.expr.deinit(allocator);
         }
         allocator.free(self.assignments);
         if (self.where_clause) |*where| {
@@ -301,6 +345,8 @@ pub const AggregateFunctionType = enum {
     Max,
     GroupConcat,
     CountDistinct,
+    Stddev, // Standard deviation
+    Variance, // Statistical variance
 };
 
 /// Column definition in CREATE TABLE
@@ -465,6 +511,7 @@ pub const ComparisonOperator = enum {
     GreaterThanOrEqual,
     Like,
     NotLike,
+    Match, // FTS MATCH operator
     In,
     NotIn,
     IsNull,
@@ -516,17 +563,54 @@ pub const CaseExpression = struct {
     }
 };
 
-/// Expression (column reference or literal value)
+/// Arithmetic operators for expressions
+pub const ArithmeticOp = enum {
+    Add, // +
+    Subtract, // -
+    Multiply, // *
+    Divide, // /
+    Modulo, // %
+};
+
+/// Binary expression (e.g., counter + 1)
+pub const BinaryExpr = struct {
+    left: *Expression,
+    op: ArithmeticOp,
+    right: *Expression,
+
+    pub fn deinit(self: *BinaryExpr, allocator: std.mem.Allocator) void {
+        self.left.deinit(allocator);
+        allocator.destroy(self.left);
+        self.right.deinit(allocator);
+        allocator.destroy(self.right);
+    }
+};
+
+/// Expression (column reference, literal value, or binary expression)
 pub const Expression = union(enum) {
     Column: []const u8,
     Literal: Value,
     Parameter: u32, // Parameter placeholder index
+    BinaryOp: BinaryExpr, // Arithmetic expression like counter + 1
+    Subquery: *SelectStatement, // Scalar subquery or IN subquery
+    InList: []Value, // IN (value1, value2, ...) list
 
     pub fn deinit(self: *Expression, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .Column => |col| allocator.free(col),
             .Literal => |value| value.deinit(allocator),
             .Parameter => {},
+            .BinaryOp => |*bin| bin.deinit(allocator),
+            .Subquery => |subquery| {
+                subquery.deinit(allocator);
+                allocator.destroy(subquery);
+            },
+            .InList => |list| {
+                for (list) |*val| {
+                    val.deinit(allocator);
+                }
+                allocator.free(list);
+            },
         }
     }
 };
@@ -534,7 +618,12 @@ pub const Expression = union(enum) {
 /// Assignment in UPDATE statement
 pub const Assignment = struct {
     column: []const u8,
-    value: Value,
+    expr: Expression, // Can be literal, column reference, or arithmetic expression
+
+    pub fn deinit(self: *Assignment, allocator: std.mem.Allocator) void {
+        allocator.free(self.column);
+        self.expr.deinit(allocator);
+    }
 };
 
 /// Value types

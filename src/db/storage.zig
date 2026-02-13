@@ -14,6 +14,7 @@ pub const StorageEngine = struct {
     pooled_allocator: memory_pool.PooledAllocator,
     tables: std.StringHashMap(*Table),
     indexes: std.StringHashMap(*Index),
+    fts_indexes: std.StringHashMap(*FTSIndex), // Full-text search indexes
     is_memory: bool,
 
     const Self = @This();
@@ -27,6 +28,7 @@ pub const StorageEngine = struct {
         engine.pooled_allocator = memory_pool.PooledAllocator.init(&engine.memory_pool);
         engine.tables = std.StringHashMap(*Table).init(allocator);
         engine.indexes = std.StringHashMap(*Index).init(allocator);
+        engine.fts_indexes = std.StringHashMap(*FTSIndex).init(allocator);
         engine.is_memory = false;
 
         // Load existing tables from file
@@ -44,6 +46,7 @@ pub const StorageEngine = struct {
         engine.pooled_allocator = memory_pool.PooledAllocator.init(&engine.memory_pool);
         engine.tables = std.StringHashMap(*Table).init(allocator);
         engine.indexes = std.StringHashMap(*Index).init(allocator);
+        engine.fts_indexes = std.StringHashMap(*FTSIndex).init(allocator);
         engine.is_memory = true;
 
         return engine;
@@ -203,6 +206,27 @@ pub const StorageEngine = struct {
         }
     }
 
+    /// Create an FTS (Full-Text Search) index for a virtual table
+    pub fn createFTSIndex(self: *Self, table_name: []const u8, columns: []const []const u8) !void {
+        var fts_index = try FTSIndex.create(self.allocator, table_name, columns);
+        errdefer fts_index.deinit(self.allocator);
+
+        const duped_name = try self.allocator.dupe(u8, table_name);
+        errdefer self.allocator.free(duped_name);
+
+        try self.fts_indexes.put(duped_name, fts_index);
+    }
+
+    /// Get an FTS index by table name
+    pub fn getFTSIndex(self: *Self, table_name: []const u8) ?*FTSIndex {
+        return self.fts_indexes.get(table_name);
+    }
+
+    /// Check if a table has an FTS index (is a virtual table)
+    pub fn isFTSTable(self: *Self, table_name: []const u8) bool {
+        return self.fts_indexes.contains(table_name);
+    }
+
     /// Metadata page layout:
     /// - Bytes 0-3: Magic number (0x5A514C54 = "ZQLT")
     /// - Bytes 4-7: Table count
@@ -309,6 +333,14 @@ pub const StorageEngine = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.indexes.deinit();
+
+        // Cleanup FTS indexes
+        var fts_iterator = self.fts_indexes.iterator();
+        while (fts_iterator.next()) |entry| {
+            entry.value_ptr.*.deinit(self.allocator);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.fts_indexes.deinit();
 
         self.pager.deinit();
         self.memory_pool.deinit();
@@ -1068,6 +1100,184 @@ pub const Index = struct {
         }
         allocator.free(self.column_names);
         self.btree.deinit();
+        allocator.destroy(self);
+    }
+};
+
+/// Full-Text Search Index for virtual tables (FTS5)
+pub const FTSIndex = struct {
+    allocator: std.mem.Allocator,
+    table_name: []const u8,
+    column_names: [][]const u8,
+    /// Inverted index: term -> list of (rowid, column_index, position)
+    inverted_index: std.StringHashMap(std.ArrayList(TermOccurrence)),
+
+    const Self = @This();
+
+    /// Term occurrence in a document
+    const TermOccurrence = struct {
+        rowid: u64,
+        column_index: u32,
+        position: u32,
+    };
+
+    /// Create a new FTS index
+    pub fn create(allocator: std.mem.Allocator, table_name: []const u8, columns: []const []const u8) !*Self {
+        var fts = try allocator.create(Self);
+        errdefer allocator.destroy(fts);
+
+        fts.allocator = allocator;
+        fts.table_name = try allocator.dupe(u8, table_name);
+        errdefer allocator.free(fts.table_name);
+
+        // Copy column names
+        fts.column_names = try allocator.alloc([]const u8, columns.len);
+        errdefer allocator.free(fts.column_names);
+
+        var cols_allocated: usize = 0;
+        errdefer {
+            for (fts.column_names[0..cols_allocated]) |col| {
+                allocator.free(col);
+            }
+        }
+
+        for (columns, 0..) |col, i| {
+            fts.column_names[i] = try allocator.dupe(u8, col);
+            cols_allocated = i + 1;
+        }
+
+        fts.inverted_index = std.StringHashMap(std.ArrayList(TermOccurrence)).init(allocator);
+
+        return fts;
+    }
+
+    /// Index a document (row)
+    pub fn indexDocument(self: *Self, rowid: u64, values: []const Value) !void {
+        for (values, 0..) |value, col_idx| {
+            if (col_idx >= self.column_names.len) continue;
+
+            // Only index text values
+            const text = switch (value) {
+                .Text => |t| t,
+                else => continue,
+            };
+
+            // Tokenize and index
+            var pos: u32 = 0;
+            var iter = std.mem.tokenizeAny(u8, text, " \t\n\r.,;:!?()[]{}\"'");
+            while (iter.next()) |token| {
+                // Normalize to lowercase
+                var lower_buf: [256]u8 = undefined;
+                const lower_token = if (token.len <= 256) blk: {
+                    for (token, 0..) |c, i| {
+                        lower_buf[i] = std.ascii.toLower(c);
+                    }
+                    break :blk lower_buf[0..token.len];
+                } else token;
+
+                // Get or create term entry
+                var entry = self.inverted_index.getPtr(lower_token);
+                if (entry == null) {
+                    const term_copy = try self.allocator.dupe(u8, lower_token);
+                    const new_list: std.ArrayList(TermOccurrence) = .{};
+                    try self.inverted_index.put(term_copy, new_list);
+                    entry = self.inverted_index.getPtr(term_copy);
+                }
+
+                try entry.?.append(self.allocator, TermOccurrence{
+                    .rowid = rowid,
+                    .column_index = @intCast(col_idx),
+                    .position = pos,
+                });
+
+                pos += 1;
+            }
+        }
+    }
+
+    /// Search the FTS index for a query
+    pub fn search(self: *Self, query: []const u8) ![]u64 {
+        var results = std.AutoHashMap(u64, void).init(self.allocator);
+        defer results.deinit();
+
+        // Tokenize query
+        var first_term = true;
+        var iter = std.mem.tokenizeAny(u8, query, " \t\n\r.,;:!?()[]{}\"'");
+        while (iter.next()) |token| {
+            // Normalize to lowercase
+            var lower_buf: [256]u8 = undefined;
+            const lower_token = if (token.len <= 256) blk: {
+                for (token, 0..) |c, i| {
+                    lower_buf[i] = std.ascii.toLower(c);
+                }
+                break :blk lower_buf[0..token.len];
+            } else token;
+
+            if (self.inverted_index.get(lower_token)) |occurrences| {
+                if (first_term) {
+                    // First term: add all matching rowids
+                    for (occurrences.items) |occ| {
+                        try results.put(occ.rowid, {});
+                    }
+                    first_term = false;
+                } else {
+                    // Subsequent terms: intersect with existing results
+                    var term_rowids = std.AutoHashMap(u64, void).init(self.allocator);
+                    defer term_rowids.deinit();
+
+                    for (occurrences.items) |occ| {
+                        try term_rowids.put(occ.rowid, {});
+                    }
+
+                    // Remove rowids not in this term's results
+                    var to_remove: std.ArrayList(u64) = .{};
+                    defer to_remove.deinit(self.allocator);
+
+                    var result_iter = results.iterator();
+                    while (result_iter.next()) |entry| {
+                        if (!term_rowids.contains(entry.key_ptr.*)) {
+                            try to_remove.append(self.allocator, entry.key_ptr.*);
+                        }
+                    }
+
+                    for (to_remove.items) |rowid| {
+                        _ = results.remove(rowid);
+                    }
+                }
+            } else if (!first_term) {
+                // Term not found in subsequent terms: empty results
+                results.clearRetainingCapacity();
+            }
+        }
+
+        // Convert to array
+        var result_array = try self.allocator.alloc(u64, results.count());
+        var i: usize = 0;
+        var result_iter = results.iterator();
+        while (result_iter.next()) |entry| {
+            result_array[i] = entry.key_ptr.*;
+            i += 1;
+        }
+
+        return result_array;
+    }
+
+    /// Clean up FTS index
+    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+        allocator.free(self.table_name);
+        for (self.column_names) |col| {
+            allocator.free(col);
+        }
+        allocator.free(self.column_names);
+
+        // Free inverted index
+        var iter = self.inverted_index.iterator();
+        while (iter.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(allocator);
+        }
+        self.inverted_index.deinit();
+
         allocator.destroy(self);
     }
 };

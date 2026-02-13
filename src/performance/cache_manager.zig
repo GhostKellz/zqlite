@@ -338,7 +338,7 @@ pub const QueryPlanCache = struct {
         }
 
         for (expired_hashes.items) |hash| {
-            if (self.cache.get(hash)) |cached_plan| {
+            if (self.cache.getPtr(hash)) |cached_plan| {
                 cached_plan.plan.deinit();
             }
             _ = self.cache.remove(hash);
@@ -369,7 +369,7 @@ pub const QueryPlanCache = struct {
         }
 
         if (oldest_hash) |hash| {
-            if (self.cache.get(hash)) |cached_plan| {
+            if (self.cache.getPtr(hash)) |cached_plan| {
                 cached_plan.plan.deinit();
             }
             _ = self.cache.remove(hash);

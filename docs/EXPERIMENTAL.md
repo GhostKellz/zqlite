@@ -19,6 +19,8 @@ This document describes features that are experimental, proof-of-concept, or not
 | Two-Phase Commit (Phase1) | Experimental | No |
 | Window Functions | Partial | Limited |
 | Query Cache | Partial | Limited |
+| Full-Text Search (FTS5) | Stable | Yes (v1.5.3+) |
+| ATTACH DATABASE | Stable | Yes (v1.5.3+) |
 
 ---
 
@@ -166,6 +168,71 @@ Coordinator for distributed transaction prepare phase.
 
 ---
 
+## New Features (v1.5.3)
+
+The following features were added in v1.5.3.
+
+### Full-Text Search (FTS5)
+
+**Status:** Stable
+
+```zig
+// Create FTS virtual table
+try conn.execute("CREATE VIRTUAL TABLE docs USING fts5(title, body)");
+
+// Insert and search
+try conn.execute("INSERT INTO docs VALUES (1, 'ZQLite Guide', 'A comprehensive guide to ZQLite')");
+var result = try conn.query("SELECT * FROM docs WHERE body MATCH 'comprehensive guide'");
+```
+
+**Features:**
+- CREATE VIRTUAL TABLE with FTS5/FTS4 module
+- Inverted index for fast term lookups
+- MATCH operator for full-text queries
+- Case-insensitive tokenization
+- Multi-term AND search semantics
+
+**Limitations:**
+- FTS index is not persisted across restarts
+- No phrase search or boolean operators yet
+- Large document indexing not optimized
+
+### ATTACH DATABASE
+
+**Status:** Stable
+
+```zig
+// Attach external database file
+try conn.execute("ATTACH DATABASE 'archive.db' AS archive");
+
+// Query across databases
+var result = try conn.query("SELECT * FROM main.users u JOIN archive.logs l ON u.id = l.user_id");
+
+// Detach when done
+try conn.execute("DETACH DATABASE archive");
+```
+
+**Features:**
+- Multiple database files in single connection
+- Schema-qualified table names (schema.table)
+- Automatic cleanup on connection close
+- Reserved schema name protection (main, temp)
+
+**Limitations:**
+- Cross-database transactions not fully tested
+- No schema migration between attached databases
+
+### Additional SQL Features (v1.5.3)
+
+The following SQL features were also added:
+
+- **HAVING clause** - Filter results after GROUP BY aggregation
+- **SELECT DISTINCT** - Remove duplicate rows with hash-based deduplication
+- **Subqueries** - IN (SELECT ...) and scalar subqueries
+- **STDDEV/VARIANCE** - Population standard deviation and variance functions
+
+---
+
 ## Partial Implementations
 
 ### Window Functions (`src/executor/window_functions.zig`)
@@ -252,10 +319,20 @@ const result = try cluster.routeQuery(query);
 
 ## Roadmap
 
+### Added in v1.5.3
+- [x] Full-text search (FTS5) with MATCH operator
+- [x] ATTACH/DETACH DATABASE support
+- [x] HAVING clause for GROUP BY
+- [x] SELECT DISTINCT
+- [x] Subquery support (IN, scalar)
+- [x] STDDEV/VARIANCE aggregate functions
+- [x] Two-phase commit coordinator (Phase1Engine)
+
 ### Near-term (v1.6.x)
 - [ ] Complete window function PARTITION BY support
 - [ ] Improve query cache invalidation
 - [ ] Add cluster health check implementation
+- [ ] FTS phrase search and boolean operators
 
 ### Medium-term (v1.7.x)
 - [ ] Integrate real QUIC library for PQ transport

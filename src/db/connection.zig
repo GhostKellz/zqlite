@@ -5,6 +5,7 @@ const ast = @import("../parser/ast.zig");
 const parser = @import("../parser/parser.zig");
 const planner = @import("../executor/planner.zig");
 const vm = @import("../executor/vm.zig");
+const cache_manager = @import("../performance/cache_manager.zig");
 
 /// Undo log entry for transaction rollback
 pub const UndoEntry = struct {
@@ -35,6 +36,8 @@ pub const Connection = struct {
     owns_storage: bool, // Whether this connection owns and should clean up the storage engine
     in_transaction: bool,
     undo_log: std.ArrayList(UndoEntry),
+    plan_cache: ?cache_manager.QueryPlanCache,
+    attached_databases: std.StringHashMap(*Self), // ATTACH DATABASE schema_name -> connection
 
     const Self = @This();
 
@@ -49,6 +52,8 @@ pub const Connection = struct {
         conn.owns_storage = true;
         conn.in_transaction = false;
         conn.undo_log = .{};
+        conn.plan_cache = try cache_manager.QueryPlanCache.init(allocator, 100);
+        conn.attached_databases = std.StringHashMap(*Self).init(allocator);
 
         // Replay WAL on startup to recover any uncommitted changes
         if (conn.wal) |w| {
@@ -69,6 +74,8 @@ pub const Connection = struct {
         conn.owns_storage = true;
         conn.in_transaction = false;
         conn.undo_log = .{};
+        conn.plan_cache = try cache_manager.QueryPlanCache.init(allocator, 100);
+        conn.attached_databases = std.StringHashMap(*Self).init(allocator);
 
         return conn;
     }
@@ -84,6 +91,8 @@ pub const Connection = struct {
         conn.owns_storage = false; // This connection doesn't own the storage
         conn.in_transaction = false;
         conn.undo_log = .{};
+        conn.plan_cache = try cache_manager.QueryPlanCache.init(allocator, 100);
+        conn.attached_databases = std.StringHashMap(*Self).init(allocator);
 
         return conn;
     }
@@ -240,15 +249,38 @@ pub const Connection = struct {
         var parsed = try parser.parse(self.allocator, sql);
         defer parsed.deinit();
 
-        // Create execution plan
-        var query_planner = planner.Planner.init(self.allocator);
-        var plan = try query_planner.plan(&parsed.statement);
-        defer plan.deinit();
+        // Try to get cached plan first
+        var plan_ptr: *planner.ExecutionPlan = undefined;
+        var owns_plan = false;
+
+        if (self.plan_cache) |*cache| {
+            if (cache.get(sql)) |cached_plan| {
+                plan_ptr = cached_plan;
+            } else {
+                // Cache miss - create new plan and cache it
+                var query_planner = planner.Planner.init(self.allocator);
+                const new_plan = try query_planner.plan(&parsed.statement);
+                try cache.put(sql, new_plan);
+                // Get pointer from cache (cache now owns the plan)
+                plan_ptr = cache.get(sql).?;
+            }
+        } else {
+            // No cache - create plan that we own
+            var query_planner = planner.Planner.init(self.allocator);
+            const owned_plan = try self.allocator.create(planner.ExecutionPlan);
+            owned_plan.* = try query_planner.plan(&parsed.statement);
+            plan_ptr = owned_plan;
+            owns_plan = true;
+        }
+        defer if (owns_plan) {
+            plan_ptr.deinit();
+            self.allocator.destroy(plan_ptr);
+        };
 
         // Execute and get results
         var virtual_machine = vm.VirtualMachine.init(self.allocator, self);
         defer virtual_machine.deinitVM();
-        var result = try virtual_machine.execute(&plan);
+        var result = try virtual_machine.execute(plan_ptr);
         defer result.deinit();
 
         // Convert to ResultSet (copy the rows so result can be cleaned up)
@@ -359,11 +391,26 @@ pub const Connection = struct {
 
     /// Close the database connection
     pub fn close(self: *Self) void {
+        // Close all attached databases
+        var attached_iter = self.attached_databases.iterator();
+        while (attached_iter.next()) |entry| {
+            // Free the schema name key
+            self.allocator.free(entry.key_ptr.*);
+            // Close the attached connection
+            entry.value_ptr.*.close();
+        }
+        self.attached_databases.deinit();
+
         // Clean up any remaining undo log entries
         for (self.undo_log.items) |*entry| {
             entry.deinit(self.allocator);
         }
         self.undo_log.deinit(self.allocator);
+
+        // Clean up plan cache
+        if (self.plan_cache) |*cache| {
+            cache.deinit();
+        }
 
         // Checkpoint any remaining WAL entries before closing
         if (self.wal) |w| {
@@ -390,6 +437,47 @@ pub const Connection = struct {
             .path = self.path,
             .has_wal = self.wal != null,
         };
+    }
+
+    /// Attach an external database file with a schema name
+    pub fn attachDatabase(self: *Self, file_path: []const u8, schema_name: []const u8) !void {
+        // Check if schema name is already in use
+        if (self.attached_databases.get(schema_name) != null) {
+            return error.SchemaAlreadyAttached;
+        }
+
+        // Reserved schema names
+        if (std.mem.eql(u8, schema_name, "main") or std.mem.eql(u8, schema_name, "temp")) {
+            return error.ReservedSchemaName;
+        }
+
+        // Open connection to the external database
+        const attached_conn = try Self.open(self.allocator, file_path);
+        errdefer attached_conn.close();
+
+        // Store with duplicated schema name as key
+        const schema_key = try self.allocator.dupe(u8, schema_name);
+        errdefer self.allocator.free(schema_key);
+
+        try self.attached_databases.put(schema_key, attached_conn);
+    }
+
+    /// Detach a previously attached database
+    pub fn detachDatabase(self: *Self, schema_name: []const u8) !void {
+        // Check if schema exists
+        if (self.attached_databases.fetchRemove(schema_name)) |kv| {
+            // Free the schema name key
+            self.allocator.free(kv.key);
+            // Close the attached connection
+            kv.value.close();
+        } else {
+            return error.SchemaNotFound;
+        }
+    }
+
+    /// Get attached database connection by schema name
+    pub fn getAttachedDatabase(self: *Self, schema_name: []const u8) ?*Self {
+        return self.attached_databases.get(schema_name);
     }
 };
 

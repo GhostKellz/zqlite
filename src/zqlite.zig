@@ -185,7 +185,7 @@ pub fn printBuildInfo() void {
 
 // Tests
 test "zqlite version info" {
-    try std.testing.expect(std.mem.eql(u8, version.VERSION_STRING, "1.5.2"));
+    try std.testing.expect(std.mem.eql(u8, version.VERSION_STRING, "1.5.3"));
 }
 
 test "build info contains version" {

@@ -1,6 +1,6 @@
 # ZQLite API Reference
 
-**Version:** 1.3.5
+**Version:** 1.5.3
 
 ## Core API
 
@@ -102,10 +102,13 @@ conn.execute("...") catch |err| switch (err) {
 
 ### Supported Statements
 - `CREATE TABLE` with constraints (PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT)
+- `CREATE VIRTUAL TABLE ... USING fts5` - Full-text search tables
 - `INSERT`, `UPDATE`, `DELETE`
-- `SELECT` with WHERE, ORDER BY, LIMIT
+- `SELECT` with WHERE, ORDER BY, LIMIT, DISTINCT, GROUP BY, HAVING
 - `BEGIN`, `COMMIT`, `ROLLBACK`
 - `CREATE INDEX`, `DROP TABLE`
+- `ATTACH DATABASE`, `DETACH DATABASE` - Multi-database support
+- `EXPLAIN`, `EXPLAIN QUERY PLAN`
 
 ### Data Types
 - `INTEGER` - 64-bit signed integer
@@ -113,6 +116,67 @@ conn.execute("...") catch |err| switch (err) {
 - `TEXT` - UTF-8 string
 - `BLOB` - Binary data
 - `BOOLEAN` - True/false (stored as INTEGER)
+
+### Aggregate Functions
+- `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
+- `STDDEV` / `STDDEV_POP` / `STDEV` - Population standard deviation
+- `VARIANCE` / `VAR_POP` - Population variance
+- `GROUP_CONCAT` - Concatenate values with separator
+
+### Subqueries (v1.5.3+)
+
+```zig
+// IN subquery
+try conn.query("SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)");
+
+// Scalar subquery
+try conn.query("SELECT name, (SELECT COUNT(*) FROM orders WHERE orders.user_id = users.id) FROM users");
+```
+
+### Full-Text Search (v1.5.3+)
+
+```zig
+// Create FTS table
+try conn.execute("CREATE VIRTUAL TABLE articles USING fts5(title, content)");
+
+// Insert documents
+try conn.execute("INSERT INTO articles VALUES (1, 'Database Design', 'Best practices for schema design')");
+
+// Search with MATCH operator
+var result = try conn.query("SELECT * FROM articles WHERE content MATCH 'schema design'");
+```
+
+### ATTACH DATABASE (v1.5.3+)
+
+```zig
+// Attach external database
+try conn.execute("ATTACH DATABASE 'archive.db' AS archive");
+
+// Query across databases
+var result = try conn.query("SELECT * FROM main.users JOIN archive.old_users ON main.users.id = archive.old_users.id");
+
+// Detach when done
+try conn.execute("DETACH DATABASE archive");
+```
+
+### HAVING Clause (v1.5.3+)
+
+```zig
+// Filter aggregated results
+var result = try conn.query(
+    \\SELECT department, COUNT(*) as count
+    \\FROM employees
+    \\GROUP BY department
+    \\HAVING COUNT(*) > 5
+);
+```
+
+### SELECT DISTINCT (v1.5.3+)
+
+```zig
+// Remove duplicate rows
+var result = try conn.query("SELECT DISTINCT category FROM products");
+```
 
 ## Performance Tips
 

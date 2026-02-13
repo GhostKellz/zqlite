@@ -186,6 +186,7 @@ pub const VirtualMachine = struct {
     fn executeStep(self: *Self, step: *planner.ExecutionStep, result: *ExecutionResult) !void {
         switch (step.*) {
             .TableScan => |*scan| try self.executeTableScan(scan, result),
+            .IndexScan => |*scan| try self.executeIndexScan(scan, result),
             .Filter => |*filter| try self.executeFilter(filter, result),
             .Project => |*project| try self.executeProject(project, result),
             .Limit => |*limit| try self.executeLimit(limit, result),
@@ -208,6 +209,11 @@ pub const VirtualMachine = struct {
             .Explain => |*explain| try self.executeExplain(explain, result),
             .SetOperation => |*set_op| try self.executeSetOperation(set_op, result),
             .Window => |*window| try self.executeWindow(window, result),
+            .Having => |*having| try self.executeHaving(having, result),
+            .Distinct => try self.executeDistinct(result),
+            .Attach => |*attach| try self.executeAttach(attach, result),
+            .Detach => |*detach| try self.executeDetach(detach, result),
+            .CreateVirtualTable => |*create_vt| try self.executeCreateVirtualTable(create_vt, result),
         }
     }
 
@@ -262,6 +268,7 @@ pub const VirtualMachine = struct {
     fn executeNonCTEStep(self: *Self, step: *planner.ExecutionStep, result: *ExecutionResult) !void {
         switch (step.*) {
             .TableScan => |*scan| try self.executeTableScan(scan, result),
+            .IndexScan => |*scan| try self.executeIndexScan(scan, result),
             .Filter => |*filter| try self.executeFilter(filter, result),
             .Project => |*project| try self.executeProject(project, result),
             .Limit => |*limit| try self.executeLimit(limit, result),
@@ -290,6 +297,11 @@ pub const VirtualMachine = struct {
                 return error.NestedSetOperationNotSupported;
             },
             .Window => |*window| try self.executeWindow(window, result),
+            .Having => |*having| try self.executeHaving(having, result),
+            .Distinct => try self.executeDistinct(result),
+            .Attach => |*attach| try self.executeAttach(attach, result),
+            .Detach => |*detach| try self.executeDetach(detach, result),
+            .CreateVirtualTable => |*create_vt| try self.executeCreateVirtualTable(create_vt, result),
         }
     }
 
@@ -359,6 +371,90 @@ pub const VirtualMachine = struct {
         }
     }
 
+    /// Execute index scan (uses index for direct lookup instead of full table scan)
+    fn executeIndexScan(self: *Self, scan: *planner.IndexScanStep, result: *ExecutionResult) !void {
+        // Get the table
+        const table = self.connection.storage_engine.getTable(scan.table_name) orelse {
+            return error.TableNotFound;
+        };
+        self.current_table = table;
+
+        // Try to use the index for lookup
+        if (self.connection.storage_engine.getIndex(scan.index_name)) |index| {
+            // Convert lookup value to index key
+            const key = self.valueToIndexKey(scan.lookup_value);
+
+            // Use index search to find row_id
+            if (try index.search(key)) |row_id| {
+                // Get the row from the table
+                if (try table.getRow(@intCast(row_id))) |row| {
+                    // Clone the row values for the result
+                    var values = try self.connection.allocator.alloc(storage.Value, row.values.len);
+                    errdefer self.connection.allocator.free(values);
+
+                    var cloned_count: usize = 0;
+                    errdefer {
+                        for (values[0..cloned_count]) |v| {
+                            v.deinit(self.connection.allocator);
+                        }
+                    }
+
+                    for (row.values, 0..) |val, i| {
+                        values[i] = try val.clone(self.connection.allocator);
+                        cloned_count = i + 1;
+                    }
+                    try result.rows.append(self.connection.allocator, storage.Row{ .values = values });
+                }
+            }
+        } else {
+            // Index not found, fallback to table scan
+            return self.executeTableScanFallback(table, result);
+        }
+    }
+
+    /// Convert a storage Value to an index key (u64)
+    fn valueToIndexKey(self: *Self, value: storage.Value) u64 {
+        _ = self;
+        return switch (value) {
+            .Integer => |i| @bitCast(i),
+            .Text => |t| blk: {
+                // Simple hash for text values
+                var hash: u64 = 0;
+                for (t) |byte| {
+                    hash = hash *% 31 +% byte;
+                }
+                break :blk hash;
+            },
+            .Real => |r| @bitCast(r),
+            else => 0,
+        };
+    }
+
+    /// Fallback to table scan when index is unavailable
+    fn executeTableScanFallback(self: *Self, table: *storage.Table, result: *ExecutionResult) !void {
+        // Full table scan fallback - iterate through all rows in the table
+        var row_id: i64 = 1;
+        while (row_id <= @as(i64, @intCast(table.row_count))) : (row_id += 1) {
+            if (try table.getRow(row_id)) |row| {
+                var values = try self.connection.allocator.alloc(storage.Value, row.values.len);
+                errdefer self.connection.allocator.free(values);
+
+                var cloned_count: usize = 0;
+                errdefer {
+                    for (values[0..cloned_count]) |v| {
+                        v.deinit(self.connection.allocator);
+                    }
+                }
+
+                for (row.values, 0..) |val, i| {
+                    values[i] = try val.clone(self.connection.allocator);
+                    cloned_count = i + 1;
+                }
+                try result.rows.append(self.connection.allocator, storage.Row{ .values = values });
+            }
+        }
+    }
+
     /// Execute filter (WHERE clause)
     fn executeFilter(self: *Self, filter: *planner.FilterStep, result: *ExecutionResult) !void {
         var filtered_rows: std.ArrayList(storage.Row) = .{};
@@ -378,6 +474,142 @@ pub const VirtualMachine = struct {
         // Only free the ArrayList structure, not its contents (they're now in filtered_rows or freed)
         result.rows.deinit(self.connection.allocator);
         result.rows = filtered_rows;
+    }
+
+    /// Execute HAVING clause (filter after GROUP BY aggregation)
+    fn executeHaving(self: *Self, having: *planner.HavingStep, result: *ExecutionResult) !void {
+        var filtered_rows: std.ArrayList(storage.Row) = .{};
+
+        for (result.rows.items) |row| {
+            if (try self.evaluateCondition(&having.condition, &row)) {
+                try filtered_rows.append(self.connection.allocator, row);
+            } else {
+                // Free rows that don't match the HAVING condition
+                for (row.values) |value| {
+                    value.deinit(self.connection.allocator);
+                }
+                self.connection.allocator.free(row.values);
+            }
+        }
+
+        // Replace result rows with filtered rows
+        result.rows.deinit(self.connection.allocator);
+        result.rows = filtered_rows;
+    }
+
+    /// Execute DISTINCT (remove duplicate rows)
+    fn executeDistinct(self: *Self, result: *ExecutionResult) !void {
+        if (result.rows.items.len <= 1) {
+            // 0 or 1 rows is already distinct
+            return;
+        }
+
+        var unique_rows: std.ArrayList(storage.Row) = .{};
+        var seen = std.StringHashMap(void).init(self.connection.allocator);
+        defer seen.deinit();
+
+        for (result.rows.items) |row| {
+            // Build a hash key for the row by concatenating all values
+            const row_key = try self.buildRowKey(&row);
+            defer self.connection.allocator.free(row_key);
+
+            if (seen.get(row_key) == null) {
+                // New unique row
+                try seen.put(try self.connection.allocator.dupe(u8, row_key), {});
+                try unique_rows.append(self.connection.allocator, row);
+            } else {
+                // Duplicate row - free its memory
+                for (row.values) |value| {
+                    value.deinit(self.connection.allocator);
+                }
+                self.connection.allocator.free(row.values);
+            }
+        }
+
+        // Free the keys in seen hashmap
+        var key_iter = seen.keyIterator();
+        while (key_iter.next()) |key| {
+            self.connection.allocator.free(key.*);
+        }
+
+        // Replace result rows with unique rows
+        result.rows.deinit(self.connection.allocator);
+        result.rows = unique_rows;
+    }
+
+    /// Build a string key for a row (for deduplication)
+    fn buildRowKey(self: *Self, row: *const storage.Row) ![]u8 {
+        var key_parts: std.ArrayList(u8) = .{};
+        defer key_parts.deinit(self.connection.allocator);
+
+        for (row.values, 0..) |value, i| {
+            if (i > 0) {
+                try key_parts.append(self.connection.allocator, 0); // Separator
+            }
+            switch (value) {
+                .Null => try key_parts.appendSlice(self.connection.allocator, "NULL"),
+                .Integer, .Timestamp, .Time, .Interval, .BigInt => |v| {
+                    var buf: [32]u8 = undefined;
+                    const slice = std.fmt.bufPrint(&buf, "{d}", .{v}) catch "?";
+                    try key_parts.appendSlice(self.connection.allocator, slice);
+                },
+                .Date => |v| {
+                    var buf: [16]u8 = undefined;
+                    const slice = std.fmt.bufPrint(&buf, "{d}", .{v}) catch "?";
+                    try key_parts.appendSlice(self.connection.allocator, slice);
+                },
+                .Real => |v| {
+                    var buf: [64]u8 = undefined;
+                    const slice = std.fmt.bufPrint(&buf, "{d}", .{v}) catch "ERR";
+                    try key_parts.appendSlice(self.connection.allocator, slice);
+                },
+                .Text, .JSON => |v| try key_parts.appendSlice(self.connection.allocator, v),
+                .Blob => |v| try key_parts.appendSlice(self.connection.allocator, v),
+                .JSONB => |v| {
+                    // Convert JSONB to string for comparison
+                    const json_str = v.toString(self.connection.allocator) catch "JSONB";
+                    defer self.connection.allocator.free(json_str);
+                    try key_parts.appendSlice(self.connection.allocator, json_str);
+                },
+                .UUID => |v| {
+                    try key_parts.appendSlice(self.connection.allocator, &v);
+                },
+                .Boolean => |v| {
+                    try key_parts.appendSlice(self.connection.allocator, if (v) "T" else "F");
+                },
+                .TimestampTZ => |v| {
+                    var buf: [64]u8 = undefined;
+                    const slice = std.fmt.bufPrint(&buf, "{d}:{s}", .{ v.timestamp, v.timezone }) catch "ERR";
+                    try key_parts.appendSlice(self.connection.allocator, slice);
+                },
+                .Array => |v| {
+                    // For arrays, include element count in key
+                    var buf: [32]u8 = undefined;
+                    const slice = std.fmt.bufPrint(&buf, "ARR:{d}", .{v.elements.len}) catch "ARR:?";
+                    try key_parts.appendSlice(self.connection.allocator, slice);
+                },
+                .Parameter => |idx| {
+                    var buf: [32]u8 = undefined;
+                    const slice = std.fmt.bufPrint(&buf, "?{d}", .{idx}) catch "?";
+                    try key_parts.appendSlice(self.connection.allocator, slice);
+                },
+                .FunctionCall => try key_parts.appendSlice(self.connection.allocator, "FUNC"),
+                .SmallInt => |v| {
+                    var buf: [16]u8 = undefined;
+                    const slice = std.fmt.bufPrint(&buf, "{d}", .{v}) catch "?";
+                    try key_parts.appendSlice(self.connection.allocator, slice);
+                },
+                .Numeric => |v| {
+                    // Use the raw digits bytes for uniqueness
+                    if (v.is_negative) {
+                        try key_parts.appendSlice(self.connection.allocator, "-");
+                    }
+                    try key_parts.appendSlice(self.connection.allocator, v.digits);
+                },
+            }
+        }
+
+        return try key_parts.toOwnedSlice(self.connection.allocator);
     }
 
     /// Execute projection (SELECT columns)
@@ -531,7 +763,7 @@ pub const VirtualMachine = struct {
     }
 
     /// Convert AST value to storage value
-    fn convertAstValueToStorage(self: *Self, value: ast.Value) !storage.Value {
+    fn convertAstValueToStorage(self: *Self, value: ast.Value) std.mem.Allocator.Error!storage.Value {
         return switch (value) {
             .Integer => |i| storage.Value{ .Integer = i },
             .Text => |t| storage.Value{ .Text = try self.connection.allocator.dupe(u8, t) },
@@ -543,6 +775,7 @@ pub const VirtualMachine = struct {
                 const storage_func = try self.convertAstFunctionToStorage(function_call);
                 return storage.Value{ .FunctionCall = storage_func };
             },
+            .Case => storage.Value.Null, // CASE expressions evaluated separately
         };
     }
 
@@ -745,6 +978,77 @@ pub const VirtualMachine = struct {
             else => {},
         }
         return cloned;
+    }
+
+    /// Evaluate an UPDATE expression against the current row values
+    fn evaluateUpdateExpression(self: *Self, expr: ast.Expression, row_values: []storage.Value, table: *storage.Table) !storage.Value {
+        return switch (expr) {
+            .Column => |col_name| {
+                // Find column index by name
+                for (table.schema.columns, 0..) |col, idx| {
+                    if (std.mem.eql(u8, col.name, col_name)) {
+                        if (idx < row_values.len) {
+                            return try row_values[idx].clone(self.connection.allocator);
+                        }
+                    }
+                }
+                return storage.Value.Null;
+            },
+            .Literal => |value| {
+                return try self.convertAstValueToStorage(value);
+            },
+            .Parameter => |param_index| {
+                return storage.Value{ .Parameter = param_index };
+            },
+            .BinaryOp => |bin| {
+                const left_val = try self.evaluateUpdateExpression(bin.left.*, row_values, table);
+                defer left_val.deinit(self.connection.allocator);
+
+                const right_val = try self.evaluateUpdateExpression(bin.right.*, row_values, table);
+                defer right_val.deinit(self.connection.allocator);
+
+                // Perform arithmetic based on operator
+                return self.performArithmetic(left_val, bin.op, right_val);
+            },
+            .Subquery => |subquery| {
+                // Execute scalar subquery and return first column of first row
+                return try self.executeScalarSubquery(subquery);
+            },
+            .InList => {
+                // InList is handled in comparison, not as standalone value
+                return storage.Value.Null;
+            },
+        };
+    }
+
+    /// Perform arithmetic operation on two values
+    fn performArithmetic(self: *Self, left: storage.Value, op: ast.ArithmeticOp, right: storage.Value) !storage.Value {
+        _ = self;
+        // Extract numeric values
+        const left_num: f64 = switch (left) {
+            .Integer => |i| @floatFromInt(i),
+            .Real => |r| r,
+            else => return storage.Value.Null,
+        };
+        const right_num: f64 = switch (right) {
+            .Integer => |i| @floatFromInt(i),
+            .Real => |r| r,
+            else => return storage.Value.Null,
+        };
+
+        const result: f64 = switch (op) {
+            .Add => left_num + right_num,
+            .Subtract => left_num - right_num,
+            .Multiply => left_num * right_num,
+            .Divide => if (right_num != 0) left_num / right_num else return storage.Value.Null,
+            .Modulo => if (right_num != 0) @mod(left_num, right_num) else return storage.Value.Null,
+        };
+
+        // Return integer if both operands were integers and result is whole
+        if (left == .Integer and right == .Integer and @floor(result) == result) {
+            return storage.Value{ .Integer = @intFromFloat(result) };
+        }
+        return storage.Value{ .Real = result };
     }
 
     /// Execute limit
@@ -987,7 +1291,8 @@ pub const VirtualMachine = struct {
                     if (col_idx) |idx| {
                         if (idx < updated_values.len) {
                             updated_values[idx].deinit(self.connection.allocator);
-                            updated_values[idx] = try self.cloneValue(assignment.value);
+                            // Evaluate expression against current row values
+                            updated_values[idx] = try self.evaluateUpdateExpression(assignment.expr, item.row.values, table);
                         }
                     }
                 }
@@ -1097,6 +1402,12 @@ pub const VirtualMachine = struct {
             return left_value != .Null;
         }
 
+        // Handle IN / NOT IN with InList or Subquery
+        if (comp.operator == .In or comp.operator == .NotIn) {
+            const in_result = try self.evaluateInCondition(left_value, &comp.right, row);
+            return if (comp.operator == .In) in_result else !in_result;
+        }
+
         const right_value = try self.evaluateExpression(&comp.right, row);
         defer right_value.deinit(self.connection.allocator);
 
@@ -1130,16 +1441,84 @@ pub const VirtualMachine = struct {
             },
             .Like => self.evaluateLike(left_value, right_value, false),
             .NotLike => self.evaluateLike(left_value, right_value, true),
-            .In => {
-                // Simple IN implementation - check equality
-                return self.compareValues(left_value, right_value) == .eq;
-            },
-            .NotIn => {
-                // Simple NOT IN implementation
-                return self.compareValues(left_value, right_value) != .eq;
-            },
+            .Match => self.evaluateMatch(left_value, right_value), // FTS MATCH
+            .In, .NotIn => unreachable, // Already handled above
             .IsNull, .IsNotNull, .Between, .NotBetween => unreachable, // Already handled above
         };
+    }
+
+    /// Evaluate IN condition with InList or Subquery
+    fn evaluateInCondition(self: *Self, left_value: storage.Value, right_expr: *const ast.Expression, row: *const storage.Row) anyerror!bool {
+        switch (right_expr.*) {
+            .InList => |list| {
+                // Check if left_value matches any value in the list
+                for (list) |ast_val| {
+                    const val = try self.convertAstValueToStorage(ast_val);
+                    defer val.deinit(self.connection.allocator);
+                    if (self.compareValues(left_value, val) == .eq) {
+                        return true;
+                    }
+                }
+                return false;
+            },
+            .Subquery => |subquery| {
+                // Execute subquery and check if left_value matches any result
+                var result = try self.executeSubquery(subquery);
+                defer result.deinit();
+
+                for (result.rows.items) |subrow| {
+                    if (subrow.values.len > 0) {
+                        if (self.compareValues(left_value, subrow.values[0]) == .eq) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            },
+            else => {
+                // Fall back to simple equality comparison
+                const right_value = try self.evaluateExpression(right_expr, row);
+                defer right_value.deinit(self.connection.allocator);
+                return self.compareValues(left_value, right_value) == .eq;
+            },
+        }
+    }
+
+    /// Execute a subquery and return the full result
+    fn executeSubquery(self: *Self, subquery: *ast.SelectStatement) anyerror!ExecutionResult {
+        // Create execution plan for subquery
+        var query_planner = planner.Planner.init(self.connection.allocator);
+        var cloned_stmt = try query_planner.cloneSelectStatement(subquery.*);
+        defer @constCast(&cloned_stmt).deinit(self.connection.allocator);
+
+        const stmt = ast.Statement{ .Select = cloned_stmt };
+        var plan = try query_planner.plan(&stmt);
+        defer plan.deinit();
+
+        // Execute plan
+        var subquery_result = ExecutionResult{
+            .rows = .{},
+            .affected_rows = 0,
+            .connection = self.connection,
+        };
+
+        for (plan.steps) |*step| {
+            try self.executeStep(step, &subquery_result);
+        }
+
+        return subquery_result;
+    }
+
+    /// Execute a scalar subquery and return the first column of the first row
+    fn executeScalarSubquery(self: *Self, subquery: *ast.SelectStatement) anyerror!storage.Value {
+        var result = try self.executeSubquery(subquery);
+        defer result.deinit();
+
+        // Return first column of first row, or NULL if empty
+        if (result.rows.items.len > 0 and result.rows.items[0].values.len > 0) {
+            return try result.rows.items[0].values[0].clone(self.connection.allocator);
+        }
+        return storage.Value.Null;
     }
 
     /// Evaluate LIKE pattern matching with % and _ wildcards
@@ -1156,6 +1535,38 @@ pub const VirtualMachine = struct {
 
         const matches = likeMatch(text, pat);
         return if (negate) !matches else matches;
+    }
+
+    /// Evaluate FTS MATCH operator for full-text search
+    /// Checks if the text contains all words from the search query
+    fn evaluateMatch(self: *Self, value: storage.Value, query: storage.Value) bool {
+        _ = self;
+        const text = switch (value) {
+            .Text => |t| t,
+            else => return false,
+        };
+        const search_query = switch (query) {
+            .Text => |q| q,
+            else => return false,
+        };
+
+        // Tokenize the search query and check if all terms exist in the text
+        var query_iter = std.mem.tokenizeAny(u8, search_query, " \t\n\r.,;:!?()[]{}\"'");
+
+        while (query_iter.next()) |term| {
+            // Case-insensitive search: check if term exists in text
+            var found = false;
+            var text_iter = std.mem.tokenizeAny(u8, text, " \t\n\r.,;:!?()[]{}\"'");
+            while (text_iter.next()) |word| {
+                if (std.ascii.eqlIgnoreCase(word, term)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
+
+        return true;
     }
 
     /// Evaluate CASE WHEN ... THEN ... ELSE ... END expression
@@ -1548,6 +1959,21 @@ pub const VirtualMachine = struct {
                 } else {
                     return error.NoParametersProvided;
                 }
+            },
+            .BinaryOp => |bin| {
+                const left_val = try self.evaluateExpression(bin.left, row);
+                defer left_val.deinit(self.connection.allocator);
+                const right_val = try self.evaluateExpression(bin.right, row);
+                defer right_val.deinit(self.connection.allocator);
+                return self.performArithmetic(left_val, bin.op, right_val);
+            },
+            .Subquery => |subquery| {
+                // Execute scalar subquery and return first column of first row
+                return try self.executeScalarSubquery(subquery);
+            },
+            .InList => {
+                // InList is handled in comparison context, not as standalone value
+                return storage.Value.Null;
             },
         };
     }
@@ -2237,6 +2663,103 @@ pub const VirtualMachine = struct {
                     const result_value = storage.Value{ .Integer = @intCast(seen.count()) };
                     try self.finishAggregateResult(result, result_value);
                 },
+                .Stddev => {
+                    // STDDEV(column) - population standard deviation
+                    // First pass: calculate mean
+                    var sum: f64 = 0.0;
+                    var count: u32 = 0;
+                    for (result.rows.items) |row| {
+                        if (col_idx < row.values.len) {
+                            switch (row.values[col_idx]) {
+                                .Integer => |i| {
+                                    sum += @floatFromInt(i);
+                                    count += 1;
+                                },
+                                .Real => |r| {
+                                    sum += r;
+                                    count += 1;
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                    if (count == 0) {
+                        const result_value = storage.Value.Null;
+                        try self.finishAggregateResult(result, result_value);
+                    } else {
+                        const mean = sum / @as(f64, @floatFromInt(count));
+                        // Second pass: calculate sum of squared differences
+                        var sum_sq_diff: f64 = 0.0;
+                        for (result.rows.items) |row| {
+                            if (col_idx < row.values.len) {
+                                switch (row.values[col_idx]) {
+                                    .Integer => |i| {
+                                        const val: f64 = @floatFromInt(i);
+                                        const diff = val - mean;
+                                        sum_sq_diff += diff * diff;
+                                    },
+                                    .Real => |r| {
+                                        const diff = r - mean;
+                                        sum_sq_diff += diff * diff;
+                                    },
+                                    else => {},
+                                }
+                            }
+                        }
+                        const variance = sum_sq_diff / @as(f64, @floatFromInt(count));
+                        const stddev = @sqrt(variance);
+                        const result_value = storage.Value{ .Real = stddev };
+                        try self.finishAggregateResult(result, result_value);
+                    }
+                },
+                .Variance => {
+                    // VARIANCE(column) - population variance
+                    // First pass: calculate mean
+                    var sum: f64 = 0.0;
+                    var count: u32 = 0;
+                    for (result.rows.items) |row| {
+                        if (col_idx < row.values.len) {
+                            switch (row.values[col_idx]) {
+                                .Integer => |i| {
+                                    sum += @floatFromInt(i);
+                                    count += 1;
+                                },
+                                .Real => |r| {
+                                    sum += r;
+                                    count += 1;
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                    if (count == 0) {
+                        const result_value = storage.Value.Null;
+                        try self.finishAggregateResult(result, result_value);
+                    } else {
+                        const mean = sum / @as(f64, @floatFromInt(count));
+                        // Second pass: calculate sum of squared differences
+                        var sum_sq_diff: f64 = 0.0;
+                        for (result.rows.items) |row| {
+                            if (col_idx < row.values.len) {
+                                switch (row.values[col_idx]) {
+                                    .Integer => |i| {
+                                        const val: f64 = @floatFromInt(i);
+                                        const diff = val - mean;
+                                        sum_sq_diff += diff * diff;
+                                    },
+                                    .Real => |r| {
+                                        const diff = r - mean;
+                                        sum_sq_diff += diff * diff;
+                                    },
+                                    else => {},
+                                }
+                            }
+                        }
+                        const variance = sum_sq_diff / @as(f64, @floatFromInt(count));
+                        const result_value = storage.Value{ .Real = variance };
+                        try self.finishAggregateResult(result, result_value);
+                    }
+                },
             }
         }
     }
@@ -2519,6 +3042,83 @@ pub const VirtualMachine = struct {
                 }
                 return storage.Value{ .Integer = @intCast(seen.count()) };
             },
+            .Stddev => {
+                // STDDEV(column) - population standard deviation
+                var sum: f64 = 0.0;
+                var count: u32 = 0;
+                for (rows) |row| {
+                    const val = self.getAggregateColumnValue(row, col_idx);
+                    switch (val) {
+                        .Integer => |i| {
+                            sum += @floatFromInt(i);
+                            count += 1;
+                        },
+                        .Real => |r| {
+                            sum += r;
+                            count += 1;
+                        },
+                        else => {},
+                    }
+                }
+                if (count == 0) return storage.Value.Null;
+                const mean = sum / @as(f64, @floatFromInt(count));
+                var sum_sq_diff: f64 = 0.0;
+                for (rows) |row| {
+                    const val = self.getAggregateColumnValue(row, col_idx);
+                    switch (val) {
+                        .Integer => |i| {
+                            const v: f64 = @floatFromInt(i);
+                            const diff = v - mean;
+                            sum_sq_diff += diff * diff;
+                        },
+                        .Real => |r| {
+                            const diff = r - mean;
+                            sum_sq_diff += diff * diff;
+                        },
+                        else => {},
+                    }
+                }
+                const variance = sum_sq_diff / @as(f64, @floatFromInt(count));
+                return storage.Value{ .Real = @sqrt(variance) };
+            },
+            .Variance => {
+                // VARIANCE(column) - population variance
+                var sum: f64 = 0.0;
+                var count: u32 = 0;
+                for (rows) |row| {
+                    const val = self.getAggregateColumnValue(row, col_idx);
+                    switch (val) {
+                        .Integer => |i| {
+                            sum += @floatFromInt(i);
+                            count += 1;
+                        },
+                        .Real => |r| {
+                            sum += r;
+                            count += 1;
+                        },
+                        else => {},
+                    }
+                }
+                if (count == 0) return storage.Value.Null;
+                const mean = sum / @as(f64, @floatFromInt(count));
+                var sum_sq_diff: f64 = 0.0;
+                for (rows) |row| {
+                    const val = self.getAggregateColumnValue(row, col_idx);
+                    switch (val) {
+                        .Integer => |i| {
+                            const v: f64 = @floatFromInt(i);
+                            const diff = v - mean;
+                            sum_sq_diff += diff * diff;
+                        },
+                        .Real => |r| {
+                            const diff = r - mean;
+                            sum_sq_diff += diff * diff;
+                        },
+                        else => {},
+                    }
+                }
+                return storage.Value{ .Real = sum_sq_diff / @as(f64, @floatFromInt(count)) };
+            },
         }
     }
 
@@ -2764,6 +3364,86 @@ pub const VirtualMachine = struct {
                 .values = try row_values.toOwnedSlice(allocator),
             });
         }
+    }
+
+    /// Execute ATTACH DATABASE statement
+    fn executeAttach(self: *Self, attach: *planner.AttachStep, result: *ExecutionResult) !void {
+        _ = result; // ATTACH doesn't return rows
+        try self.connection.attachDatabase(attach.file_path, attach.schema_name);
+    }
+
+    /// Execute DETACH DATABASE statement
+    fn executeDetach(self: *Self, detach: *planner.DetachStep, result: *ExecutionResult) !void {
+        _ = result; // DETACH doesn't return rows
+        try self.connection.detachDatabase(detach.schema_name);
+    }
+
+    /// Execute CREATE VIRTUAL TABLE statement (FTS5)
+    fn executeCreateVirtualTable(self: *Self, create_vt: *planner.CreateVirtualTableStep, result: *ExecutionResult) !void {
+        _ = result; // CREATE doesn't return rows
+        const allocator = self.connection.allocator;
+
+        // Only FTS5 module is currently supported
+        if (!std.mem.eql(u8, create_vt.module_name, "fts5") and
+            !std.mem.eql(u8, create_vt.module_name, "fts4") and
+            !std.mem.eql(u8, create_vt.module_name, "FTS5") and
+            !std.mem.eql(u8, create_vt.module_name, "FTS4"))
+        {
+            return error.UnsupportedVirtualTableModule;
+        }
+
+        // Check if table already exists
+        if (self.connection.storage_engine.getTable(create_vt.table_name)) |_| {
+            if (create_vt.if_not_exists) {
+                return; // Table already exists, IF NOT EXISTS specified
+            }
+            return error.TableAlreadyExists;
+        }
+
+        // Create the backing table for FTS with rowid and indexed columns
+        var columns = try allocator.alloc(storage.Column, create_vt.columns.len + 1);
+        var columns_owned = false;
+        errdefer {
+            // Clean up on error: free all column names and the array only if not yet owned by table
+            if (!columns_owned) {
+                for (columns) |col| {
+                    if (col.name.len > 0) allocator.free(col.name);
+                }
+                allocator.free(columns);
+            }
+        }
+
+        // First column is rowid (implicit)
+        columns[0] = storage.Column{
+            .name = try allocator.dupe(u8, "rowid"),
+            .data_type = .Integer,
+            .is_nullable = false,
+            .is_primary_key = true,
+            .default_value = null,
+        };
+
+        // Add indexed columns
+        for (create_vt.columns, 0..) |col_name, i| {
+            columns[i + 1] = storage.Column{
+                .name = try allocator.dupe(u8, col_name),
+                .data_type = .Text,
+                .is_nullable = true,
+                .is_primary_key = false,
+                .default_value = null,
+            };
+        }
+
+        const schema = storage.TableSchema{ .columns = columns };
+        try self.connection.storage_engine.createTable(create_vt.table_name, schema);
+        columns_owned = true; // Table now owns the columns
+
+        // Mark this table as an FTS virtual table by creating a special FTS index
+        // The FTS functionality will be handled by the MATCH operator in WHERE clause
+        // If FTS creation fails, rollback by dropping the backing table
+        self.connection.storage_engine.createFTSIndex(create_vt.table_name, create_vt.columns) catch |err| {
+            self.connection.storage_engine.dropTable(create_vt.table_name) catch {};
+            return err;
+        };
     }
 
     /// Execute a basic query step (no CTEs or nested set operations - breaks recursion)
@@ -3213,6 +3893,7 @@ pub const VirtualMachine = struct {
         _ = self;
         return switch (step.*) {
             .TableScan => |scan| try std.fmt.allocPrint(allocator, "SCAN TABLE {s}", .{scan.table_name}),
+            .IndexScan => |scan| try std.fmt.allocPrint(allocator, "INDEX SCAN {s}.{s} USING {s}", .{ scan.table_name, scan.column_name, scan.index_name }),
             .Filter => try allocator.dupe(u8, "FILTER"),
             .Project => try allocator.dupe(u8, "PROJECT"),
             .Limit => |limit| try std.fmt.allocPrint(allocator, "LIMIT {d}", .{limit.count}),
@@ -3235,6 +3916,11 @@ pub const VirtualMachine = struct {
             .Explain => try allocator.dupe(u8, "EXPLAIN"),
             .SetOperation => |set_op| try std.fmt.allocPrint(allocator, "SET OPERATION {s}", .{@tagName(set_op.operation)}),
             .Window => try allocator.dupe(u8, "WINDOW"),
+            .Having => try allocator.dupe(u8, "HAVING"),
+            .Distinct => try allocator.dupe(u8, "DISTINCT"),
+            .Attach => |attach| try std.fmt.allocPrint(allocator, "ATTACH DATABASE '{s}' AS {s}", .{ attach.file_path, attach.schema_name }),
+            .Detach => |detach| try std.fmt.allocPrint(allocator, "DETACH DATABASE {s}", .{detach.schema_name}),
+            .CreateVirtualTable => |create_vt| try std.fmt.allocPrint(allocator, "CREATE VIRTUAL TABLE {s} USING {s}", .{ create_vt.table_name, create_vt.module_name }),
         };
     }
 };
@@ -3389,4 +4075,43 @@ pub fn execute(connection: *db.Connection, parsed: *const ast.Statement) !void {
 
 test "vm creation" {
     try std.testing.expect(true); // Placeholder
+}
+
+test "FTS virtual table creation failure rollback" {
+    // This test verifies that when CREATE VIRTUAL TABLE fails during FTS index creation,
+    // the backing table is properly rolled back (no orphan table remains).
+    // Regression test for memory safety issues identified in v1.5.3 code review.
+
+    const testing = std.testing;
+
+    // Use a FailingAllocator that will fail after a certain number of allocations
+    // We need to find the right count where table creation succeeds but FTS creation fails
+    const fail_counts_to_test = [_]usize{ 50, 60, 70, 80, 90, 100, 110, 120 };
+
+    for (fail_counts_to_test) |fail_after| {
+        const backing_allocator = testing.allocator;
+        var failing_alloc = std.heap.FailingAllocator.init(backing_allocator, .{ .fail_index = fail_after });
+        const alloc = failing_alloc.allocator();
+
+        // Try to create connection and virtual table
+        const conn = db.Connection.openMemory(alloc) catch continue;
+        defer conn.close();
+
+        // Try creating the virtual table - this may fail at various points
+        conn.execute("CREATE VIRTUAL TABLE test_fts USING fts5(title, content)") catch |err| {
+            // If it failed, verify no orphan table exists
+            if (conn.storage_engine.getTable("test_fts")) |_| {
+                // Orphan table found - this is the bug we're testing for
+                std.debug.print("FAIL: Orphan table found after FTS creation failure at fail_index={d}\n", .{fail_after});
+                return error.OrphanTableAfterFTSFailure;
+            }
+            // No orphan - good, the rollback worked
+            _ = err;
+            continue;
+        };
+
+        // If we get here, creation succeeded - verify both table and FTS index exist
+        try testing.expect(conn.storage_engine.getTable("test_fts") != null);
+        try testing.expect(conn.storage_engine.isFTSTable("test_fts"));
+    }
 }
