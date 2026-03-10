@@ -3,6 +3,7 @@ const posix = std.posix;
 const builtin = @import("builtin");
 const native_os = builtin.os.tag;
 const encryption = @import("encryption.zig");
+const Io = std.Io;
 
 /// Doubly-linked list node for O(1) LRU operations
 const LRUNode = struct {
@@ -396,7 +397,7 @@ pub const Pager = struct {
 
         // Close file
         if (self.fd) |fd| {
-            posix.close(fd);
+            Io.Threaded.closeFd(fd);
         }
 
         self.allocator.destroy(self);

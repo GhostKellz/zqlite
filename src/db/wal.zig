@@ -2,6 +2,7 @@ const std = @import("std");
 const posix = std.posix;
 const builtin = @import("builtin");
 const native_os = builtin.os.tag;
+const Io = std.Io;
 
 /// Write-Ahead Log for transaction safety and durability
 pub const WriteAheadLog = struct {
@@ -450,7 +451,7 @@ pub const WriteAheadLog = struct {
         self.log_entries.deinit(self.allocator);
 
         if (self.fd) |fd| {
-            posix.close(fd);
+            Io.Threaded.closeFd(fd);
         }
 
         self.allocator.free(self.wal_path);
