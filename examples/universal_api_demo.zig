@@ -4,7 +4,7 @@ const zqlite = @import("zqlite");
 /// ZQLite Universal API Demo
 /// Shows how non-crypto applications can leverage zqlite's broad API surfaces
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

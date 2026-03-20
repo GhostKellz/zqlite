@@ -3,7 +3,7 @@ const zqlite = @import("zqlite");
 
 /// Demo of all the new improved APIs for GhostMesh and ZNS use cases
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

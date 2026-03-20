@@ -115,7 +115,7 @@ pub const Connection = struct {
     path: ?[]const u8,
     owns_storage: bool, // Whether this connection owns and should clean up the storage engine
     in_transaction: bool,
-    undo_log: std.ArrayList(UndoEntry),
+    undo_log: std.ArrayListUnmanaged(UndoEntry),
     plan_cache: ?cache_manager.QueryPlanCache,
     attached_databases: std.StringHashMap(*Self), // ATTACH DATABASE schema_name -> connection
     /// SECURITY: Path policy for ATTACH operations (default allows all for backwards compatibility)
@@ -133,7 +133,7 @@ pub const Connection = struct {
         conn.path = try allocator.dupe(u8, path);
         conn.owns_storage = true;
         conn.in_transaction = false;
-        conn.undo_log = .{};
+        conn.undo_log = .empty;
         conn.plan_cache = try cache_manager.QueryPlanCache.init(allocator, 100);
         conn.attached_databases = std.StringHashMap(*Self).init(allocator);
         conn.attach_path_policy = AttachPathPolicy.ALLOW_ALL; // Default for backwards compatibility
@@ -156,7 +156,7 @@ pub const Connection = struct {
         conn.path = null;
         conn.owns_storage = true;
         conn.in_transaction = false;
-        conn.undo_log = .{};
+        conn.undo_log = .empty;
         conn.plan_cache = try cache_manager.QueryPlanCache.init(allocator, 100);
         conn.attached_databases = std.StringHashMap(*Self).init(allocator);
         conn.attach_path_policy = AttachPathPolicy.ALLOW_ALL; // Default for backwards compatibility
@@ -174,7 +174,7 @@ pub const Connection = struct {
         conn.path = null;
         conn.owns_storage = false; // This connection doesn't own the storage
         conn.in_transaction = false;
-        conn.undo_log = .{};
+        conn.undo_log = .empty;
         conn.plan_cache = try cache_manager.QueryPlanCache.init(allocator, 100);
         conn.attached_databases = std.StringHashMap(*Self).init(allocator);
         conn.attach_path_policy = AttachPathPolicy.ALLOW_ALL; // Default for backwards compatibility
@@ -372,7 +372,7 @@ pub const Connection = struct {
         var result_set = ResultSet{
             .allocator = self.allocator,
             .connection = self,
-            .rows = .{},
+            .rows = .empty,
             .current_index = 0,
             .column_names = try self.extractColumnNames(&parsed.statement),
         };
@@ -380,7 +380,7 @@ pub const Connection = struct {
         // Transfer ownership of rows to ResultSet
         result_set.rows = result.rows;
         // Prevent result.deinit from freeing the rows (we've transferred ownership)
-        result.rows = .{};
+        result.rows = .empty;
 
         return result_set;
     }
@@ -592,7 +592,7 @@ pub const ConnectionInfo = struct {
 pub const ResultSet = struct {
     allocator: std.mem.Allocator,
     connection: *Connection,
-    rows: std.ArrayList(storage.Row),
+    rows: std.ArrayListUnmanaged(storage.Row),
     current_index: usize,
     column_names: [][]const u8,
 

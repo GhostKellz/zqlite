@@ -20,7 +20,7 @@ pub const NodeCache = struct {
         return NodeCache{
             .allocator = allocator,
             .entries = std.AutoHashMap(u32, CacheEntry).init(allocator),
-            .lru_order = .{},
+            .lru_order = .empty,
             .max_entries = max_entries,
             .hits = 0,
             .misses = 0,
@@ -246,7 +246,7 @@ pub const BTree = struct {
 
     /// Select all rows (for table scans)
     pub fn selectAll(self: *Self, allocator: std.mem.Allocator) ![]storage.Row {
-        var results: std.ArrayList(storage.Row) = .{};
+        var results: std.ArrayListUnmanaged(storage.Row) = .empty;
         try self.collectAllLeafValues(self.root_page, &results, allocator);
         return results.toOwnedSlice(allocator);
     }
@@ -259,7 +259,7 @@ pub const BTree = struct {
 
     /// Select all rows with their keys (for delete filtering)
     pub fn selectAllWithKeys(self: *Self, allocator: std.mem.Allocator) ![]KeyRowPair {
-        var results: std.ArrayList(KeyRowPair) = .{};
+        var results: std.ArrayListUnmanaged(KeyRowPair) = .empty;
         try self.collectAllLeafValuesWithKeys(self.root_page, &results, allocator);
         return results.toOwnedSlice(allocator);
     }

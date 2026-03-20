@@ -11,7 +11,7 @@ const zqlite = @import("../zqlite.zig");
 pub const Transport = struct {
     allocator: std.mem.Allocator,
     endpoint: ?Endpoint,
-    connections: std.ArrayList(*Connection),
+    connections: std.ArrayListUnmanaged(*Connection),
     is_server: bool,
     crypto_enabled: bool,
 
@@ -27,8 +27,8 @@ pub const Transport = struct {
         id: ConnectionId,
         address: std.Io.net.IpAddress,
         state: ConnectionState,
-        write_buffer: std.ArrayList(u8),
-        read_buffer: std.ArrayList(u8),
+        write_buffer: std.ArrayListUnmanaged(u8),
+        read_buffer: std.ArrayListUnmanaged(u8),
         allocator: std.mem.Allocator,
 
         const ConnectionState = enum {
@@ -44,8 +44,8 @@ pub const Transport = struct {
                 .id = id,
                 .address = address,
                 .state = .connecting,
-                .write_buffer = .{},
-                .read_buffer = .{},
+                .write_buffer = .empty,
+                .read_buffer = .empty,
                 .allocator = allocator,
             };
             return conn;
@@ -66,7 +66,7 @@ pub const Transport = struct {
         return Self{
             .allocator = allocator,
             .endpoint = null,
-            .connections = .{},
+            .connections = .empty,
             .is_server = is_server,
             .crypto_enabled = false,
         };
@@ -146,7 +146,7 @@ pub const TransportStats = struct {
 
 test "transport basic functionality" {
     const testing = std.testing;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

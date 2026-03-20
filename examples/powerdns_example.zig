@@ -127,7 +127,7 @@ const PowerDNSServer = struct {
 
 /// Demo function showing PowerDNS-like operations
 pub fn runDemo() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

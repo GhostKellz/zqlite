@@ -5,7 +5,7 @@ const zqlite = @import("zqlite");
 /// Demonstrating cutting-edge cryptographic database features
 /// Powered by ZQLite v0.6.0 with modular crypto backends
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

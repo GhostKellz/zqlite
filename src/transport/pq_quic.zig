@@ -25,7 +25,7 @@ pub const PQQuicTransport = struct {
     allocator: std.mem.Allocator,
     quic_crypto: QuicCrypto,
     endpoint: ?Endpoint,
-    connections: std.ArrayList(*PQConnection), // Use ArrayList instead of HashMap
+    connections: std.ArrayListUnmanaged(*PQConnection), // Use ArrayList instead of HashMap
     is_server: bool,
 
     const Self = @This();
@@ -577,7 +577,7 @@ pub const PQDatabaseTransport = struct {
     pub fn executeQuery(self: *Self, conn_id: u64, query: []const u8) ![]u8 {
         if (self.query_encryption) {
             // Encrypt query with additional protection
-            var encrypted_query: std.ArrayList(u8) = .{};
+            var encrypted_query: std.ArrayListUnmanaged(u8) = .empty;
             defer encrypted_query.deinit();
 
             try encrypted_query.appendSlice("ENCRYPTED:");
@@ -611,7 +611,7 @@ pub const PQDatabaseTransport = struct {
 pub const QueryStream = struct {
     conn_id: u64,
     transport: *PQQuicTransport,
-    buffer: std.ArrayList(u8),
+    buffer: std.ArrayListUnmanaged(u8),
 
     const Self = @This();
 
@@ -633,7 +633,7 @@ pub const QueryStream = struct {
 // Tests for post-quantum QUIC transport
 test "post-quantum QUIC connection" {
     const testing = std.testing;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -654,7 +654,7 @@ test "post-quantum QUIC connection" {
 
 test "encrypted database query over PQ-QUIC" {
     const testing = std.testing;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -672,7 +672,7 @@ test "encrypted database query over PQ-QUIC" {
 
 test "QUIC packet encryption with post-quantum" {
     const testing = std.testing;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
     _ = allocator; // Not used in this test

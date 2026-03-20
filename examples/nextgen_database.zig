@@ -213,7 +213,7 @@ const NextGenDatabase = struct {
 
 /// Demo function showcasing next-generation database capabilities
 pub fn runNextGenDemo() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

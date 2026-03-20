@@ -107,7 +107,7 @@ pub const Parser = struct {
             try self.advance();
             try self.expect(.By);
 
-            var order_clauses: std.ArrayList(ast.OrderByClause) = .{};
+            var order_clauses: std.ArrayListUnmanaged(ast.OrderByClause) = .empty;
             defer order_clauses.deinit(self.allocator);
 
             while (true) {
@@ -184,7 +184,7 @@ pub const Parser = struct {
         }
 
         // Parse columns
-        var columns: std.ArrayList(ast.Column) = .{};
+        var columns: std.ArrayListUnmanaged(ast.Column) = .empty;
         defer columns.deinit(self.allocator);
 
         if (std.meta.activeTag(self.current_token) == .Asterisk) {
@@ -224,7 +224,7 @@ pub const Parser = struct {
         }
 
         // Parse optional JOIN clauses
-        var joins: std.ArrayList(ast.JoinClause) = .{};
+        var joins: std.ArrayListUnmanaged(ast.JoinClause) = .empty;
         defer joins.deinit(self.allocator);
 
         while (true) {
@@ -246,7 +246,7 @@ pub const Parser = struct {
             try self.advance();
             try self.expect(.By);
 
-            var group_columns: std.ArrayList([]const u8) = .{};
+            var group_columns: std.ArrayListUnmanaged([]const u8) = .empty;
             defer group_columns.deinit(self.allocator);
 
             while (true) {
@@ -283,7 +283,7 @@ pub const Parser = struct {
                 try self.advance();
                 try self.expect(.By);
 
-                var order_clauses: std.ArrayList(ast.OrderByClause) = .{};
+                var order_clauses: std.ArrayListUnmanaged(ast.OrderByClause) = .empty;
                 defer order_clauses.deinit(self.allocator);
 
                 while (true) {
@@ -479,7 +479,7 @@ pub const Parser = struct {
         var columns: ?[][]const u8 = null;
         if (std.meta.activeTag(self.current_token) == .LeftParen) {
             try self.advance();
-            var column_list: std.ArrayList([]const u8) = .{};
+            var column_list: std.ArrayListUnmanaged([]const u8) = .empty;
             defer column_list.deinit(self.allocator);
 
             while (true) {
@@ -500,14 +500,14 @@ pub const Parser = struct {
         // Parse VALUES clause
         try self.expect(.Values);
 
-        var values: std.ArrayList([]ast.Value) = .{};
+        var values: std.ArrayListUnmanaged([]ast.Value) = .empty;
         defer values.deinit(self.allocator);
 
         // Parse value rows
         while (true) {
             try self.expect(.LeftParen);
 
-            var row: std.ArrayList(ast.Value) = .{};
+            var row: std.ArrayListUnmanaged(ast.Value) = .empty;
             defer row.deinit(self.allocator);
 
             while (true) {
@@ -801,7 +801,7 @@ pub const Parser = struct {
         // Column list (col1, col2, ...)
         try self.expect(.LeftParen);
 
-        var columns: std.ArrayList([]const u8) = .{};
+        var columns: std.ArrayListUnmanaged([]const u8) = .empty;
         errdefer {
             for (columns.items) |col| {
                 self.allocator.free(col);
@@ -855,7 +855,7 @@ pub const Parser = struct {
 
         try self.expect(.LeftParen);
 
-        var columns: std.ArrayList([]const u8) = .{};
+        var columns: std.ArrayListUnmanaged([]const u8) = .empty;
         defer columns.deinit(self.allocator);
 
         while (true) {
@@ -918,10 +918,10 @@ pub const Parser = struct {
 
         try self.expect(.LeftParen);
 
-        var columns: std.ArrayList(ast.ColumnDefinition) = .{};
+        var columns: std.ArrayListUnmanaged(ast.ColumnDefinition) = .empty;
         defer columns.deinit(self.allocator);
 
-        var table_constraints: std.ArrayList(ast.TableConstraint) = .{};
+        var table_constraints: std.ArrayListUnmanaged(ast.TableConstraint) = .empty;
         defer table_constraints.deinit(self.allocator);
 
         while (true) {
@@ -962,7 +962,7 @@ pub const Parser = struct {
 
         try self.expect(.Set);
 
-        var assignments: std.ArrayList(ast.Assignment) = .{};
+        var assignments: std.ArrayListUnmanaged(ast.Assignment) = .empty;
         errdefer {
             // Clean up any already-parsed assignments on error
             for (assignments.items) |*assignment| {
@@ -1257,7 +1257,7 @@ pub const Parser = struct {
         try self.expect(.LeftParen); // expect '('
 
         // Parse arguments (some window functions take arguments, e.g., LAG(column, offset, default))
-        var arguments: std.ArrayList(ast.FunctionArgument) = .{};
+        var arguments: std.ArrayListUnmanaged(ast.FunctionArgument) = .empty;
         errdefer {
             for (arguments.items) |arg| {
                 arg.deinit(self.allocator);
@@ -1329,7 +1329,7 @@ pub const Parser = struct {
             try self.advance(); // consume PARTITION
             try self.expect(.By); // expect BY
 
-            var columns: std.ArrayList([]const u8) = .{};
+            var columns: std.ArrayListUnmanaged([]const u8) = .empty;
             errdefer {
                 for (columns.items) |col| {
                     self.allocator.free(col);
@@ -1356,7 +1356,7 @@ pub const Parser = struct {
             try self.advance(); // consume ORDER
             try self.expect(.By); // expect BY
 
-            var order_clauses: std.ArrayList(ast.OrderByClause) = .{};
+            var order_clauses: std.ArrayListUnmanaged(ast.OrderByClause) = .empty;
             errdefer {
                 for (order_clauses.items) |clause| {
                     self.allocator.free(clause.column);
@@ -1477,7 +1477,7 @@ pub const Parser = struct {
         const name = try self.expectIdentifier();
         const data_type = try self.parseDataType();
 
-        var constraints: std.ArrayList(ast.ColumnConstraint) = .{};
+        var constraints: std.ArrayListUnmanaged(ast.ColumnConstraint) = .empty;
         defer constraints.deinit(self.allocator);
 
         // Parse constraints
@@ -1779,7 +1779,7 @@ pub const Parser = struct {
 
         try self.expect(.LeftParen);
 
-        var arguments: std.ArrayList(ast.FunctionArgument) = .{};
+        var arguments: std.ArrayListUnmanaged(ast.FunctionArgument) = .empty;
         defer arguments.deinit(self.allocator);
 
         // Parse arguments
@@ -2043,7 +2043,7 @@ pub const Parser = struct {
         }
 
         // Otherwise parse as value list
-        var values: std.ArrayList(ast.Value) = .{};
+        var values: std.ArrayListUnmanaged(ast.Value) = .empty;
         errdefer {
             for (values.items) |*val| {
                 val.deinit(self.allocator);
@@ -2179,7 +2179,7 @@ pub const Parser = struct {
     fn parseCaseExpression(self: *Self) Error!ast.Value {
         try self.advance(); // consume CASE
 
-        var branches: std.ArrayListUnmanaged(ast.CaseWhenBranch) = .{};
+        var branches: std.ArrayListUnmanaged(ast.CaseWhenBranch) = .empty;
         errdefer {
             for (branches.items) |*branch| {
                 branch.deinit(self.allocator);
@@ -2240,7 +2240,7 @@ pub const Parser = struct {
         try self.advance(); // consume function name
         try self.expect(.LeftParen);
 
-        var arguments: std.ArrayListUnmanaged(ast.FunctionArgument) = .{};
+        var arguments: std.ArrayListUnmanaged(ast.FunctionArgument) = .empty;
         errdefer {
             for (arguments.items) |*arg| {
                 arg.deinit(self.allocator);
@@ -2386,7 +2386,7 @@ pub const Parser = struct {
                 try self.advance(); // consume UNIQUE
                 try self.expect(.LeftParen);
 
-                var columns_list: std.ArrayList([]const u8) = .{};
+                var columns_list: std.ArrayListUnmanaged([]const u8) = .empty;
                 defer columns_list.deinit(self.allocator);
 
                 while (true) {
@@ -2411,7 +2411,7 @@ pub const Parser = struct {
                 try self.expect(.Key); // expect KEY
                 try self.expect(.LeftParen);
 
-                var columns_list: std.ArrayList([]const u8) = .{};
+                var columns_list: std.ArrayListUnmanaged([]const u8) = .empty;
                 defer columns_list.deinit(self.allocator);
 
                 while (true) {

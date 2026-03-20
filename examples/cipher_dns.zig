@@ -216,7 +216,7 @@ const LookupResult = struct {
 
 /// Demo function showing Cipher DNS capabilities
 pub fn runCipherDemo() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

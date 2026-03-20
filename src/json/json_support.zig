@@ -5,7 +5,7 @@ const std = @import("std");
 /// JSON value type that can be stored in the database
 pub const JsonValue = union(enum) {
     object: std.StringHashMap(JsonValue),
-    array: std.ArrayList(JsonValue),
+    array: std.ArrayListUnmanaged(JsonValue),
     string: []const u8,
     number: f64,
     boolean: bool,
@@ -26,7 +26,7 @@ pub const JsonValue = union(enum) {
 
     /// Convert to JSON string
     pub fn stringify(self: Self, allocator: std.mem.Allocator) ![]const u8 {
-        var buffer: std.ArrayList(u8) = .{};
+        var buffer: std.ArrayListUnmanaged(u8) = .empty;
         try self.stringifyInto(buffer.writer(allocator));
         return try buffer.toOwnedSlice(allocator);
     }
@@ -173,7 +173,7 @@ pub const JsonValue = union(enum) {
                 return JsonValue{ .object = new_obj };
             },
             .array => |arr| {
-                var new_arr: std.ArrayList(JsonValue) = .{};
+                var new_arr: std.ArrayListUnmanaged(JsonValue) = .empty;
                 for (arr.items) |item| {
                     try new_arr.append(allocator, try item.clone(allocator));
                 }
@@ -232,7 +232,7 @@ pub const JsonValue = union(enum) {
                 return JsonValue{ .object = result };
             },
             .array => |arr| {
-                var result: std.ArrayList(JsonValue) = .{};
+                var result: std.ArrayListUnmanaged(JsonValue) = .empty;
                 for (arr.items) |item| {
                     try result.append(allocator, try jsonValueFromStd(allocator, item));
                 }
@@ -320,7 +320,7 @@ pub const JsonFunctions = struct {
 
         switch (extracted) {
             .object => |obj| {
-                var keys: std.ArrayList(JsonValue) = .{};
+                var keys: std.ArrayListUnmanaged(JsonValue) = .empty;
                 defer keys.deinit(allocator);
 
                 var iterator = obj.iterator();

@@ -343,7 +343,7 @@ pub const MeshStatus = struct {
 
 /// Demo the GhostMesh VPN coordination system
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

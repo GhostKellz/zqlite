@@ -456,7 +456,7 @@ pub const SecureValue = union(enum) {
 
     pub fn encrypt(value: storage.Value, crypto: *CryptoEngine) !SecureValue {
         // Convert storage value to bytes for encryption
-        var buffer: std.ArrayList(u8) = .{};
+        var buffer: std.ArrayListUnmanaged(u8) = .empty;
         defer buffer.deinit(crypto.allocator);
 
         switch (value) {
@@ -559,7 +559,7 @@ pub const SecureTable = struct {
 pub const CryptoTransactionLog = struct {
     allocator: std.mem.Allocator,
     crypto_engine: *CryptoEngine,
-    entries: std.ArrayList(LogEntry),
+    entries: std.ArrayListUnmanaged(LogEntry),
     chain_key: [32]u8,
 
     const LogEntry = struct {
@@ -599,7 +599,7 @@ pub const CryptoTransactionLog = struct {
             std.mem.zeroes([32]u8);
 
         // Create signing data
-        var signing_data: std.ArrayList(u8) = .{};
+        var signing_data: std.ArrayListUnmanaged(u8) = .empty;
         defer signing_data.deinit(self.allocator);
         try signing_data.appendSlice(self.allocator, std.mem.asBytes(&transaction_id));
         try signing_data.appendSlice(self.allocator, table_name);
@@ -628,7 +628,7 @@ pub const CryptoTransactionLog = struct {
     pub fn verifyIntegrity(self: *Self) !bool {
         for (self.entries.items, 0..) |entry, i| {
             // Reconstruct signing data
-            var signing_data: std.ArrayList(u8) = .{};
+            var signing_data: std.ArrayListUnmanaged(u8) = .empty;
             defer signing_data.deinit(self.allocator);
             try signing_data.appendSlice(self.allocator, std.mem.asBytes(&entry.transaction_id));
             try signing_data.appendSlice(self.allocator, entry.table_name);
@@ -668,7 +668,7 @@ pub const CryptoTransactionLog = struct {
 // Enhanced tests for post-quantum features
 test "post-quantum encrypt and decrypt field" {
     const testing = std.testing;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -687,7 +687,7 @@ test "post-quantum encrypt and decrypt field" {
 
 test "hybrid signature verification" {
     const testing = std.testing;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -702,7 +702,7 @@ test "hybrid signature verification" {
 
 test "zero-knowledge range proof" {
     const testing = std.testing;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -719,7 +719,7 @@ test "zero-knowledge range proof" {
 
 test "enhanced password hashing with BLAKE2b" {
     const testing = std.testing;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

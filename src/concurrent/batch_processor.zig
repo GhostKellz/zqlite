@@ -209,7 +209,7 @@ pub const BatchProcessor = struct {
     /// Serialize a row for transport
     fn serializeRow(self: *Self, row: storage.Row) ![]u8 {
         // Simple serialization - in production this would be more efficient
-        var list: std.ArrayList(u8) = .{};
+        var list: std.ArrayListUnmanaged(u8) = .empty;
         defer list.deinit(self.allocator);
 
         // Write number of values
@@ -318,10 +318,10 @@ const VectorizedOperations = struct {
 
     /// Preprocess operations for vectorization
     pub fn preprocess(self: *Self, operations: []const BatchOperation) !VectorizedBatch {
-        var groups: std.ArrayList(OperationGroup) = .{};
+        var groups: std.ArrayListUnmanaged(OperationGroup) = .empty;
         var current_type: ?OperationType = null;
         var current_group: ?OperationGroup = null;
-        var current_ops: std.ArrayList(BatchOperation) = .{};
+        var current_ops: std.ArrayListUnmanaged(BatchOperation) = .empty;
 
         for (operations, 0..) |op, i| {
             if (current_type == null or current_type.? != op.operation_type) {
@@ -408,7 +408,7 @@ pub const BatchResult = struct {
 
 /// Vectorized batch for processing
 const VectorizedBatch = struct {
-    groups: std.ArrayList(OperationGroup),
+    groups: std.ArrayListUnmanaged(OperationGroup),
 
     pub fn deinit(self: *VectorizedBatch, allocator: std.mem.Allocator) void {
         for (self.groups.items) |group| {
@@ -462,7 +462,7 @@ pub const BatchMetrics = struct {
 // Tests
 test "batch processor basic operations" {
     const testing = std.testing;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -506,7 +506,7 @@ test "batch processor basic operations" {
 
 test "vectorized batch processing" {
     const testing = std.testing;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

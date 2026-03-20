@@ -4,7 +4,7 @@ const zqlite = @import("zqlite");
 /// Advanced indexing demonstration showing B-tree indexes and composite key optimization
 /// Perfect for AI applications requiring fast range queries and multi-dimensional lookups
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

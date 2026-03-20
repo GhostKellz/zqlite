@@ -6,7 +6,7 @@ const zqlite = @import("zqlite");
 /// of partially-allocated storage.Value arrays when cloneValue() failed.
 /// This test verifies that the fix prevents those segfaults.
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

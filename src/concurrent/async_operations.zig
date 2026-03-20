@@ -259,7 +259,7 @@ pub const AsyncDatabase = struct {
 
             // Use prepared statement for better performance
             // This is a simplified version - real implementation would use proper prepared statements
-            var values_str: std.ArrayList(u8) = .{};
+            var values_str: std.ArrayListUnmanaged(u8) = .empty;
             defer values_str.deinit(self.allocator);
 
             for (batch[0..current_batch_size], 0..) |row, i| {
@@ -375,8 +375,8 @@ fn getMilliTimestamp() i64 {
 /// Enhanced connection pool with health monitoring
 const ConnectionPool = struct {
     allocator: std.mem.Allocator,
-    connections: std.ArrayList(*connection.Connection),
-    connection_health: std.ArrayList(ConnectionHealth),
+    connections: std.ArrayListUnmanaged(*connection.Connection),
+    connection_health: std.ArrayListUnmanaged(ConnectionHealth),
     available: std.Thread.Semaphore,
     mutex: compat.Mutex = .{},
     health_check_interval_ms: u64,
@@ -392,8 +392,8 @@ const ConnectionPool = struct {
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, db_path: []const u8, pool_size: u32) !Self {
-        var connections: std.ArrayList(*connection.Connection) = .{};
-        var health_info: std.ArrayList(ConnectionHealth) = .{};
+        var connections: std.ArrayListUnmanaged(*connection.Connection) = .empty;
+        var health_info: std.ArrayListUnmanaged(ConnectionHealth) = .empty;
         const current_time = getMilliTimestamp();
 
         // Create connections with health monitoring

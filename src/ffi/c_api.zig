@@ -76,7 +76,7 @@ const ConnectionWrapper = struct {
 };
 
 // Default global allocator for C API
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+var gpa: std.heap.DebugAllocator(.{}) = .init;
 var c_allocator: std.mem.Allocator = gpa.allocator();
 
 /// Custom allocator function pointer types for C interop

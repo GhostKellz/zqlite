@@ -6,7 +6,7 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
     // Collect args into a slice
-    var args_list: std.ArrayList([]const u8) = .{};
+    var args_list: std.ArrayListUnmanaged([]const u8) = .empty;
     defer args_list.deinit(allocator);
 
     var args_iter = std.process.Args.Iterator.init(init.minimal.args);
@@ -26,7 +26,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "simple test" {
-    var list: std.ArrayList(i32) = .{};
+    var list: std.ArrayListUnmanaged(i32) = .empty;
     defer list.deinit(std.testing.allocator);
     try list.append(std.testing.allocator, 42);
     try std.testing.expectEqual(@as(i32, 42), list.pop());
@@ -34,7 +34,7 @@ test "simple test" {
 
 test "database integration" {
     // Test in-memory database
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

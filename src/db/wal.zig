@@ -10,7 +10,7 @@ pub const WriteAheadLog = struct {
     fd: ?posix.fd_t,
     is_transaction_active: bool,
     transaction_id: u64,
-    log_entries: std.ArrayList(LogEntry),
+    log_entries: std.ArrayListUnmanaged(LogEntry),
     wal_path: []const u8,
 
     const Self = @This();
@@ -31,7 +31,7 @@ pub const WriteAheadLog = struct {
         wal.fd = null;
         wal.is_transaction_active = false;
         wal.transaction_id = 0;
-        wal.log_entries = .{};
+        wal.log_entries = .empty;
 
         // Create WAL path: db_path + "-wal"
         const wal_path = try std.fmt.allocPrint(allocator, "{s}-wal", .{db_path});

@@ -5,7 +5,7 @@ const zqlite = @import("zqlite");
 /// Shows how zqlite can be used as a backend database for web applications
 /// (This is a simulation - no actual HTTP server, just the database operations)
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

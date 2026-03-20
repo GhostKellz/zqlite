@@ -277,7 +277,7 @@ pub const KeyManager = struct {
     }
 
     pub fn listWallets(self: *Self) ![][]const u8 {
-        var wallet_ids: std.ArrayList([]const u8) = .{};
+        var wallet_ids: std.ArrayListUnmanaged([]const u8) = .empty;
         defer wallet_ids.deinit(self.allocator);
 
         var iterator = self.master_keys.iterator();
@@ -349,7 +349,7 @@ pub const KeyStorage = struct {
     }
 
     pub fn listKeys(self: *Self) ![]StoredKey {
-        var keys: std.ArrayList(StoredKey) = .{};
+        var keys: std.ArrayListUnmanaged(StoredKey) = .empty;
         defer keys.deinit(self.allocator);
 
         var iterator = self.keys.iterator();

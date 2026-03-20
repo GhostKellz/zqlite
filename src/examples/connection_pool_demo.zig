@@ -2,7 +2,7 @@ const std = @import("std");
 const zqlite = @import("zqlite");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -33,7 +33,7 @@ pub fn main() !void {
     std.debug.print("\n⚡ Simulating concurrent database operations...\n", .{});
 
     // Acquire multiple connections and use them simultaneously
-    var connections = std.ArrayList(*zqlite.connection_pool.PooledConnection){};
+    var connections: std.ArrayListUnmanaged(*zqlite.connection_pool.PooledConnection) = .empty;
     defer connections.deinit(allocator);
 
     // Acquire 5 connections
@@ -85,8 +85,9 @@ pub fn main() !void {
 
         // Insert with prepared statement
         try stmt.bindParameter(0, zqlite.storage.Value{ .Integer = 100 });
-        try stmt.bindParameter(1, zqlite.storage.Value{ .Text = try allocator.dupe(u8, "prepared_data") });
-        defer allocator.free("prepared_data");
+        const prepared_text = try allocator.dupe(u8, "prepared_data");
+        defer allocator.free(prepared_text);
+        try stmt.bindParameter(1, zqlite.storage.Value{ .Text = prepared_text });
         const ts = zqlite.time_utils.getTimespec();
         const timestamp = ts.sec;
         try stmt.bindParameter(2, zqlite.storage.Value{ .Integer = timestamp });

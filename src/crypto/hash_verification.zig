@@ -143,7 +143,7 @@ pub const HashVerifier = struct {
 
     pub const VerificationResult = struct {
         all_verified: bool,
-        failed_deps: std.ArrayList([]const u8),
+        failed_deps: std.ArrayListUnmanaged([]const u8),
 
         pub fn deinit(self: *VerificationResult, allocator: std.mem.Allocator) void {
             for (self.failed_deps.items) |dep| {
@@ -247,7 +247,7 @@ pub const StabilityMonitor = struct {
 
     /// Generate stability report
     pub fn generateReport(self: Self) ![]u8 {
-        var report: std.ArrayList(u8) = .{};
+        var report: std.ArrayListUnmanaged(u8) = .empty;
         const writer = report.writer(self.allocator);
 
         try writer.writeAll("=== ZQLite v0.8.0 Stability Report ===\n");

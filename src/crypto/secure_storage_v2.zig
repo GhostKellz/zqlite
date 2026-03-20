@@ -170,7 +170,7 @@ pub const BackendInfo = struct {
 
 /// Test function for crypto engine
 pub fn testCryptoEngine() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

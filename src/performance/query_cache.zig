@@ -220,7 +220,7 @@ pub const QueryCache = struct {
     pub fn cleanupExpired(self: *Self, ttl_seconds: i64) !void {
         const ts = time_utils.getTimespec();
         const current_time = ts.sec;
-        var entries_to_remove: std.ArrayList(*CacheEntry) = .{};
+        var entries_to_remove: std.ArrayListUnmanaged(*CacheEntry) = .empty;
         defer entries_to_remove.deinit(self.allocator);
 
         var iterator = self.cache_entries.iterator();
@@ -237,7 +237,7 @@ pub const QueryCache = struct {
 
     /// Invalidate cache entries that might be affected by a table update
     pub fn invalidateTable(self: *Self, table_name: []const u8) !void {
-        var entries_to_remove: std.ArrayList(*CacheEntry) = .{};
+        var entries_to_remove: std.ArrayListUnmanaged(*CacheEntry) = .empty;
         defer entries_to_remove.deinit(self.allocator);
 
         var iterator = self.cache_entries.iterator();

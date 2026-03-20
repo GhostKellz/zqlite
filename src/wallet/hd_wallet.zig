@@ -117,7 +117,7 @@ pub const HDWallet = struct {
 
         // Convert entropy to mnemonic (simplified implementation)
         // In a real implementation, you'd use BIP39 wordlist
-        var mnemonic: std.ArrayList(u8) = .{};
+        var mnemonic: std.ArrayListUnmanaged(u8) = .empty;
         defer mnemonic.deinit(allocator);
 
         for (entropy) |byte| {
@@ -205,7 +205,7 @@ pub const WalletManager = struct {
     }
 
     pub fn listWallets(self: *Self) []const HDWallet.Wallet {
-        var wallets: std.ArrayList(HDWallet.Wallet) = .{};
+        var wallets: std.ArrayListUnmanaged(HDWallet.Wallet) = .empty;
         defer wallets.deinit(self.allocator);
 
         var iterator = self.wallets.iterator();

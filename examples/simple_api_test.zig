@@ -3,7 +3,7 @@ const zqlite = @import("zqlite");
 
 /// Simple test of the core new features
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

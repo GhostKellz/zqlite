@@ -429,7 +429,7 @@ pub const Table = struct {
         defer allocator.free(all_rows);
 
         // Filter out deleted rows
-        var results: std.ArrayList(Row) = .{};
+        var results: std.ArrayListUnmanaged(Row) = .empty;
         for (all_rows) |item| {
             if (!self.deleted_keys.contains(item.key)) {
                 try results.append(allocator, item.row);
@@ -456,7 +456,7 @@ pub const Table = struct {
         defer allocator.free(all_rows);
 
         // Filter out deleted rows
-        var results: std.ArrayList(KeyRow) = .{};
+        var results: std.ArrayListUnmanaged(KeyRow) = .empty;
         for (all_rows) |item| {
             if (!self.deleted_keys.contains(item.key)) {
                 try results.append(allocator, KeyRow{
@@ -761,7 +761,7 @@ pub const JSONBValue = struct {
             .number_string => |s| try allocator.dupe(u8, s),
             .string => |s| try std.fmt.allocPrint(allocator, "\"{s}\"", .{s}),
             .array => |arr| blk: {
-                var result = std.ArrayList(u8){};
+                var result: std.ArrayListUnmanaged(u8) = .empty;
                 defer result.deinit(allocator);
 
                 try result.append(allocator, '[');
@@ -776,7 +776,7 @@ pub const JSONBValue = struct {
                 break :blk try result.toOwnedSlice(allocator);
             },
             .object => |obj| blk: {
-                var result = std.ArrayList(u8){};
+                var result: std.ArrayListUnmanaged(u8) = .empty;
                 defer result.deinit(allocator);
 
                 try result.append(allocator, '{');
@@ -886,7 +886,7 @@ pub const ArrayValue = struct {
 
     /// Convert array to PostgreSQL format string: {elem1,elem2,elem3}
     pub fn toString(self: ArrayValue, allocator: std.mem.Allocator) ![]u8 {
-        var result = std.ArrayList(u8){};
+        var result: std.ArrayListUnmanaged(u8) = .empty;
         defer result.deinit(allocator);
 
         try result.append(allocator, '{');
@@ -1110,7 +1110,7 @@ pub const FTSIndex = struct {
     table_name: []const u8,
     column_names: [][]const u8,
     /// Inverted index: term -> list of (rowid, column_index, position)
-    inverted_index: std.StringHashMap(std.ArrayList(TermOccurrence)),
+    inverted_index: std.StringHashMap(std.ArrayListUnmanaged(TermOccurrence)),
 
     const Self = @This();
 
@@ -1146,7 +1146,7 @@ pub const FTSIndex = struct {
             cols_allocated = i + 1;
         }
 
-        fts.inverted_index = std.StringHashMap(std.ArrayList(TermOccurrence)).init(allocator);
+        fts.inverted_index = std.StringHashMap(std.ArrayListUnmanaged(TermOccurrence)).init(allocator);
 
         return fts;
     }
@@ -1179,7 +1179,7 @@ pub const FTSIndex = struct {
                 var entry = self.inverted_index.getPtr(lower_token);
                 if (entry == null) {
                     const term_copy = try self.allocator.dupe(u8, lower_token);
-                    const new_list: std.ArrayList(TermOccurrence) = .{};
+                    const new_list: std.ArrayListUnmanaged(TermOccurrence) = .empty;
                     try self.inverted_index.put(term_copy, new_list);
                     entry = self.inverted_index.getPtr(term_copy);
                 }
@@ -1230,7 +1230,7 @@ pub const FTSIndex = struct {
                     }
 
                     // Remove rowids not in this term's results
-                    var to_remove: std.ArrayList(u64) = .{};
+                    var to_remove: std.ArrayListUnmanaged(u64) = .empty;
                     defer to_remove.deinit(self.allocator);
 
                     var result_iter = results.iterator();

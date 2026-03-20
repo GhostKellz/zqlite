@@ -736,7 +736,7 @@ pub const WindowFunctionType = enum {
 
 // Tests
 test "window function ROW_NUMBER" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -780,7 +780,7 @@ test "window function ROW_NUMBER" {
 }
 
 test "window function context" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
