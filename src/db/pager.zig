@@ -206,6 +206,8 @@ pub const Pager = struct {
         pager.next_page_id = 1;
         pager.cache_hits = 0;
         pager.cache_misses = 0;
+        // SECURITY: Default to no encryption for backwards compatibility.
+        // For production use with sensitive data, call setEncryption() after init.
         pager.encryption = encryption.Encryption.initPlain();
 
         if (comptime native_os == .windows) {
@@ -247,6 +249,8 @@ pub const Pager = struct {
         pager.next_page_id = 1;
         pager.cache_hits = 0;
         pager.cache_misses = 0;
+        // SECURITY: In-memory databases use no encryption by default.
+        // This is typically acceptable since data doesn't persist to disk.
         pager.encryption = encryption.Encryption.initPlain();
 
         return pager;

@@ -196,80 +196,182 @@ pub const SQLiteCompat = struct {
         return try results.toOwnedSlice();
     }
 
-    /// JSON functions
+    /// JSON functions using std.json for proper parsing and validation
     pub const JSONFunctions = struct {
-        /// Extract value from JSON at path
+        /// Extract value from JSON at path (supports $.field syntax)
         pub fn jsonExtract(allocator: std.mem.Allocator, json_text: []const u8, path: []const u8) !storage.Value {
-            _ = allocator; // Remove unused variable warning
+            // Parse JSON using std.json
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch {
+                return storage.Value.Null; // Invalid JSON returns NULL
+            };
+            defer parsed.deinit();
 
-            // Simple JSON extraction - in production, use a proper JSON parser
-            if (std.mem.eql(u8, path, "$.name")) {
-                // Extract name field (simplified)
-                if (std.mem.indexOf(u8, json_text, "\"name\"")) |start| {
-                    if (std.mem.indexOf(u8, json_text[start..], ":")) |colon_pos| {
-                        const value_start = start + colon_pos + 1;
-                        if (std.mem.indexOf(u8, json_text[value_start..], "\"")) |quote1| {
-                            if (std.mem.indexOf(u8, json_text[value_start + quote1 + 1 ..], "\"")) |quote2| {
-                                const name = json_text[value_start + quote1 + 1 .. value_start + quote1 + 1 + quote2];
-                                return storage.Value{ .Text = name };
-                            }
+            // Parse the path (e.g., "$.name" or "$.user.email")
+            const field_path = if (std.mem.startsWith(u8, path, "$."))
+                path[2..]
+            else if (std.mem.startsWith(u8, path, "$"))
+                path[1..]
+            else
+                path;
+
+            // Navigate the JSON structure
+            var current = parsed.value;
+            var path_iter = std.mem.splitSequence(u8, field_path, ".");
+
+            while (path_iter.next()) |segment| {
+                if (segment.len == 0) continue;
+
+                switch (current) {
+                    .object => |obj| {
+                        if (obj.get(segment)) |value| {
+                            current = value;
+                        } else {
+                            return storage.Value.Null;
                         }
-                    }
+                    },
+                    .array => |arr| {
+                        // Handle array index like $[0] or $.items[0]
+                        const index = std.fmt.parseInt(usize, segment, 10) catch return storage.Value.Null;
+                        if (index < arr.items.len) {
+                            current = arr.items[index];
+                        } else {
+                            return storage.Value.Null;
+                        }
+                    },
+                    else => return storage.Value.Null,
                 }
             }
 
-            return storage.Value.Null;
+            // Convert final value to storage.Value
+            return switch (current) {
+                .string => |s| storage.Value{ .Text = try allocator.dupe(u8, s) },
+                .integer => |i| storage.Value{ .Integer = i },
+                .float => |f| storage.Value{ .Float = f },
+                .bool => |b| storage.Value{ .Integer = if (b) 1 else 0 },
+                .null => storage.Value.Null,
+                else => storage.Value.Null, // Objects and arrays returned as NULL (use json() for full extraction)
+            };
         }
 
         /// Set value in JSON at path
         pub fn jsonSet(allocator: std.mem.Allocator, json_text: []const u8, path: []const u8, new_value: []const u8) ![]u8 {
-            _ = path; // Remove unused variable warning
+            // Parse existing JSON
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch {
+                return error.InvalidJson;
+            };
+            defer parsed.deinit();
 
-            // Simple JSON setting - in production, use a proper JSON parser
-            var result = try allocator.dupe(u8, json_text);
+            // Parse the path
+            const field_path = if (std.mem.startsWith(u8, path, "$."))
+                path[2..]
+            else if (std.mem.startsWith(u8, path, "$"))
+                path[1..]
+            else
+                path;
 
-            // Replace the value (simplified implementation)
-            if (std.mem.indexOf(u8, result, "\"name\"")) |start| {
-                if (std.mem.indexOf(u8, result[start..], ":")) |colon_pos| {
-                    const value_start = start + colon_pos + 1;
-                    if (std.mem.indexOf(u8, result[value_start..], "\"")) |quote1| {
-                        if (std.mem.indexOf(u8, result[value_start + quote1 + 1 ..], "\"")) |quote2| {
-                            // Replace the value between quotes
-                            const before = result[0 .. value_start + quote1 + 1];
-                            const after = result[value_start + quote1 + 1 + quote2 ..];
+            // Parse the new value as JSON
+            const new_json_value = std.json.parseFromSlice(std.json.Value, allocator, new_value, .{}) catch blk: {
+                // If not valid JSON, treat as string literal
+                break :blk null;
+            };
+            defer if (new_json_value) |v| v.deinit();
 
-                            allocator.free(result);
-                            result = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ before, new_value, after });
+            // Navigate to parent and set value
+            var current = &parsed.value;
+            var path_segments = std.ArrayList([]const u8).init(allocator);
+            defer path_segments.deinit();
+
+            var path_iter = std.mem.splitSequence(u8, field_path, ".");
+            while (path_iter.next()) |segment| {
+                if (segment.len > 0) {
+                    try path_segments.append(segment);
+                }
+            }
+
+            if (path_segments.items.len == 0) {
+                return error.InvalidPath;
+            }
+
+            // Navigate to parent
+            for (path_segments.items[0 .. path_segments.items.len - 1]) |segment| {
+                switch (current.*) {
+                    .object => |*obj| {
+                        if (obj.getPtr(segment)) |ptr| {
+                            current = ptr;
+                        } else {
+                            return error.PathNotFound;
                         }
-                    }
+                    },
+                    else => return error.PathNotFound,
                 }
             }
 
-            return result;
-        }
-
-        /// Check if JSON is valid
-        pub fn jsonValid(json_text: []const u8) bool {
-            // Simple validation - check for balanced braces
-            var brace_count: i32 = 0;
-            var bracket_count: i32 = 0;
-
-            for (json_text) |char| {
-                switch (char) {
-                    '{' => brace_count += 1,
-                    '}' => brace_count -= 1,
-                    '[' => bracket_count += 1,
-                    ']' => bracket_count -= 1,
-                    else => {},
-                }
-
-                if (brace_count < 0 or bracket_count < 0) {
-                    return false;
-                }
+            // Set the value
+            const final_key = path_segments.items[path_segments.items.len - 1];
+            switch (current.*) {
+                .object => |*obj| {
+                    const value_to_set: std.json.Value = if (new_json_value) |v|
+                        v.value
+                    else
+                        .{ .string = new_value };
+                    try obj.put(final_key, value_to_set);
+                },
+                else => return error.PathNotFound,
             }
 
-            return brace_count == 0 and bracket_count == 0;
+            // Serialize back to string
+            var output = std.ArrayList(u8).init(allocator);
+            errdefer output.deinit();
+            try std.json.stringify(parsed.value, .{}, output.writer());
+            return try output.toOwnedSlice();
         }
+
+        /// Check if JSON is valid using std.json parser
+        pub fn jsonValid(allocator: std.mem.Allocator, json_text: []const u8) bool {
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch {
+                return false;
+            };
+            parsed.deinit();
+            return true;
+        }
+
+        /// Validate JSON and return detailed error info
+        pub fn jsonValidateWithError(allocator: std.mem.Allocator, json_text: []const u8) JsonValidationResult {
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch |err| {
+                return JsonValidationResult{
+                    .valid = false,
+                    .error_message = @errorName(err),
+                };
+            };
+            parsed.deinit();
+            return JsonValidationResult{
+                .valid = true,
+                .error_message = null,
+            };
+        }
+
+        /// Get JSON type as string (for json_type() function)
+        pub fn jsonType(allocator: std.mem.Allocator, json_text: []const u8) ![]const u8 {
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch {
+                return error.InvalidJson;
+            };
+            defer parsed.deinit();
+
+            return switch (parsed.value) {
+                .object => "object",
+                .array => "array",
+                .string => "text",
+                .integer, .float => "real",
+                .bool => "true", // SQLite returns "true" or "false"
+                .null => "null",
+                else => "null",
+            };
+        }
+    };
+
+    pub const JsonValidationResult = struct {
+        valid: bool,
+        error_message: ?[]const u8,
     };
 
     // Helper functions
@@ -387,7 +489,17 @@ const PragmaSettings = struct {
             .page_size = 4096,
             .cache_size = -2000, // 2MB default
             .journal_mode = "DELETE",
-            .foreign_keys = false,
+            .foreign_keys = true, // SECURITY: Enable foreign key constraints by default
+        };
+    }
+
+    /// Legacy defaults with foreign keys disabled (use only for backwards compatibility)
+    pub fn legacyInsecureDefaults() PragmaSettings {
+        return PragmaSettings{
+            .page_size = 4096,
+            .cache_size = -2000,
+            .journal_mode = "DELETE",
+            .foreign_keys = false, // WARNING: Foreign keys disabled - may cause data integrity issues
         };
     }
 };

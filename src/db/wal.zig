@@ -15,6 +15,13 @@ pub const WriteAheadLog = struct {
 
     const Self = @This();
 
+    /// Maximum size for a single data field in a WAL entry (64KB)
+    /// This prevents DoS via memory exhaustion from malformed WAL files
+    pub const MAX_DATA_FIELD_SIZE: u32 = 64 * 1024;
+
+    /// Maximum total size for old_data + new_data combined (128KB)
+    pub const MAX_ENTRY_DATA_SIZE: u32 = 128 * 1024;
+
     /// Initialize WAL
     pub fn init(allocator: std.mem.Allocator, db_path: []const u8) !*Self {
         var wal = try allocator.create(Self);
@@ -86,6 +93,11 @@ pub const WriteAheadLog = struct {
         if (!self.is_transaction_active) {
             return error.NoActiveTransaction;
         }
+
+        // SECURITY: Enforce size limits to prevent creating oversized WAL entries
+        if (old_data.len > MAX_DATA_FIELD_SIZE) return error.WalEntryTooLarge;
+        if (new_data.len > MAX_DATA_FIELD_SIZE) return error.WalEntryTooLarge;
+        if (old_data.len + new_data.len > MAX_ENTRY_DATA_SIZE) return error.WalEntryTooLarge;
 
         const old_data_copy = try self.allocator.dupe(u8, old_data);
         errdefer self.allocator.free(old_data_copy);
@@ -638,6 +650,11 @@ pub const LogEntry = struct {
 
         const new_data_len = std.mem.readInt(u32, buffer[pos..][0..4], .little);
         pos += 4;
+
+        // SECURITY: Enforce size limits to prevent DoS via memory exhaustion
+        if (old_data_len > WriteAheadLog.MAX_DATA_FIELD_SIZE) return error.WalEntryTooLarge;
+        if (new_data_len > WriteAheadLog.MAX_DATA_FIELD_SIZE) return error.WalEntryTooLarge;
+        if (old_data_len + new_data_len > WriteAheadLog.MAX_ENTRY_DATA_SIZE) return error.WalEntryTooLarge;
 
         if (buffer.len < pos + old_data_len + new_data_len) return error.BufferTooSmall;
 

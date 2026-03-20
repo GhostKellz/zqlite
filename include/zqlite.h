@@ -106,6 +106,11 @@ int zqlite_json_type(zqlite_connection_t* conn, const char* json, const char* pa
 const char* zqlite_errmsg(zqlite_connection_t* conn);
 int zqlite_errcode(zqlite_connection_t* conn);
 
+// Memory management
+// IMPORTANT: Call zqlite_free_string() to free strings returned by zqlite_result_get_text
+// and other functions that return allocated strings. Failure to do so causes memory leaks.
+void zqlite_free_string(const char* str);
+
 // Utility functions
 const char* zqlite_version();
 int64_t zqlite_last_insert_rowid(zqlite_connection_t* conn);

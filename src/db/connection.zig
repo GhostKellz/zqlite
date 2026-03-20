@@ -6,6 +6,86 @@ const parser = @import("../parser/parser.zig");
 const planner = @import("../executor/planner.zig");
 const vm = @import("../executor/vm.zig");
 const cache_manager = @import("../performance/cache_manager.zig");
+const posix = std.posix;
+
+/// SECURITY: Path policy for ATTACH DATABASE operations
+/// Controls which paths can be attached to prevent path traversal attacks
+pub const AttachPathPolicy = struct {
+    /// Allowed root directories for ATTACH operations
+    /// If empty, all paths are allowed (insecure - use only for testing)
+    allowed_roots: []const []const u8,
+    /// Whether to allow :memory: databases
+    allow_memory: bool,
+    /// Whether to allow relative paths (resolved relative to current working directory)
+    allow_relative: bool,
+
+    pub const ALLOW_ALL = AttachPathPolicy{
+        .allowed_roots = &[_][]const u8{},
+        .allow_memory = true,
+        .allow_relative = true,
+    };
+
+    pub const SECURE_DEFAULT = AttachPathPolicy{
+        .allowed_roots = &[_][]const u8{},
+        .allow_memory = true,
+        .allow_relative = false, // Require absolute paths
+    };
+
+    /// Validate and canonicalize a path against this policy
+    pub fn validatePath(self: AttachPathPolicy, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+        // Allow :memory: if permitted
+        if (std.mem.eql(u8, path, ":memory:")) {
+            if (self.allow_memory) {
+                return try allocator.dupe(u8, path);
+            }
+            return error.MemoryDatabaseNotAllowed;
+        }
+
+        // Check for path traversal attempts (.. sequences)
+        if (std.mem.indexOf(u8, path, "..") != null) {
+            return error.PathTraversalDetected;
+        }
+
+        // Check for null bytes (path injection)
+        for (path) |c| {
+            if (c == 0) {
+                return error.InvalidPathCharacter;
+            }
+        }
+
+        // Check if path is absolute
+        const is_absolute = std.fs.path.isAbsolute(path);
+        if (!is_absolute and !self.allow_relative) {
+            return error.RelativePathNotAllowed;
+        }
+
+        // Normalize the path (remove redundant separators, etc.)
+        // For security, we work with the path as-is after basic validation
+        const validated_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(validated_path);
+
+        // If allowed_roots is empty, allow all paths
+        if (self.allowed_roots.len == 0) {
+            return validated_path;
+        }
+
+        // For relative paths with allowed_roots, we need absolute path to check
+        if (!is_absolute) {
+            allocator.free(validated_path);
+            return error.RelativePathWithRootsNotSupported;
+        }
+
+        // Check if path is under an allowed root
+        for (self.allowed_roots) |allowed_root| {
+            if (std.mem.startsWith(u8, validated_path, allowed_root)) {
+                return validated_path;
+            }
+        }
+
+        allocator.free(validated_path);
+        return error.PathNotInAllowedRoots;
+    }
+};
 
 /// Undo log entry for transaction rollback
 pub const UndoEntry = struct {
@@ -38,6 +118,8 @@ pub const Connection = struct {
     undo_log: std.ArrayList(UndoEntry),
     plan_cache: ?cache_manager.QueryPlanCache,
     attached_databases: std.StringHashMap(*Self), // ATTACH DATABASE schema_name -> connection
+    /// SECURITY: Path policy for ATTACH operations (default allows all for backwards compatibility)
+    attach_path_policy: AttachPathPolicy,
 
     const Self = @This();
 
@@ -54,6 +136,7 @@ pub const Connection = struct {
         conn.undo_log = .{};
         conn.plan_cache = try cache_manager.QueryPlanCache.init(allocator, 100);
         conn.attached_databases = std.StringHashMap(*Self).init(allocator);
+        conn.attach_path_policy = AttachPathPolicy.ALLOW_ALL; // Default for backwards compatibility
 
         // Replay WAL on startup to recover any uncommitted changes
         if (conn.wal) |w| {
@@ -76,6 +159,7 @@ pub const Connection = struct {
         conn.undo_log = .{};
         conn.plan_cache = try cache_manager.QueryPlanCache.init(allocator, 100);
         conn.attached_databases = std.StringHashMap(*Self).init(allocator);
+        conn.attach_path_policy = AttachPathPolicy.ALLOW_ALL; // Default for backwards compatibility
 
         return conn;
     }
@@ -93,6 +177,7 @@ pub const Connection = struct {
         conn.undo_log = .{};
         conn.plan_cache = try cache_manager.QueryPlanCache.init(allocator, 100);
         conn.attached_databases = std.StringHashMap(*Self).init(allocator);
+        conn.attach_path_policy = AttachPathPolicy.ALLOW_ALL; // Default for backwards compatibility
 
         return conn;
     }
@@ -440,6 +525,7 @@ pub const Connection = struct {
     }
 
     /// Attach an external database file with a schema name
+    /// SECURITY: Path is validated against the connection's attach_path_policy
     pub fn attachDatabase(self: *Self, file_path: []const u8, schema_name: []const u8) !void {
         // Check if schema name is already in use
         if (self.attached_databases.get(schema_name) != null) {
@@ -451,15 +537,28 @@ pub const Connection = struct {
             return error.ReservedSchemaName;
         }
 
-        // Open connection to the external database
-        const attached_conn = try Self.open(self.allocator, file_path);
+        // SECURITY: Validate and canonicalize the path against the policy
+        const validated_path = try self.attach_path_policy.validatePath(self.allocator, file_path);
+        defer self.allocator.free(validated_path);
+
+        // Open connection to the external database using validated path
+        const attached_conn = try Self.open(self.allocator, validated_path);
         errdefer attached_conn.close();
+
+        // Inherit the same path policy to attached databases
+        attached_conn.attach_path_policy = self.attach_path_policy;
 
         // Store with duplicated schema name as key
         const schema_key = try self.allocator.dupe(u8, schema_name);
         errdefer self.allocator.free(schema_key);
 
         try self.attached_databases.put(schema_key, attached_conn);
+    }
+
+    /// Set the path policy for ATTACH operations
+    /// SECURITY: Use this to restrict which paths can be attached
+    pub fn setAttachPathPolicy(self: *Self, policy: AttachPathPolicy) void {
+        self.attach_path_policy = policy;
     }
 
     /// Detach a previously attached database

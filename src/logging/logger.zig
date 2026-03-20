@@ -307,3 +307,239 @@ pub const ScopedLogger = struct {
         self.logger.fatal("[{s}] " ++ fmt, .{self.scope} ++ args);
     }
 };
+
+/// SECURITY: Sensitive data redaction utilities
+/// Prevents accidental logging of passwords, tokens, keys, and PII
+pub const SensitiveDataRedactor = struct {
+    allocator: std.mem.Allocator,
+    redaction_placeholder: []const u8,
+
+    const Self = @This();
+
+    /// Common sensitive field patterns (case-insensitive matching)
+    const SENSITIVE_PATTERNS = [_][]const u8{
+        "password",
+        "passwd",
+        "pwd",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "api-key",
+        "auth",
+        "bearer",
+        "credential",
+        "private_key",
+        "privatekey",
+        "private-key",
+        "access_token",
+        "refresh_token",
+        "session_id",
+        "sessionid",
+        "cookie",
+        "authorization",
+        "x-api-key",
+        "master_key",
+        "masterkey",
+        "encryption_key",
+        "ssn",
+        "social_security",
+        "credit_card",
+        "creditcard",
+        "cvv",
+        "pin",
+    };
+
+    pub fn init(allocator: std.mem.Allocator) Self {
+        return Self{
+            .allocator = allocator,
+            .redaction_placeholder = "[REDACTED]",
+        };
+    }
+
+    pub fn initWithPlaceholder(allocator: std.mem.Allocator, placeholder: []const u8) Self {
+        return Self{
+            .allocator = allocator,
+            .redaction_placeholder = placeholder,
+        };
+    }
+
+    /// Redact a value if the key matches sensitive patterns
+    pub fn redactIfSensitive(self: *const Self, key: []const u8, value: []const u8) []const u8 {
+        if (self.isSensitiveKey(key)) {
+            return self.redaction_placeholder;
+        }
+        return value;
+    }
+
+    /// Check if a key name indicates sensitive data
+    pub fn isSensitiveKey(self: *const Self, key: []const u8) bool {
+        _ = self;
+        var lower_key_buf: [256]u8 = undefined;
+        const lower_key = toLowerBounded(key, &lower_key_buf);
+
+        for (SENSITIVE_PATTERNS) |pattern| {
+            if (std.mem.indexOf(u8, lower_key, pattern) != null) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Redact common sensitive patterns from a string
+    /// Looks for patterns like "password=xxx", "token: xxx", etc.
+    pub fn redactString(self: *const Self, input: []const u8) ![]u8 {
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(self.allocator);
+
+        var i: usize = 0;
+        while (i < input.len) {
+            // Check for key=value or key: value patterns
+            const remaining = input[i..];
+            var found_sensitive = false;
+
+            for (SENSITIVE_PATTERNS) |pattern| {
+                if (startsWithIgnoreCase(remaining, pattern)) {
+                    const pattern_end = i + pattern.len;
+                    if (pattern_end < input.len) {
+                        const next_char = input[pattern_end];
+                        // Check for common delimiters
+                        if (next_char == '=' or next_char == ':' or next_char == '"') {
+                            // Append the key
+                            try result.appendSlice(self.allocator, input[i..pattern_end]);
+                            try result.append(self.allocator, next_char);
+
+                            // Skip past delimiter and whitespace
+                            var value_start = pattern_end + 1;
+                            while (value_start < input.len and (input[value_start] == ' ' or input[value_start] == '"' or input[value_start] == '\'')) {
+                                try result.append(self.allocator, input[value_start]);
+                                value_start += 1;
+                            }
+
+                            // Find value end (space, comma, quote, newline, or end)
+                            var value_end = value_start;
+                            while (value_end < input.len) {
+                                const c = input[value_end];
+                                if (c == ' ' or c == ',' or c == '\n' or c == '\r' or c == '"' or c == '\'' or c == '}' or c == '&') {
+                                    break;
+                                }
+                                value_end += 1;
+                            }
+
+                            // Replace value with redaction placeholder
+                            try result.appendSlice(self.allocator, self.redaction_placeholder);
+                            i = value_end;
+                            found_sensitive = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!found_sensitive) {
+                try result.append(self.allocator, input[i]);
+                i += 1;
+            }
+        }
+
+        return try result.toOwnedSlice(self.allocator);
+    }
+
+    /// Redact email addresses from a string
+    pub fn redactEmails(self: *const Self, input: []const u8) ![]u8 {
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(self.allocator);
+
+        var i: usize = 0;
+        while (i < input.len) {
+            // Simple email detection: look for @ with alphanumeric chars around it
+            if (input[i] == '@' and i > 0 and i + 1 < input.len) {
+                // Find start of email (go back)
+                var email_start = i;
+                while (email_start > 0 and isEmailChar(input[email_start - 1])) {
+                    email_start -= 1;
+                }
+
+                // Find end of email (go forward)
+                var email_end = i + 1;
+                while (email_end < input.len and isEmailChar(input[email_end])) {
+                    email_end += 1;
+                }
+
+                // Must have characters on both sides
+                if (email_start < i and email_end > i + 1) {
+                    // Remove already-added email prefix
+                    const prefix_len = i - email_start;
+                    if (result.items.len >= prefix_len) {
+                        result.shrinkRetainingCapacity(result.items.len - prefix_len);
+                    }
+                    try result.appendSlice(self.allocator, "[EMAIL_REDACTED]");
+                    i = email_end;
+                    continue;
+                }
+            }
+            try result.append(self.allocator, input[i]);
+            i += 1;
+        }
+
+        return try result.toOwnedSlice(self.allocator);
+    }
+
+    fn isEmailChar(c: u8) bool {
+        return std.ascii.isAlphanumeric(c) or c == '.' or c == '_' or c == '-' or c == '+';
+    }
+
+    fn toLowerBounded(input: []const u8, buf: []u8) []const u8 {
+        const len = @min(input.len, buf.len);
+        for (input[0..len], 0..) |c, j| {
+            buf[j] = std.ascii.toLower(c);
+        }
+        return buf[0..len];
+    }
+
+    fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+        if (haystack.len < needle.len) return false;
+        for (haystack[0..needle.len], needle) |h, n| {
+            if (std.ascii.toLower(h) != std.ascii.toLower(n)) return false;
+        }
+        return true;
+    }
+};
+
+/// Safe logger that automatically redacts sensitive data
+pub const SafeLogger = struct {
+    logger: *Logger,
+    redactor: SensitiveDataRedactor,
+
+    const Self = @This();
+
+    pub fn init(logger: *Logger, allocator: std.mem.Allocator) Self {
+        return Self{
+            .logger = logger,
+            .redactor = SensitiveDataRedactor.init(allocator),
+        };
+    }
+
+    /// Log with automatic redaction of sensitive patterns
+    pub fn logSafe(self: *Self, level: LogLevel, message: []const u8) void {
+        const redacted = self.redactor.redactString(message) catch {
+            // On allocation failure, log original with warning prefix
+            self.logger.log(level, "[REDACTION_FAILED] {s}", .{message});
+            return;
+        };
+        defer self.redactor.allocator.free(redacted);
+        self.logger.log(level, "{s}", .{redacted});
+    }
+
+    /// Log a key-value pair, redacting value if key is sensitive
+    pub fn logKeyValue(self: *Self, level: LogLevel, key: []const u8, value: []const u8) void {
+        const safe_value = self.redactor.redactIfSensitive(key, value);
+        self.logger.log(level, "{s}={s}", .{ key, safe_value });
+    }
+};
+
+/// Create a safe audit detail string that redacts sensitive content
+pub fn createSafeAuditDetail(allocator: std.mem.Allocator, detail: []const u8) ![]u8 {
+    var redactor = SensitiveDataRedactor.init(allocator);
+    return redactor.redactString(detail);
+}

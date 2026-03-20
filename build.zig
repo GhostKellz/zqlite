@@ -412,6 +412,25 @@ pub fn build(b: *std.Build) void {
     const logger_test_step = b.step("test-logging", "Test structured logging system");
     logger_test_step.dependOn(&run_logger_test.step);
 
+    // Add security test suite (SQL injection, WAL limits, integrity verification)
+    const security_test = b.addExecutable(.{
+        .name = "security_test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/standalone/test_security.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    security_test.root_module.addImport("zqlite", lib.root_module);
+    security_test.root_module.addImport("zsync", zsync.module("zsync"));
+    security_test.root_module.addOptions("build_options", build_options);
+
+    const run_security_test = b.addRunArtifact(security_test);
+
+    const security_test_step = b.step("test-security", "Run security tests (SQL injection, integrity verification, WAL limits)");
+    security_test_step.dependOn(&run_security_test.step);
+
     // Add simple benchmark suite (avoids B-tree OrderMismatch bug)
     const benchmark_suite = b.addExecutable(.{
         .name = "benchmark_suite",

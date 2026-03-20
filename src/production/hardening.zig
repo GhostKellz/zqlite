@@ -121,13 +121,13 @@ pub const RateLimiter = struct {
         defer self.mutex.unlock();
 
         const now = std.time.nanoTimestamp();
-        var to_remove = std.ArrayList(u64).init(self.allocator);
-        defer to_remove.deinit();
+        var to_remove: std.ArrayList(u64) = .empty;
+        defer to_remove.deinit(self.allocator);
 
         var iterator = self.requests.iterator();
         while (iterator.next()) |entry| {
             if (now - entry.value_ptr.window_start > self.window_size_ns * 2) {
-                to_remove.append(entry.key_ptr.*) catch continue;
+                to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }
 
@@ -167,44 +167,81 @@ pub const AuditEventType = enum {
 };
 
 /// Audit logger for security-relevant events
+/// SECURITY: Automatically redacts sensitive data from log entries
 pub const AuditLogger = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(AuditEntry),
     max_entries: usize,
     mutex: std.Io.Mutex = .init,
     file: ?std.fs.File,
+    enable_redaction: bool,
 
     const Self = @This();
 
+    /// Sensitive patterns to redact from audit logs
+    const SENSITIVE_PATTERNS = [_][]const u8{
+        "password",
+        "passwd",
+        "pwd",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "bearer",
+        "credential",
+        "private_key",
+        "authorization",
+        "master_key",
+        "encryption_key",
+    };
+
     /// Initialize audit logger with optional file output
+    /// Redaction is enabled by default for security
     pub fn init(allocator: std.mem.Allocator, max_entries: usize, log_path: ?[]const u8) !Self {
+        return initWithOptions(allocator, max_entries, log_path, true);
+    }
+
+    /// Initialize with explicit redaction control
+    /// WARNING: Disabling redaction may expose sensitive data in logs
+    pub fn initWithOptions(allocator: std.mem.Allocator, max_entries: usize, log_path: ?[]const u8, enable_redaction: bool) !Self {
         var file: ?std.fs.File = null;
         if (log_path) |path| {
             file = try std.fs.cwd().createFile(path, .{ .truncate = false });
             try file.?.seekFromEnd(0);
         }
 
+        if (!enable_redaction) {
+            std.log.warn("SECURITY: Audit log redaction disabled - sensitive data may be logged", .{});
+        }
+
         return Self{
             .allocator = allocator,
-            .entries = std.ArrayList(AuditEntry).init(allocator),
+            .entries = .empty,
             .max_entries = max_entries,
             .mutex = .{},
             .file = file,
+            .enable_redaction = enable_redaction,
         };
     }
 
-    /// Log an audit event
+    /// Log an audit event with automatic redaction of sensitive data
     pub fn log(self: *Self, event_type: AuditEventType, client_id: ?u64, details: []const u8, success: bool) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         const ts = std.time.timestamp();
 
+        // Redact sensitive data from details
+        const safe_details = if (self.enable_redaction)
+            try self.redactSensitiveData(details)
+        else
+            try self.allocator.dupe(u8, details);
+
         const entry = AuditEntry{
             .timestamp = ts,
             .event_type = event_type,
             .client_id = client_id,
-            .details = try self.allocator.dupe(u8, details),
+            .details = safe_details,
             .success = success,
         };
 
@@ -228,7 +265,107 @@ pub const AuditLogger = struct {
             self.allocator.free(old.details);
         }
 
-        try self.entries.append(entry);
+        try self.entries.append(self.allocator, entry);
+    }
+
+    /// Log an audit event with pre-redacted safe details
+    /// Use this when you've already ensured the details are safe
+    pub fn logSafe(self: *Self, event_type: AuditEventType, client_id: ?u64, safe_details: []const u8, success: bool) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const ts = std.time.timestamp();
+
+        const entry = AuditEntry{
+            .timestamp = ts,
+            .event_type = event_type,
+            .client_id = client_id,
+            .details = try self.allocator.dupe(u8, safe_details),
+            .success = success,
+        };
+
+        if (self.file) |file| {
+            var buf: [512]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, "{d}|{s}|{?d}|{s}|{s}\n", .{
+                entry.timestamp,
+                @tagName(entry.event_type),
+                entry.client_id,
+                entry.details,
+                if (entry.success) "OK" else "FAIL",
+            }) catch &buf;
+            file.writeAll(line) catch {};
+        }
+
+        if (self.entries.items.len >= self.max_entries) {
+            const old = self.entries.orderedRemove(0);
+            self.allocator.free(old.details);
+        }
+
+        try self.entries.append(self.allocator, entry);
+    }
+
+    /// Redact sensitive patterns from detail string
+    fn redactSensitiveData(self: *Self, input: []const u8) ![]u8 {
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(self.allocator);
+
+        var i: usize = 0;
+        while (i < input.len) {
+            const remaining = input[i..];
+            var found_sensitive = false;
+
+            for (SENSITIVE_PATTERNS) |pattern| {
+                if (startsWithIgnoreCase(remaining, pattern)) {
+                    const pattern_end = i + pattern.len;
+                    if (pattern_end < input.len) {
+                        const next_char = input[pattern_end];
+                        if (next_char == '=' or next_char == ':' or next_char == '"') {
+                            // Append the key and delimiter
+                            try result.appendSlice(self.allocator, input[i..pattern_end]);
+                            try result.append(self.allocator, next_char);
+
+                            // Skip whitespace and quotes
+                            var value_start = pattern_end + 1;
+                            while (value_start < input.len and (input[value_start] == ' ' or input[value_start] == '"' or input[value_start] == '\'')) {
+                                try result.append(self.allocator, input[value_start]);
+                                value_start += 1;
+                            }
+
+                            // Find value end
+                            var value_end = value_start;
+                            while (value_end < input.len) {
+                                const c = input[value_end];
+                                if (c == ' ' or c == ',' or c == '\n' or c == '\r' or c == '"' or c == '\'' or c == '}' or c == '&' or c == '|') {
+                                    break;
+                                }
+                                value_end += 1;
+                            }
+
+                            // Replace value with redaction placeholder
+                            try result.appendSlice(self.allocator, "[REDACTED]");
+                            i = value_end;
+                            found_sensitive = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!found_sensitive) {
+                try result.append(self.allocator, input[i]);
+                i += 1;
+            }
+        }
+
+        return try result.toOwnedSlice(self.allocator);
+    }
+
+    fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+        if (haystack.len < needle.len) return false;
+        for (haystack[0..needle.len], needle) |h, n| {
+            if (std.ascii.toLower(h) != std.ascii.toLower(n)) return false;
+        }
+        return true;
     }
 
     /// Get recent audit entries
@@ -244,7 +381,7 @@ pub const AuditLogger = struct {
         for (self.entries.items) |entry| {
             self.allocator.free(entry.details);
         }
-        self.entries.deinit();
+        self.entries.deinit(self.allocator);
         if (self.file) |file| {
             file.close();
         }
@@ -292,8 +429,8 @@ pub const ConnectionValidator = struct {
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return Self{
-            .allowed_hosts = std.ArrayList([]const u8).init(allocator),
-            .blocked_hosts = std.ArrayList([]const u8).init(allocator),
+            .allowed_hosts = .empty,
+            .blocked_hosts = .empty,
             .require_tls = true,
             .min_tls_version = .TLS13,
             .allocator = allocator,
@@ -301,11 +438,11 @@ pub const ConnectionValidator = struct {
     }
 
     pub fn allowHost(self: *Self, host: []const u8) !void {
-        try self.allowed_hosts.append(try self.allocator.dupe(u8, host));
+        try self.allowed_hosts.append(self.allocator, try self.allocator.dupe(u8, host));
     }
 
     pub fn blockHost(self: *Self, host: []const u8) !void {
-        try self.blocked_hosts.append(try self.allocator.dupe(u8, host));
+        try self.blocked_hosts.append(self.allocator, try self.allocator.dupe(u8, host));
     }
 
     pub fn isHostAllowed(self: *Self, host: []const u8) bool {
@@ -335,12 +472,12 @@ pub const ConnectionValidator = struct {
         for (self.allowed_hosts.items) |host| {
             self.allocator.free(host);
         }
-        self.allowed_hosts.deinit();
+        self.allowed_hosts.deinit(self.allocator);
 
         for (self.blocked_hosts.items) |host| {
             self.allocator.free(host);
         }
-        self.blocked_hosts.deinit();
+        self.blocked_hosts.deinit(self.allocator);
     }
 };
 

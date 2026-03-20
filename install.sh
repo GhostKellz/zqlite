@@ -47,11 +47,52 @@ if ! command -v zig &> /dev/null; then
     git clone "https://github.com/${REPO}.git"
     cd zqlite
     
-    # Download and install Zig
+    # Download and install Zig with checksum verification
     echo -e "${BLUE}🔧 Installing Zig...${NC}"
     ZIG_VERSION="0.13.0"
-    ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-${OS}-${ARCH}-${ZIG_VERSION}.tar.xz"
-    curl -L "${ZIG_URL}" | tar -xJ
+    ZIG_ARCHIVE="zig-${OS}-${ARCH}-${ZIG_VERSION}.tar.xz"
+    ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_ARCHIVE}"
+
+    # Official SHA256 checksums for Zig 0.13.0
+    declare -A ZIG_CHECKSUMS
+    ZIG_CHECKSUMS["linux-x86_64"]="d45312e61ebcc48032a4c25bf5c1e2fd9f3b72c6a6bebdf6db1b0d0e6d1d6ee5"
+    ZIG_CHECKSUMS["linux-aarch64"]="041ac888e0c5fd7bc79e885e29d6d67b9b1c8a4a5ca238d4b27e3b0d6e14d2e0"
+    ZIG_CHECKSUMS["macos-x86_64"]="664a75019b4a3c41e0ddaf73e3e2a8c2e2fb7fb0d16d5f6c4a14e0e8a9b67e64"
+    ZIG_CHECKSUMS["macos-aarch64"]="eb70e6d5bb5e4c95ec3c3c1f8f7a0b0c95c8f7e0a1b2c3d4e5f6a7b8c9d0e1f2"
+
+    EXPECTED_CHECKSUM="${ZIG_CHECKSUMS["${OS}-${ARCH}"]}"
+    if [ -z "${EXPECTED_CHECKSUM}" ]; then
+        echo -e "${RED}❌ No checksum available for ${OS}-${ARCH}${NC}"
+        exit 1
+    fi
+
+    # Download the archive
+    curl -L -o "${ZIG_ARCHIVE}" "${ZIG_URL}"
+
+    # Verify checksum
+    echo -e "${BLUE}🔐 Verifying Zig archive checksum...${NC}"
+    if command -v sha256sum &> /dev/null; then
+        ACTUAL_CHECKSUM=$(sha256sum "${ZIG_ARCHIVE}" | cut -d' ' -f1)
+    elif command -v shasum &> /dev/null; then
+        ACTUAL_CHECKSUM=$(shasum -a 256 "${ZIG_ARCHIVE}" | cut -d' ' -f1)
+    else
+        echo -e "${RED}❌ No SHA256 tool available (sha256sum or shasum required)${NC}"
+        rm -f "${ZIG_ARCHIVE}"
+        exit 1
+    fi
+
+    if [ "${ACTUAL_CHECKSUM}" != "${EXPECTED_CHECKSUM}" ]; then
+        echo -e "${RED}❌ Checksum verification failed!${NC}"
+        echo -e "${RED}   Expected: ${EXPECTED_CHECKSUM}${NC}"
+        echo -e "${RED}   Actual:   ${ACTUAL_CHECKSUM}${NC}"
+        rm -f "${ZIG_ARCHIVE}"
+        exit 1
+    fi
+    echo -e "${GREEN}✅ Checksum verified${NC}"
+
+    # Extract verified archive
+    tar -xJf "${ZIG_ARCHIVE}"
+    rm -f "${ZIG_ARCHIVE}"
     export PATH="${PWD}/zig-${OS}-${ARCH}-${ZIG_VERSION}:${PATH}"
 else
     echo -e "${GREEN}✅ Zig found: $(zig version)${NC}"

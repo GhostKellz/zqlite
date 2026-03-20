@@ -57,6 +57,10 @@ pub const cli = @import("shell/cli.zig");
 
 // Structured logging
 pub const logging = @import("logging/logger.zig");
+pub const logger = logging; // Alias for convenience
+
+// Production hardening utilities
+pub const hardening = @import("production/hardening.zig");
 
 // Post-quantum cryptography (profile: full, or -Dcrypto=true)
 pub const crypto = if (build_options.enable_crypto)
@@ -185,7 +189,7 @@ pub fn printBuildInfo() void {
 
 // Tests
 test "zqlite version info" {
-    try std.testing.expect(std.mem.eql(u8, version.VERSION_STRING, "1.5.3"));
+    try std.testing.expect(std.mem.eql(u8, version.VERSION_STRING, "1.5.4"));
 }
 
 test "build info contains version" {

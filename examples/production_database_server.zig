@@ -1,9 +1,20 @@
 const std = @import("std");
 const zqlite = @import("../src/zqlite.zig");
 
-/// 🏦 ZQLite Production Database Server
+/// 🏦 ZQLite Production Database Server - REFERENCE IMPLEMENTATION
 /// High-performance, secure database server for production workloads
 /// Features: Connection pooling, replication, backup, monitoring
+///
+/// ⚠️  SECURITY NOTICE ⚠️
+/// This is a REFERENCE IMPLEMENTATION demonstrating security patterns.
+/// Before deploying to production, you MUST:
+///   1. Set ZQLITE_MASTER_KEY environment variable with a secure 32+ char key
+///   2. Implement real user authentication in verifyUserCredentials()
+///   3. Configure TLS/SSL for network connections
+///   4. Set up proper access control and audit logging
+///   5. Review and customize all security-related code paths
+///
+/// DO NOT deploy this example as-is to production!
 const ServerError = error{
     ConnectionLimitReached,
     AuthenticationFailed,
@@ -11,6 +22,8 @@ const ServerError = error{
     ReplicationFailed,
     BackupFailed,
     InvalidQuery,
+    MasterKeyNotConfigured,
+    MasterKeyTooShort,
 };
 
 /// Client connection information
@@ -86,7 +99,21 @@ pub const ZQLiteServer = struct {
         std.debug.print("File: {s}\n", .{config.file_path});
 
         const crypto_engine = try allocator.create(zqlite.crypto.CryptoEngine);
-        crypto_engine.* = try zqlite.crypto.CryptoEngine.initWithMasterKey(allocator, "zqlite_production_master_key_2024");
+        // SECURITY: Master key MUST be provided externally, never hardcoded!
+        // In production, load from:
+        //   - Environment variable: std.posix.getenv("ZQLITE_MASTER_KEY")
+        //   - Hardware security module (HSM)
+        //   - Secure key management service (KMS)
+        const master_key = std.posix.getenv("ZQLITE_MASTER_KEY") orelse {
+            std.log.err("SECURITY ERROR: ZQLITE_MASTER_KEY environment variable not set!", .{});
+            std.log.err("Set a cryptographically secure master key before starting the server.", .{});
+            return error.MasterKeyNotConfigured;
+        };
+        if (master_key.len < 32) {
+            std.log.err("SECURITY ERROR: Master key must be at least 32 characters!", .{});
+            return error.MasterKeyTooShort;
+        }
+        crypto_engine.* = try zqlite.crypto.CryptoEngine.initWithMasterKey(allocator, master_key);
 
         var self = Self{
             .allocator = allocator,
@@ -229,7 +256,10 @@ pub const ZQLiteServer = struct {
             return ServerError.AuthenticationFailed;
         }
 
-        std.debug.print("🔍 Executing query for {s}: {s}\n", .{ connection.username, query });
+        // SECURITY: Don't log full query content - may contain sensitive data (passwords, PII, etc.)
+        // Log only query type/prefix for audit purposes
+        const query_preview = if (query.len > 20) query[0..20] else query;
+        std.debug.print("🔍 Executing query for {s}: {s}...\n", .{ connection.username, query_preview });
 
         connection.updateActivity();
         connection.queries_executed += 1;
@@ -288,13 +318,33 @@ pub const ZQLiteServer = struct {
         };
     }
 
-    /// Verify user credentials (placeholder)
+    /// Verify user credentials
+    /// SECURITY: This is a reference implementation - customize for your auth system
     fn verifyUserCredentials(self: *Self, username: []const u8, password_hash: []const u8) bool {
         _ = self;
-        _ = username;
+
+        // SECURITY: NEVER accept all credentials in production!
+        // This example shows the pattern - you MUST implement real verification.
+        //
+        // Production implementations should:
+        // 1. Query user table: SELECT password_hash, salt FROM users WHERE username = ?
+        // 2. Use constant-time comparison for password hashes
+        // 3. Implement rate limiting and account lockout
+        // 4. Log failed authentication attempts
+        // 5. Consider multi-factor authentication
+
+        // Example: Reject all logins until properly configured
+        // This prevents accidental deployment with auth bypass
+        if (std.posix.getenv("ZQLITE_ALLOW_DEMO_AUTH")) |_| {
+            // Only allow demo auth if explicitly enabled (for development only!)
+            std.log.warn("WARNING: Demo authentication enabled - DO NOT USE IN PRODUCTION!", .{});
+            return std.mem.eql(u8, username, "demo") and password_hash.len > 0;
+        }
+
+        // Default: Reject all authentication until real implementation is added
+        std.log.err("Authentication not configured. Implement verifyUserCredentials().", .{});
         _ = password_hash;
-        // TODO: Check against user database in ZQLite
-        return true; // Accept all users for demo
+        return false;
     }
 
     /// Get database file size

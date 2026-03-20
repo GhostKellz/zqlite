@@ -93,12 +93,49 @@ install_zig() {
         *)          log_error "Unsupported architecture: $(uname -m)"; exit 1 ;;
     esac
 
-    local zig_url="https://ziglang.org/builds/zig-${platform}-${arch}-${ZIG_VERSION}.tar.xz"
+    local zig_archive="zig-${platform}-${arch}-${ZIG_VERSION}.tar.xz"
+    local zig_url="https://ziglang.org/builds/${zig_archive}"
     local zig_dir="./zig-${platform}-${arch}-${ZIG_VERSION}"
 
     if [ ! -d "$zig_dir" ]; then
         log_info "Downloading Zig from $zig_url"
-        curl -L "$zig_url" | tar xJ
+        curl -L -o "${zig_archive}" "$zig_url"
+
+        # Fetch and verify checksum from official source
+        log_info "Verifying Zig archive integrity..."
+        local checksum_url="https://ziglang.org/builds/zig-${platform}-${arch}-${ZIG_VERSION}.tar.xz.sha256"
+        local expected_checksum
+        expected_checksum=$(curl -sL "$checksum_url" | cut -d' ' -f1)
+
+        if [ -z "$expected_checksum" ]; then
+            log_error "Could not fetch checksum from $checksum_url"
+            rm -f "${zig_archive}"
+            exit 1
+        fi
+
+        local actual_checksum
+        if command -v sha256sum &> /dev/null; then
+            actual_checksum=$(sha256sum "${zig_archive}" | cut -d' ' -f1)
+        elif command -v shasum &> /dev/null; then
+            actual_checksum=$(shasum -a 256 "${zig_archive}" | cut -d' ' -f1)
+        else
+            log_error "No SHA256 tool available (sha256sum or shasum required)"
+            rm -f "${zig_archive}"
+            exit 1
+        fi
+
+        if [ "$actual_checksum" != "$expected_checksum" ]; then
+            log_error "Checksum verification failed!"
+            log_error "Expected: $expected_checksum"
+            log_error "Actual:   $actual_checksum"
+            rm -f "${zig_archive}"
+            exit 1
+        fi
+        log_success "Checksum verified"
+
+        # Extract verified archive
+        tar xJf "${zig_archive}"
+        rm -f "${zig_archive}"
     fi
 
     # Add to PATH for this session
@@ -118,14 +155,29 @@ download_zqlite() {
     mkdir -p "$INSTALL_DIR"
     cd "$INSTALL_DIR"
 
-    # Download ZQLite source (using GitHub API to get latest release or specific version)
+    # Download ZQLite source with integrity verification
+    # SECURITY: Use specific tags/commits rather than unverified HEAD
     if [ "$ZQLITE_VERSION" = "latest" ]; then
-        log_info "Downloading latest ZQLite source..."
-        git clone --depth 1 https://github.com/ghostkellz/zqlite.git .
+        log_info "Downloading latest ZQLite release..."
+        # Fetch latest release tag via GitHub API for reproducibility
+        local latest_tag
+        latest_tag=$(curl -sL "https://api.github.com/repos/ghostkellz/zqlite/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        if [ -z "$latest_tag" ]; then
+            log_warning "Could not fetch latest release tag, falling back to main branch"
+            git clone --depth 1 https://github.com/ghostkellz/zqlite.git .
+        else
+            log_info "Using release tag: $latest_tag"
+            git clone --depth 1 --branch "$latest_tag" https://github.com/ghostkellz/zqlite.git .
+        fi
     else
         log_info "Downloading ZQLite version $ZQLITE_VERSION..."
         git clone --depth 1 --branch "$ZQLITE_VERSION" https://github.com/ghostkellz/zqlite.git .
     fi
+
+    # Verify the clone succeeded and show commit hash for auditability
+    local commit_hash
+    commit_hash=$(git rev-parse HEAD)
+    log_info "Cloned at commit: $commit_hash"
 
     log_success "ZQLite source downloaded"
 }

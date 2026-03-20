@@ -304,6 +304,7 @@ export fn zqlite_result_column_count(result: ?*zqlite_result_t) c_int {
 }
 
 /// Get a cell value from the result
+/// IMPORTANT: The returned string must be freed with zqlite_free_string() when done
 export fn zqlite_result_get_text(result: ?*zqlite_result_t, row: c_int, column: c_int) ?[*:0]const u8 {
     if (result == null) return null;
 
@@ -322,6 +323,17 @@ export fn zqlite_result_get_text(result: ?*zqlite_result_t, row: c_int, column: 
     }
 
     return null;
+}
+
+/// Free a string returned by zqlite_result_get_text or other zqlite functions
+/// SECURITY: Always call this to prevent memory leaks from returned strings
+export fn zqlite_free_string(str: ?[*:0]const u8) void {
+    if (str) |s| {
+        // Calculate length and free the allocation
+        const len = std.mem.len(s);
+        const slice: []const u8 = s[0 .. len + 1]; // Include null terminator
+        c_allocator.free(slice);
+    }
 }
 
 /// Free a result

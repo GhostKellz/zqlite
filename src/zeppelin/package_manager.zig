@@ -145,29 +145,53 @@ pub const ZeppelinPackageManager = struct {
             }
         }
 
-        // Using direct SQL formatting instead of prepared statements for simplicity
-
-        // Execute insert (simplified - in production, use prepared statements)
-        const full_sql = try std.fmt.allocPrint(self.allocator, "INSERT INTO zeppelin_packages " ++
+        // Use prepared statements to prevent SQL injection
+        const insert_sql = "INSERT INTO zeppelin_packages " ++
             "(package_id, name, version, description, author, repository_url, license, " ++
             "created_at, updated_at, file_hash, signature, metadata_json) " ++
-            "VALUES ('{}', '{}', '{}', '{}', '{}', '{}', '{}', {}, {}, {}, {}, '{}')", .{
-            package.package_id,
-            package.name,
-            package.version,
-            package.description orelse "",
-            package.author orelse "",
-            package.repository_url orelse "",
-            package.license orelse "",
-            current_time,
-            current_time,
-            if (file_hash) |h| std.fmt.fmtSliceHexLower(h) else "NULL",
-            if (signature) |s| std.fmt.fmtSliceHexLower(s) else "NULL",
-            metadata_json,
-        });
-        defer self.allocator.free(full_sql);
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
-        _ = try self.connection.execute(full_sql);
+        var stmt = try connection.PreparedStatement.prepare(self.allocator, self.connection, insert_sql);
+        defer stmt.deinit();
+
+        try stmt.bind(0, package.package_id);
+        try stmt.bind(1, package.name);
+        try stmt.bind(2, package.version);
+        if (package.description) |desc| {
+            try stmt.bind(3, desc);
+        } else {
+            try stmt.bindNull(3);
+        }
+        if (package.author) |auth| {
+            try stmt.bind(4, auth);
+        } else {
+            try stmt.bindNull(4);
+        }
+        if (package.repository_url) |url| {
+            try stmt.bind(5, url);
+        } else {
+            try stmt.bindNull(5);
+        }
+        if (package.license) |lic| {
+            try stmt.bind(6, lic);
+        } else {
+            try stmt.bindNull(6);
+        }
+        try stmt.bind(7, current_time);
+        try stmt.bind(8, current_time);
+        if (file_hash) |h| {
+            try stmt.bindParameter(9, .{ .Blob = h });
+        } else {
+            try stmt.bindNull(9);
+        }
+        if (signature) |s| {
+            try stmt.bindParameter(10, .{ .Blob = s });
+        } else {
+            try stmt.bindNull(10);
+        }
+        try stmt.bind(11, metadata_json);
+
+        _ = try stmt.execute();
 
         // Register version
         try self.addPackageVersion(package.package_id, package.version, PackageVersion{
@@ -188,39 +212,47 @@ pub const ZeppelinPackageManager = struct {
 
     /// Add a package version
     pub fn addPackageVersion(self: *Self, package_id: []const u8, version: []const u8, version_info: PackageVersion) !void {
-        const insert_sql = try std.fmt.allocPrint(self.allocator, "INSERT INTO zeppelin_package_versions " ++
+        const sql = "INSERT INTO zeppelin_package_versions " ++
             "(package_id, version, release_date, is_prerelease, is_deprecated, " ++
             "file_size, release_notes) " ++
-            "VALUES ('{}', '{}', {}, {}, {}, {}, '{}')", .{
-            package_id,
-            version,
-            version_info.release_date,
-            if (version_info.is_prerelease) 1 else 0,
-            if (version_info.is_deprecated) 1 else 0,
-            version_info.file_size,
-            version_info.release_notes orelse "",
-        });
-        defer self.allocator.free(insert_sql);
+            "VALUES (?, ?, ?, ?, ?, ?, ?)";
 
-        _ = try self.connection.execute(insert_sql);
+        var stmt = try connection.PreparedStatement.prepare(self.allocator, self.connection, sql);
+        defer stmt.deinit();
+
+        try stmt.bind(0, package_id);
+        try stmt.bind(1, version);
+        try stmt.bind(2, version_info.release_date);
+        try stmt.bind(3, @as(i64, if (version_info.is_prerelease) 1 else 0));
+        try stmt.bind(4, @as(i64, if (version_info.is_deprecated) 1 else 0));
+        try stmt.bind(5, @as(i64, @intCast(version_info.file_size)));
+        if (version_info.release_notes) |notes| {
+            try stmt.bind(6, notes);
+        } else {
+            try stmt.bindNull(6);
+        }
+
+        _ = try stmt.execute();
     }
 
     /// Add a dependency
     pub fn addDependency(self: *Self, package_id: []const u8, dependency: Dependency) !void {
         const current_time = getMilliTimestamp();
 
-        const insert_sql = try std.fmt.allocPrint(self.allocator, "INSERT INTO zeppelin_dependencies " ++
+        const sql = "INSERT INTO zeppelin_dependencies " ++
             "(package_id, dependency_package_id, version_constraint, dependency_type, created_at) " ++
-            "VALUES ('{}', '{}', '{}', '{}', {})", .{
-            package_id,
-            dependency.package_id,
-            dependency.version_constraint,
-            @tagName(dependency.dependency_type),
-            current_time,
-        });
-        defer self.allocator.free(insert_sql);
+            "VALUES (?, ?, ?, ?, ?)";
 
-        _ = try self.connection.execute(insert_sql);
+        var stmt = try connection.PreparedStatement.prepare(self.allocator, self.connection, sql);
+        defer stmt.deinit();
+
+        try stmt.bind(0, package_id);
+        try stmt.bind(1, dependency.package_id);
+        try stmt.bind(2, dependency.version_constraint);
+        try stmt.bind(3, @tagName(dependency.dependency_type));
+        try stmt.bind(4, current_time);
+
+        _ = try stmt.execute();
     }
 
     /// Get package dependency graph
@@ -255,55 +287,68 @@ pub const ZeppelinPackageManager = struct {
     }
 
     /// Verify package integrity using cryptographic signatures
+    /// SECURITY: Fails closed - returns error if crypto engine unavailable
     pub fn verifyPackageIntegrity(self: *Self, package_id: []const u8, file_content: []const u8) !bool {
-        if (self.crypto_engine) |crypto_eng| {
-            // Get stored hash and signature
-            const query_sql = try std.fmt.allocPrint(self.allocator, "SELECT file_hash, signature FROM zeppelin_packages WHERE package_id = '{}'", .{package_id});
-            defer self.allocator.free(query_sql);
+        // SECURITY: Fail closed when crypto engine is unavailable
+        const crypto_eng = self.crypto_engine orelse return error.CryptoEngineUnavailable;
 
-            const result = try self.connection.execute(query_sql);
-            defer result.deinit(self.allocator);
+        // Use prepared statement to prevent SQL injection
+        const query_sql = "SELECT file_hash, signature FROM zeppelin_packages WHERE package_id = ?";
 
-            if (result.rows.len == 0) {
-                return false; // Package not found
-            }
+        var stmt = try connection.PreparedStatement.prepare(self.allocator, self.connection, query_sql);
+        defer stmt.deinit();
 
-            const stored_hash = switch (result.rows[0].values[0]) {
-                .Text => |t| t,
-                .Blob => |b| b,
-                else => return false,
-            };
+        try stmt.bind(0, package_id);
 
-            const stored_signature = switch (result.rows[0].values[1]) {
-                .Text => |t| t,
-                .Blob => |b| b,
-                else => return false,
-            };
+        const result = try stmt.execute();
+        defer result.deinit(self.allocator);
 
-            // Verify hash
-            const computed_hash = try crypto_eng.hash(file_content);
-            defer self.allocator.free(computed_hash);
-
-            if (!std.mem.eql(u8, stored_hash, std.fmt.fmtSliceHexLower(computed_hash))) {
-                return false;
-            }
-
-            // Verify signature
-            return crypto_eng.verify(file_content, stored_signature);
+        if (result.rows.len == 0) {
+            return false; // Package not found
         }
 
-        // If no crypto engine, just return true (no verification)
-        return true;
+        const stored_hash = switch (result.rows[0].values[0]) {
+            .Text => |t| t,
+            .Blob => |b| b,
+            else => return false,
+        };
+
+        const stored_signature = switch (result.rows[0].values[1]) {
+            .Text => |t| t,
+            .Blob => |b| b,
+            else => return false,
+        };
+
+        // Verify hash
+        const computed_hash = try crypto_eng.hash(file_content);
+        defer self.allocator.free(computed_hash);
+
+        if (!std.mem.eql(u8, stored_hash, std.fmt.fmtSliceHexLower(computed_hash))) {
+            return false;
+        }
+
+        // Verify signature
+        return crypto_eng.verify(file_content, stored_signature);
     }
 
     /// Search packages by name pattern
     pub fn searchPackages(self: *Self, pattern: []const u8) ![]PackageInfo {
-        const search_sql = try std.fmt.allocPrint(self.allocator, "SELECT package_id, name, version, description, author, repository_url, license, metadata_json " ++
-            "FROM zeppelin_packages WHERE name LIKE '%{}%' OR description LIKE '%{}%' " ++
-            "ORDER BY name", .{ pattern, pattern });
-        defer self.allocator.free(search_sql);
+        // Use prepared statement with LIKE pattern to prevent SQL injection
+        const search_sql = "SELECT package_id, name, version, description, author, repository_url, license, metadata_json " ++
+            "FROM zeppelin_packages WHERE name LIKE ? OR description LIKE ? " ++
+            "ORDER BY name";
 
-        const result = try self.connection.execute(search_sql);
+        var stmt = try connection.PreparedStatement.prepare(self.allocator, self.connection, search_sql);
+        defer stmt.deinit();
+
+        // Create LIKE pattern with wildcards
+        const like_pattern = try std.fmt.allocPrint(self.allocator, "%{s}%", .{pattern});
+        defer self.allocator.free(like_pattern);
+
+        try stmt.bind(0, like_pattern);
+        try stmt.bind(1, like_pattern);
+
+        const result = try stmt.execute();
         defer result.deinit(self.allocator);
 
         var packages = std.ArrayList(PackageInfo).init(self.allocator);
@@ -408,11 +453,16 @@ pub const ZeppelinPackageManager = struct {
 
         try visited.put(try self.allocator.dupe(u8, package_id), {});
 
-        const deps_sql = try std.fmt.allocPrint(self.allocator, "SELECT dependency_package_id, version_constraint, dependency_type " ++
-            "FROM zeppelin_dependencies WHERE package_id = '{}'", .{package_id});
-        defer self.allocator.free(deps_sql);
+        // Use prepared statement to prevent SQL injection
+        const deps_sql = "SELECT dependency_package_id, version_constraint, dependency_type " ++
+            "FROM zeppelin_dependencies WHERE package_id = ?";
 
-        const result = try self.connection.execute(deps_sql);
+        var stmt = try connection.PreparedStatement.prepare(self.allocator, self.connection, deps_sql);
+        defer stmt.deinit();
+
+        try stmt.bind(0, package_id);
+
+        const result = try stmt.execute();
         defer result.deinit(self.allocator);
 
         for (result.rows) |row| {
@@ -449,10 +499,15 @@ pub const ZeppelinPackageManager = struct {
 
         var package_deps = std.ArrayList([]const u8).init(self.allocator);
 
-        const deps_sql = try std.fmt.allocPrint(self.allocator, "SELECT dependency_package_id FROM zeppelin_dependencies WHERE package_id = '{}'", .{package_id});
-        defer self.allocator.free(deps_sql);
+        // Use prepared statement to prevent SQL injection
+        const deps_sql = "SELECT dependency_package_id FROM zeppelin_dependencies WHERE package_id = ?";
 
-        const result = try self.connection.execute(deps_sql);
+        var stmt = try connection.PreparedStatement.prepare(self.allocator, self.connection, deps_sql);
+        defer stmt.deinit();
+
+        try stmt.bind(0, package_id);
+
+        const result = try stmt.execute();
         defer result.deinit(self.allocator);
 
         for (result.rows) |row| {
