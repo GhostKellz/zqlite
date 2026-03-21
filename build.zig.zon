@@ -33,8 +33,8 @@
     // internet connectivity.
     .dependencies = .{
         .zsync = .{
-            .url = "https://github.com/ghostkellz/zsync/archive/main.tar.gz",
-            .hash = "zsync-0.7.7-KAuhefiZGACgJRl7uJ1tvJrU9w74XtShEKyZun1ue0uJ",
+            .url = "https://github.com/ghostkellz/zsync/archive/refs/tags/v0.7.8.tar.gz",
+            .hash = "zsync-0.7.8-KAuheQufGABcQSjcE59uKuXJtH8PNSe39fxrTiFlsTYl",
         },
     },
     .paths = .{
