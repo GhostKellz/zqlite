@@ -4,11 +4,7 @@ const zqlite = @import("zqlite");
 /// Test CREATE TABLE memory leak fixes (DEFAULT constraints)
 /// This test focuses ONLY on table creation to avoid B-tree leaks
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{
-        .safety = true,
-        .never_unmap = true,
-        .retain_metadata = true,
-    }){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leaked = gpa.deinit();
         if (leaked == .leak) {

@@ -31,7 +31,7 @@ pub fn main() !void {
 
     try conn.execute("CREATE TABLE bench (id INTEGER, value TEXT)");
 
-    var results: std.ArrayList(BenchResult) = .{};
+    var results: std.ArrayList(BenchResult) = .empty;
     defer results.deinit(allocator);
 
     // Benchmark 1: Simple INSERTs
