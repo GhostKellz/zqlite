@@ -61,3 +61,21 @@ services:
       - /opt/zig-0.16.0-dev:/opt/zig:ro
     working_dir: /workspace/zqlite
     command: /workspace/zqlite/docker/scripts/perf-baseline.sh
+
+  zqlite-file-storage:
+    image: alpine:latest
+    network_mode: host
+    volumes:
+      - ..:/workspace/zqlite
+      - /opt/zig-0.16.0-dev:/opt/zig:ro
+    working_dir: /workspace/zqlite
+    command: /workspace/zqlite/docker/scripts/test-file-storage.sh
+
+  zqlite-critical:
+    image: alpine:latest
+    network_mode: host
+    volumes:
+      - ..:/workspace/zqlite
+      - /opt/zig-0.16.0-dev:/opt/zig:ro
+    working_dir: /workspace/zqlite
+    command: /workspace/zqlite/docker/scripts/test-critical.sh

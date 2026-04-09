@@ -5,6 +5,38 @@ All notable changes to ZQLite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1] - 2026-04-09
+
+### Fixed
+- **File-backed storage page ID conflict** - Metadata page (ID 1) was colliding with btree root pages
+  - Pager now starts `next_page_id` at 2 for file-backed storage, reserving page 1 for metadata
+  - Fixes `OrderMismatch` error when executing SELECT after CREATE TABLE on file-backed databases
+- **Data persistence across connections** - Btree root page and row count now saved to metadata
+  - Added `root_page` (4 bytes) and `row_count` (8 bytes) to table metadata format
+  - `Table.load()` function to restore tables from existing btree pages
+  - `BTree.loadFromRootPage()` function to attach to existing btree structures
+  - Data now survives database close/reopen cycles
+- **Memory leak in loadTables** - Column allocations now freed after schema clone
+- **Memory leaks on error paths** - Added `errdefer` cleanup in Connection and StorageEngine init
+  - `Connection.openWithOptions()` now properly cleans up on failure
+  - `StorageEngine.init()` and `initMemory()` now properly clean up on failure
+- **Transaction ROLLBACK persistence** - WAL-based page restoration for proper rollback
+  - BTree now supports transaction write callbacks for WAL integration
+  - `rollbackWithPager()` physically restores pages from WAL old_data entries
+  - DELETE/UPDATE operations now persist correctly across connections
+  - Added `deleted_keys` to metadata format for logical delete persistence
+
+### Added
+- **File-backed storage test suite** - `tests/standalone/test_file_backed.zig`
+  - Tests CREATE/INSERT/SELECT on file storage
+  - Tests persistence across connection close/reopen
+  - Tests UPDATE/DELETE operations
+  - Tests multiple tables and large datasets (100+ rows)
+- **Transaction atomicity test suite** - `tests/standalone/test_transaction_atomicity.zig`
+  - Tests COMMIT persistence across connections
+  - Tests ROLLBACK discards uncommitted changes
+  - Tests complex nested operations (INSERT/UPDATE/DELETE)
+
 ## [1.6.0] - 2026-04-09
 
 ### Added

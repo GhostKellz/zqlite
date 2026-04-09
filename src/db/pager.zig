@@ -203,7 +203,8 @@ pub const Pager = struct {
         pager.cache = LRUCache.init(allocator, MAX_CACHED_PAGES);
         pager.page_size = DEFAULT_PAGE_SIZE;
         pager.is_memory = false;
-        pager.next_page_id = 1;
+        // Start at page 2 to reserve page 1 for metadata (METADATA_PAGE_ID = 1)
+        pager.next_page_id = 2;
         pager.cache_hits = 0;
         pager.cache_misses = 0;
         // SECURITY: Default to no encryption for backwards compatibility.

@@ -23,6 +23,7 @@ docker-compose -f docker/docker-compose.yml run --rm zqlite-test
 | `zqlite-chaos` | 10 iteration flake detection |
 | `zqlite-perf` | Performance baseline |
 | `zqlite-valgrind` | Valgrind memory analysis |
+| `zqlite-file-storage` | File-backed storage tests (disk I/O, persistence) |
 
 ## Requirements
 

@@ -1,6 +1,7 @@
 const std = @import("std");
 const storage = @import("storage.zig");
 const wal = @import("wal.zig");
+const btree = @import("btree.zig");
 const ast = @import("../parser/ast.zig");
 const parser = @import("../parser/parser.zig");
 const planner = @import("../executor/planner.zig");
@@ -8,6 +9,19 @@ const vm = @import("../executor/vm.zig");
 const cache_manager = @import("../performance/cache_manager.zig");
 const query_cache = @import("../performance/query_cache.zig");
 const posix = std.posix;
+
+/// Context for WAL page write callback during transactions
+const WalCallbackContext = struct {
+    wal_ref: *wal.WriteAheadLog,
+};
+
+/// Callback function for btree to log page writes to WAL
+fn walPageWriteCallback(ctx_ptr: *anyopaque, page_id: u32, old_data: []const u8) anyerror!void {
+    const ctx: *WalCallbackContext = @ptrCast(@alignCast(ctx_ptr));
+    // Log the entire page as old_data with offset 0
+    // new_data is empty since we're just recording what to restore on rollback
+    try ctx.wal_ref.logPageWrite(page_id, 0, old_data, &.{});
+}
 
 /// SECURITY: Path policy for ATTACH DATABASE operations
 /// Controls which paths can be attached to prevent path traversal attacks
@@ -152,6 +166,8 @@ pub const Connection = struct {
     attached_databases: std.StringHashMap(*Self), // ATTACH DATABASE schema_name -> connection
     /// SECURITY: Path policy for ATTACH operations (default allows all for backwards compatibility)
     attach_path_policy: AttachPathPolicy,
+    /// WAL callback context for transaction page logging
+    wal_callback_ctx: ?*WalCallbackContext,
 
     const Self = @This();
 
@@ -163,17 +179,28 @@ pub const Connection = struct {
     /// Open a database file with options
     pub fn openWithOptions(allocator: std.mem.Allocator, path: []const u8, options: ConnectionOptions) !*Self {
         var conn = try allocator.create(Self);
+        errdefer allocator.destroy(conn);
+
         conn.allocator = allocator;
         conn.storage_engine = try storage.StorageEngine.init(allocator, path);
+        errdefer conn.storage_engine.deinit();
+
         conn.wal = try wal.WriteAheadLog.init(allocator, path);
+        errdefer if (conn.wal) |w| w.deinit();
+
         conn.is_memory = false;
         conn.path = try allocator.dupe(u8, path);
+        errdefer allocator.free(conn.path.?);
+
         conn.owns_storage = true;
         conn.in_transaction = false;
         conn.undo_log = .empty;
         conn.plan_cache = try cache_manager.QueryPlanCache.init(allocator, 100);
+        errdefer if (conn.plan_cache) |*cache| cache.deinit();
+
         conn.result_cache = null; // Caller can set via setResultCache()
         conn.attached_databases = std.StringHashMap(*Self).init(allocator);
+        conn.wal_callback_ctx = null;
 
         // Apply security options
         if (options.attach_policy) |policy| {
@@ -211,6 +238,7 @@ pub const Connection = struct {
         conn.plan_cache = try cache_manager.QueryPlanCache.init(allocator, 100);
         conn.result_cache = null;
         conn.attached_databases = std.StringHashMap(*Self).init(allocator);
+        conn.wal_callback_ctx = null;
 
         // Apply security options
         if (options.attach_policy) |policy| {
@@ -243,6 +271,7 @@ pub const Connection = struct {
         conn.plan_cache = try cache_manager.QueryPlanCache.init(allocator, 100);
         conn.result_cache = null;
         conn.attached_databases = std.StringHashMap(*Self).init(allocator);
+        conn.wal_callback_ctx = null;
 
         // Apply security options
         if (options.attach_policy) |policy| {
@@ -270,6 +299,17 @@ pub const Connection = struct {
     pub fn beginTransaction(self: *Self) !void {
         if (self.wal) |w| {
             try w.beginTransaction();
+
+            // Set up WAL callback context for btree page logging
+            const ctx = try self.allocator.create(WalCallbackContext);
+            ctx.wal_ref = w;
+            self.wal_callback_ctx = ctx;
+
+            // Set write callback on all table btrees
+            var table_iter = self.storage_engine.tables.iterator();
+            while (table_iter.next()) |entry| {
+                entry.value_ptr.*.btree.setWriteCallback(walPageWriteCallback, ctx);
+            }
         }
         self.in_transaction = true;
     }
@@ -279,12 +319,35 @@ pub const Connection = struct {
         try self.beginTransaction();
     }
 
+    /// Clear btree write callbacks and free context
+    fn clearTransactionCallbacks(self: *Self) void {
+        // Clear callbacks on all table btrees
+        var table_iter = self.storage_engine.tables.iterator();
+        while (table_iter.next()) |entry| {
+            entry.value_ptr.*.btree.clearWriteCallback();
+        }
+
+        // Free callback context
+        if (self.wal_callback_ctx) |ctx| {
+            self.allocator.destroy(ctx);
+            self.wal_callback_ctx = null;
+        }
+    }
+
     /// Commit a transaction
     pub fn commitTransaction(self: *Self) !void {
+        // Clear btree callbacks first
+        self.clearTransactionCallbacks();
+
         if (self.wal) |w| {
             try w.commit();
-            // Checkpoint WAL to apply changes to the main database file
+            // Checkpoint WAL (truncates the file, data already in btree)
             try w.checkpointToPager(self.storage_engine.pager);
+        }
+
+        // Save metadata including deleted_keys for file-backed storage
+        if (!self.is_memory) {
+            try self.storage_engine.saveAllMetadata();
         }
 
         // Clear undo log - changes are now permanent
@@ -302,25 +365,41 @@ pub const Connection = struct {
 
     /// Rollback a transaction
     pub fn rollbackTransaction(self: *Self) !void {
-        // WAL rollback first - if this fails, keep undo log intact for retry
-        if (self.wal) |w| {
-            try w.rollback();
-        }
+        // Clear btree callbacks first
+        self.clearTransactionCallbacks();
 
-        // Only clear undo log after WAL rollback succeeds
-        while (self.undo_log.items.len > 0) {
-            if (self.undo_log.pop()) |entry_val| {
-                var entry = entry_val;
-                self.applyUndo(&entry) catch |err| {
-                    std.log.err("Failed to apply undo: {}", .{err});
-                };
-                entry.deinit(self.allocator);
+        // Use WAL-based physical page restoration for file-backed storage
+        if (self.wal) |w| {
+            // Restore original page data from WAL old_data entries
+            try w.rollbackWithPager(self.storage_engine.pager);
+
+            // Also clear any logical deletes from this transaction
+            var table_iter = self.storage_engine.tables.iterator();
+            while (table_iter.next()) |entry| {
+                entry.value_ptr.*.deleted_keys.clearRetainingCapacity();
+            }
+        } else {
+            // In-memory: use logical delete mechanism (undo log)
+            while (self.undo_log.items.len > 0) {
+                if (self.undo_log.pop()) |entry_val| {
+                    var entry = entry_val;
+                    self.applyUndo(&entry) catch |err| {
+                        std.log.err("Failed to apply undo: {}", .{err});
+                    };
+                    entry.deinit(self.allocator);
+                }
             }
         }
+
+        // Clear undo log
+        for (self.undo_log.items) |*entry| {
+            entry.deinit(self.allocator);
+        }
+        self.undo_log.clearRetainingCapacity();
         self.in_transaction = false;
     }
 
-    /// Apply a single undo entry
+    /// Apply a single undo entry (for in-memory rollback)
     fn applyUndo(self: *Self, entry: *UndoEntry) !void {
         const table = self.storage_engine.getTable(entry.table_name) orelse return error.TableNotFound;
 
@@ -653,6 +732,17 @@ pub const Connection = struct {
             entry.value_ptr.*.close();
         }
         self.attached_databases.deinit();
+
+        // Clean up WAL callback context if still active (transaction not committed/rolled back)
+        if (self.wal_callback_ctx) |ctx| {
+            // Clear btree callbacks before freeing context
+            var table_iter = self.storage_engine.tables.iterator();
+            while (table_iter.next()) |entry| {
+                entry.value_ptr.*.btree.clearWriteCallback();
+            }
+            self.allocator.destroy(ctx);
+            self.wal_callback_ctx = null;
+        }
 
         // Clean up any remaining undo log entries
         for (self.undo_log.items) |*entry| {

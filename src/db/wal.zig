@@ -145,7 +145,7 @@ pub const WriteAheadLog = struct {
         self.clearLogEntries();
     }
 
-    /// Rollback the current transaction
+    /// Rollback the current transaction (no page restoration)
     pub fn rollback(self: *Self) !void {
         if (!self.is_transaction_active) {
             return error.NoActiveTransaction;
@@ -165,6 +165,54 @@ pub const WriteAheadLog = struct {
 
         self.is_transaction_active = false;
         self.clearLogEntries();
+    }
+
+    /// Rollback the current transaction and restore pages from old_data
+    /// This physically undoes all page modifications made during the transaction
+    pub fn rollbackWithPager(self: *Self, target_pager: *@import("pager.zig").Pager) !void {
+        if (!self.is_transaction_active) {
+            return error.NoActiveTransaction;
+        }
+
+        // Restore pages from old_data in reverse order (LIFO)
+        // This ensures proper undo semantics for overlapping writes
+        var i = self.log_entries.items.len;
+        while (i > 0) {
+            i -= 1;
+            const entry = self.log_entries.items[i];
+
+            if (entry.entry_type == .PageWrite and entry.old_data.len > 0) {
+                // Restore the old page data
+                const page = target_pager.getPage(entry.page_id) catch continue;
+                const end_offset = entry.offset + @as(u32, @intCast(entry.old_data.len));
+
+                if (end_offset <= page.data.len) {
+                    @memcpy(page.data[entry.offset..end_offset], entry.old_data);
+                    target_pager.markDirty(entry.page_id) catch {};
+                }
+            }
+        }
+
+        // Flush restored pages to disk
+        try target_pager.flush();
+
+        // Write ROLLBACK record to WAL
+        const rollback_entry = LogEntry{
+            .entry_type = .Rollback,
+            .transaction_id = self.transaction_id,
+            .page_id = 0,
+            .offset = 0,
+            .old_data = &.{},
+            .new_data = &.{},
+        };
+
+        try self.writeLogEntry(rollback_entry);
+
+        self.is_transaction_active = false;
+        self.clearLogEntries();
+
+        // Truncate WAL after rollback
+        self.truncateFile();
     }
 
     /// Checkpoint - apply WAL changes to main database

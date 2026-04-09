@@ -132,6 +132,10 @@ pub const NodeCache = struct {
     }
 };
 
+/// Callback for logging page writes during transactions
+/// Called before a page is modified, with the page_id and current (old) page data
+pub const PageWriteCallback = *const fn (ctx: *anyopaque, page_id: u32, old_data: []const u8) anyerror!void;
+
 /// B-tree implementation for database storage
 pub const BTree = struct {
     allocator: std.mem.Allocator,
@@ -140,6 +144,9 @@ pub const BTree = struct {
     order: u32, // Maximum number of children per node
     node_cache: ?*NodeCache, // Optional node cache for performance
     cache_enabled: bool,
+    /// Optional callback for transaction logging (WAL integration)
+    write_callback: ?PageWriteCallback,
+    write_callback_ctx: ?*anyopaque,
 
     const Self = @This();
     const DEFAULT_ORDER = 64;
@@ -157,6 +164,8 @@ pub const BTree = struct {
         tree.pager = page_manager;
         tree.order = DEFAULT_ORDER;
         tree.cache_enabled = enable_cache;
+        tree.write_callback = null;
+        tree.write_callback_ctx = null;
 
         // Initialize cache if enabled
         if (enable_cache) {
@@ -177,6 +186,34 @@ pub const BTree = struct {
         try tree.writeNode(tree.root_page, &root_node);
 
         return tree;
+    }
+
+    /// Load an existing B-tree from a known root page (for persistence)
+    pub fn loadFromRootPage(allocator: std.mem.Allocator, page_manager: *pager.Pager, existing_root_page: u32) !*Self {
+        var tree = try allocator.create(Self);
+        tree.allocator = allocator;
+        tree.pager = page_manager;
+        tree.order = DEFAULT_ORDER;
+        tree.cache_enabled = false;
+        tree.node_cache = null;
+        tree.root_page = existing_root_page;
+        tree.write_callback = null;
+        tree.write_callback_ctx = null;
+        return tree;
+    }
+
+    /// Set transaction write callback for WAL integration
+    /// Call this when beginning a transaction to enable undo logging
+    pub fn setWriteCallback(self: *Self, callback: ?PageWriteCallback, ctx: ?*anyopaque) void {
+        self.write_callback = callback;
+        self.write_callback_ctx = ctx;
+    }
+
+    /// Clear transaction write callback
+    /// Call this when ending a transaction (commit or rollback)
+    pub fn clearWriteCallback(self: *Self) void {
+        self.write_callback = null;
+        self.write_callback_ctx = null;
     }
 
     /// Enable caching on an existing B-tree
@@ -362,6 +399,13 @@ pub const BTree = struct {
         var full_child = try self.readNode(full_child_page);
         defer full_child.deinit(self.allocator);
 
+        // Cannot split a node with fewer than 2 keys
+        if (full_child.key_count < 2) {
+            // This can happen with size-based overflow on very large single values
+            // In this case, the value is simply too large for the page size
+            return error.ValueTooLarge;
+        }
+
         // Create new node for right half
         const new_child_page = try self.pager.allocatePage();
         var new_child = if (full_child.is_leaf)
@@ -370,7 +414,9 @@ pub const BTree = struct {
             try Node.initInternal(self.allocator, self.order);
         defer new_child.deinit(self.allocator);
 
-        const mid_index = self.order / 2;
+        // Calculate mid_index - use half of current keys, not order/2
+        // This handles size-based splits where we have fewer keys than order
+        const mid_index = full_child.key_count / 2;
 
         // Move upper half of keys to new node
         // For leaf nodes: include mid_index (key and value stay together in leaves)
@@ -383,6 +429,7 @@ pub const BTree = struct {
             new_child.key_count = @intCast(keys_to_move);
         } else {
             // Internal node split: mid_index key goes to parent, rest to new node
+            // Since key_count >= 2, mid_index >= 1, so mid_index + 1 <= key_count
             const keys_to_move = full_child.key_count - mid_index - 1;
             if (keys_to_move > 0) {
                 @memcpy(new_child.keys[0..keys_to_move], full_child.keys[mid_index + 1 .. full_child.key_count]);
@@ -702,6 +749,14 @@ pub const BTree = struct {
     /// Write a node to storage
     fn writeNode(self: *Self, page_id: u32, node: *Node) !void {
         const page = try self.pager.getPage(page_id);
+
+        // If transaction callback is set, log old page data before modification
+        if (self.write_callback) |callback| {
+            if (self.write_callback_ctx) |ctx| {
+                try callback(ctx, page_id, page.data);
+            }
+        }
+
         _ = try node.serialize(page.data, self.allocator);
         try self.pager.markDirty(page_id);
     }

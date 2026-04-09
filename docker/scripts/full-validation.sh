@@ -56,4 +56,12 @@ echo "--- Benchmark validation ---"
 $ZIG build bench-validate
 
 echo ""
+echo "--- File-backed storage tests ---"
+/workspace/zqlite/docker/scripts/test-file-storage.sh
+
+echo ""
+echo "--- Critical path tests ---"
+/workspace/zqlite/docker/scripts/test-critical.sh
+
+echo ""
 echo "=== ALL VALIDATION PASSED ==="

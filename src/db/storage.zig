@@ -22,8 +22,12 @@ pub const StorageEngine = struct {
     /// Initialize storage engine with file backing
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !*Self {
         var engine = try allocator.create(Self);
+        errdefer allocator.destroy(engine);
+
         engine.allocator = allocator;
         engine.pager = try pager.Pager.init(allocator, path);
+        errdefer engine.pager.deinit();
+
         engine.memory_pool = memory_pool.MemoryPool.init(allocator);
         engine.pooled_allocator = memory_pool.PooledAllocator.init(&engine.memory_pool);
         engine.tables = std.StringHashMap(*Table).init(allocator);
@@ -40,8 +44,12 @@ pub const StorageEngine = struct {
     /// Initialize in-memory storage engine
     pub fn initMemory(allocator: std.mem.Allocator) !*Self {
         var engine = try allocator.create(Self);
+        errdefer allocator.destroy(engine);
+
         engine.allocator = allocator;
         engine.pager = try pager.Pager.initMemory(allocator);
+        errdefer engine.pager.deinit();
+
         engine.memory_pool = memory_pool.MemoryPool.init(allocator);
         engine.pooled_allocator = memory_pool.PooledAllocator.init(&engine.memory_pool);
         engine.tables = std.StringHashMap(*Table).init(allocator);
@@ -141,8 +149,9 @@ pub const StorageEngine = struct {
         while (table_iterator.next()) |entry| {
             const table = entry.value_ptr.*;
 
-            // Check if we have space for this table
-            const min_space = 4 + table.name.len + 2;
+            // Check if we have space for this table (estimate)
+            const deleted_count = table.deleted_keys.count();
+            const min_space = 4 + table.name.len + 14 + 4 + (deleted_count * 8);
             if (offset + min_space > page.data.len) {
                 break; // No more space
             }
@@ -152,6 +161,26 @@ pub const StorageEngine = struct {
             offset += 2;
             @memcpy(page.data[offset..][0..table.name.len], table.name);
             offset += table.name.len;
+
+            // Write btree root page (4 bytes)
+            std.mem.writeInt(u32, page.data[offset..][0..4], table.btree.root_page, .little);
+            offset += 4;
+
+            // Write row count (8 bytes)
+            std.mem.writeInt(u64, page.data[offset..][0..8], table.row_count, .little);
+            offset += 8;
+
+            // Write deleted keys count (4 bytes)
+            std.mem.writeInt(u32, page.data[offset..][0..4], @intCast(deleted_count), .little);
+            offset += 4;
+
+            // Write each deleted key (8 bytes each)
+            var dk_iter = table.deleted_keys.keyIterator();
+            while (dk_iter.next()) |key_ptr| {
+                if (offset + 8 > page.data.len) break;
+                std.mem.writeInt(u64, page.data[offset..][0..8], key_ptr.*, .little);
+                offset += 8;
+            }
 
             // Write column count
             std.mem.writeInt(u16, page.data[offset..][0..2], @intCast(table.schema.columns.len), .little);
@@ -185,6 +214,11 @@ pub const StorageEngine = struct {
 
         // Mark page as dirty to ensure it's written
         try self.pager.markDirty(METADATA_PAGE_ID);
+    }
+
+    /// Save metadata for all tables (public wrapper for commits)
+    pub fn saveAllMetadata(self: *Self) !void {
+        try self.rewriteAllMetadata();
     }
 
     /// Create an index
@@ -268,9 +302,44 @@ pub const StorageEngine = struct {
             const table_name = try self.allocator.dupe(u8, page.data[offset..][0..name_len]);
             offset += name_len;
 
+            // Read btree root page (4 bytes)
+            if (offset + 4 > page.data.len) {
+                self.allocator.free(table_name);
+                break;
+            }
+            const root_page = std.mem.readInt(u32, page.data[offset..][0..4], .little);
+            offset += 4;
+
+            // Read row count (8 bytes)
+            if (offset + 8 > page.data.len) {
+                self.allocator.free(table_name);
+                break;
+            }
+            const row_count = std.mem.readInt(u64, page.data[offset..][0..8], .little);
+            offset += 8;
+
+            // Read deleted keys count (4 bytes)
+            if (offset + 4 > page.data.len) {
+                self.allocator.free(table_name);
+                break;
+            }
+            const deleted_keys_count = std.mem.readInt(u32, page.data[offset..][0..4], .little);
+            offset += 4;
+
+            // Read deleted keys (8 bytes each)
+            var deleted_keys = std.AutoHashMap(u64, void).init(self.allocator);
+            var dk_idx: u32 = 0;
+            while (dk_idx < deleted_keys_count and offset + 8 <= page.data.len) {
+                const key = std.mem.readInt(u64, page.data[offset..][0..8], .little);
+                offset += 8;
+                try deleted_keys.put(key, {});
+                dk_idx += 1;
+            }
+
             // Read column count
             if (offset + 2 > page.data.len) {
                 self.allocator.free(table_name);
+                deleted_keys.deinit();
                 break;
             }
             const column_count = std.mem.readInt(u16, page.data[offset..][0..2], .little);
@@ -299,10 +368,16 @@ pub const StorageEngine = struct {
                 col_idx += 1;
             }
 
-            // Create the table
+            // Load the table with existing btree root page
             const schema = TableSchema{ .columns = columns[0..col_idx] };
-            const table = try Table.create(self.allocator, self.pager, table_name, schema);
+            const table = try Table.loadWithDeletedKeys(self.allocator, self.pager, table_name, schema, root_page, row_count, deleted_keys);
             try self.tables.put(table_name, table);
+
+            // Free temporary column allocations (Table.load clones them)
+            for (columns[0..col_idx]) |col| {
+                self.allocator.free(col.name);
+            }
+            self.allocator.free(columns);
 
             tables_loaded += 1;
         }
@@ -382,6 +457,32 @@ pub const Table = struct {
         table.btree = try btree.BTree.init(allocator, page_manager);
         table.row_count = 0;
         table.deleted_keys = std.AutoHashMap(u64, void).init(allocator);
+
+        return table;
+    }
+
+    /// Load an existing table from persisted root page
+    pub fn load(allocator: std.mem.Allocator, page_manager: *pager.Pager, name: []const u8, schema: TableSchema, root_page: u32, row_count: u64) !*Self {
+        var table = try allocator.create(Self);
+        table.allocator = allocator;
+        table.name = try allocator.dupe(u8, name);
+        table.schema = try schema.clone(allocator);
+        table.btree = try btree.BTree.loadFromRootPage(allocator, page_manager, root_page);
+        table.row_count = row_count;
+        table.deleted_keys = std.AutoHashMap(u64, void).init(allocator);
+
+        return table;
+    }
+
+    /// Load an existing table with persisted deleted keys
+    pub fn loadWithDeletedKeys(allocator: std.mem.Allocator, page_manager: *pager.Pager, name: []const u8, schema: TableSchema, root_page: u32, row_count: u64, deleted_keys: std.AutoHashMap(u64, void)) !*Self {
+        var table = try allocator.create(Self);
+        table.allocator = allocator;
+        table.name = try allocator.dupe(u8, name);
+        table.schema = try schema.clone(allocator);
+        table.btree = try btree.BTree.loadFromRootPage(allocator, page_manager, root_page);
+        table.row_count = row_count;
+        table.deleted_keys = deleted_keys; // Take ownership of the map
 
         return table;
     }
