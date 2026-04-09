@@ -1,9 +1,9 @@
 const std = @import("std");
-const zqlite = @import("src/zqlite.zig");
-const version = @import("src/version.zig");
+const zqlite = @import("zqlite");
+const version = zqlite.version;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

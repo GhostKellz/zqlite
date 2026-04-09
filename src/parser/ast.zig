@@ -196,6 +196,8 @@ pub const InsertStatement = struct {
     columns: ?[][]const u8,
     values: [][]Value,
     or_conflict: ?ConflictResolution,
+    on_conflict: ?OnConflictClause,
+    returning: ?ReturningClause,
 
     pub fn deinit(self: *InsertStatement, allocator: std.mem.Allocator) void {
         allocator.free(self.table);
@@ -212,16 +214,71 @@ pub const InsertStatement = struct {
             allocator.free(row);
         }
         allocator.free(self.values);
+        if (self.on_conflict) |*oc| {
+            oc.deinit(allocator);
+        }
+        if (self.returning) |*ret| {
+            ret.deinit(allocator);
+        }
     }
 };
 
-/// Conflict resolution for INSERT
+/// Conflict resolution for INSERT OR syntax
 pub const ConflictResolution = enum {
     Replace,
     Ignore,
     Abort,
     Fail,
     Rollback,
+};
+
+/// ON CONFLICT clause for UPSERT
+pub const OnConflictClause = struct {
+    target_columns: ?[][]const u8, // Optional conflict target columns
+    action: OnConflictAction,
+
+    pub fn deinit(self: *OnConflictClause, allocator: std.mem.Allocator) void {
+        if (self.target_columns) |cols| {
+            for (cols) |col| {
+                allocator.free(col);
+            }
+            allocator.free(cols);
+        }
+        switch (self.action) {
+            .DoUpdate => |*update| {
+                for (update.assignments) |*assignment| {
+                    allocator.free(assignment.column);
+                    assignment.expr.deinit(allocator);
+                }
+                allocator.free(update.assignments);
+                if (update.where_clause) |*where| {
+                    where.deinit(allocator);
+                }
+            },
+            .DoNothing => {},
+        }
+    }
+};
+
+/// ON CONFLICT action
+pub const OnConflictAction = union(enum) {
+    DoNothing: void,
+    DoUpdate: struct {
+        assignments: []Assignment,
+        where_clause: ?WhereClause,
+    },
+};
+
+/// RETURNING clause columns
+pub const ReturningClause = struct {
+    columns: [][]const u8, // Column names or "*" for all
+
+    pub fn deinit(self: *ReturningClause, allocator: std.mem.Allocator) void {
+        for (self.columns) |col| {
+            allocator.free(col);
+        }
+        allocator.free(self.columns);
+    }
 };
 
 /// CREATE TABLE statement AST
@@ -271,6 +328,7 @@ pub const UpdateStatement = struct {
     table: []const u8,
     assignments: []Assignment,
     where_clause: ?WhereClause,
+    returning: ?ReturningClause,
 
     pub fn deinit(self: *UpdateStatement, allocator: std.mem.Allocator) void {
         allocator.free(self.table);
@@ -282,6 +340,9 @@ pub const UpdateStatement = struct {
         if (self.where_clause) |*where| {
             where.deinit(allocator);
         }
+        if (self.returning) |*ret| {
+            ret.deinit(allocator);
+        }
     }
 };
 
@@ -289,11 +350,15 @@ pub const UpdateStatement = struct {
 pub const DeleteStatement = struct {
     table: []const u8,
     where_clause: ?WhereClause,
+    returning: ?ReturningClause,
 
     pub fn deinit(self: *DeleteStatement, allocator: std.mem.Allocator) void {
         allocator.free(self.table);
         if (self.where_clause) |*where| {
             where.deinit(allocator);
+        }
+        if (self.returning) |*ret| {
+            ret.deinit(allocator);
         }
     }
 };

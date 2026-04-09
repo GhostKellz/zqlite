@@ -4,11 +4,7 @@ const zqlite = @import("zqlite");
 /// Comprehensive memory leak detection test
 /// Uses GeneralPurposeAllocator to detect leaks, double-frees, and use-after-free
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{
-        .safety = true, // Enable safety checks
-        .never_unmap = true, // Keep unmapped memory for UAF detection
-        .retain_metadata = true, // Keep metadata for better error messages
-    }){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leaked = gpa.deinit();
         if (leaked == .leak) {

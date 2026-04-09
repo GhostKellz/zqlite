@@ -5,6 +5,72 @@ All notable changes to ZQLite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-04-09
+
+### Added
+- **RETURNING clause** - PostgreSQL-style RETURNING for data modification statements
+  - `INSERT ... RETURNING id, column1, *` returns inserted row values
+  - `UPDATE ... RETURNING *` returns updated row values
+  - `DELETE ... RETURNING id, name` returns deleted row values before removal
+- **UPSERT / ON CONFLICT** - SQLite and PostgreSQL compatible upsert syntax
+  - `ON CONFLICT DO NOTHING` - ignore conflicts silently
+  - `ON CONFLICT (column) DO UPDATE SET ...` - update on conflict
+  - `ON CONFLICT ... WHERE ...` - conditional updates
+  - Full support combined with RETURNING clause
+- **PQ capability introspection API** - Runtime post-quantum crypto status
+  - `getPQCapability()` - detailed PQ algorithm availability
+  - `getCryptoStatus()` - full crypto module status
+  - `printPQStatus()` - diagnostic output for PQ features
+  - Reports compilation status, enabled algorithms, backend type
+- **Query result cache integration** - Connection now supports optional result caching
+  - `setResultCache()` to attach a query cache
+  - Automatic cache invalidation after INSERT/UPDATE/DELETE
+- **Secure mode for connections** - New `ConnectionOptions` with `secure_mode` flag
+  - `openWithOptions()`, `openMemoryWithOptions()`, `openWithSharedStorageAndOptions()` functions
+  - When `secure_mode=true`, uses `SECURE_DEFAULT` ATTACH policy
+  - Custom `attach_policy` option for fine-grained control
+- **Standard security policy document** - Added `SECURITY.md` to project root
+
+### Fixed
+- **BTree deserialization for PostgreSQL types** - Added missing deserialize handlers for type tags 6-18
+  - JSON, JSONB, UUID, Array, Boolean, Timestamp, TimestampTZ, Date, Time, Interval, Numeric, SmallInt, BigInt
+  - Fixes serialization round-trip for PostgreSQL-compatible data types
+  - Resolves edge case failures under stress tests with extended types
+- **Query cache invalidation** - Cache entries now properly invalidated after write operations
+  - `invalidateTable()` called automatically for INSERT/UPDATE/DELETE
+  - Prevents stale cached query results after data modification
+- **ATTACH path validation** - Segment-aware boundary checking prevents `/var/db` from matching `/var/database`
+- **SQLite compatibility JSON extraction** - Changed `.Float` to `.Real` to match `storage.Value` union
+- **FFI text binding memory leak** - Removed unnecessary intermediate allocation in `zqlite_bind_text()`
+- **journal_mode ownership tracking** - Added `journal_mode_owned` field to prevent double-free on default static string
+- **Example file API signatures** - Updated PQ examples to use correct `openMemory(allocator)` API
+- **Example version references** - Updated examples from v0.5.0/v0.6.0 to v1.6.0
+
+### Changed
+- **Zig 0.16 compatibility** - Migrated all test files from `GeneralPurposeAllocator` to `DebugAllocator`
+- **build.zig** - Fixed `test-quick` target path reference
+- **Standalone test imports** - Updated to use module imports instead of relative paths
+- **Docker environment modernized** - Stripped legacy Ghostwire FFI testing, now tests ZQLite directly
+  - Updated Zig version to 0.16.0-dev.3133
+  - Added `zqlite-valgrind` service for extensive memory leak detection
+  - Added `scripts/test-release.sh` for local release validation
+  - Added `scripts/valgrind-test.sh` for containerized valgrind testing
+- **PQ messaging clarified** - Post-quantum crypto consistently described as experimental scaffolding
+  - Removed all references to "Shroud" backend (never integrated)
+  - Updated status messages: "PQ is experimental scaffolding" instead of "requires Shroud integration"
+  - Cleaned CryptoBackend enum to only include `native` and `none`
+  - Cleaned PQBackend enum to only include `none` and `native_fallback`
+
+### Removed
+- **Dead crypto implementation files** - Deleted `src/crypto/secure_storage_legacy.zig` and `src/crypto/secure_storage_v2.zig`
+- **Shroud backend references** - Removed all Shroud backend assumptions from code, docs, and tests
+- **Unused shroud import** - Removed dead `@import("shroud")` from test_production.zig
+
+### Security
+- Secure ATTACH path policy now available via `secure_mode` connection option
+- Path boundary validation prevents prefix collision attacks
+- Removed `curl | bash` one-liner from README in favor of verified installation
+
 ## [1.5.3] - 2026-02-12
 
 ### Added
@@ -179,15 +245,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Basic embedded SQL database
 - Core storage engine
 - Simple query parser
-## [1.5.2] - 2026-02-12
-
-### Added
-- Compatibility shims for Zig 0.16 removed APIs (mutex/condition, clock_gettime, Instant) exposed via `zqlite.compat`.
-
-### Changed
-- Switched all examples and core modules to use the compat clock helpers instead of `std.posix.clock_gettime`.
-- Centralized compat exports in `src/zqlite.zig` for easier consumption by modules and standalone tests.
-
-### Fixed
-- Logger and time utilities now operate on Zig 0.16.0-dev using the compat clock.
-- Ensured `zig test` targets succeed after the clock/mutex API removals.

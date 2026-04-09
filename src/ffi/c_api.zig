@@ -391,8 +391,8 @@ export fn zqlite_bind_text(stmt: ?*zqlite_stmt_t, index: c_int, value: [*:0]cons
 
     const statement: *zqlite.db.PreparedStatement = @ptrCast(@alignCast(stmt.?));
     const text_value = std.mem.span(value);
-    const owned_text = c_allocator.dupe(u8, text_value) catch return ZQLITE_NOMEM;
-    const storage_value = zqlite.storage.Value{ .Text = owned_text };
+    // Pass borrowed value - bindParameter will clone internally
+    const storage_value = zqlite.storage.Value{ .Text = text_value };
 
     statement.bindParameter(@intCast(index), storage_value) catch return ZQLITE_ERROR;
     return ZQLITE_OK;
@@ -514,6 +514,29 @@ export fn zqlite_version() [*:0]const u8 {
     return zqlite.version.VERSION_STRING.ptr;
 }
 
+/// Returns 1 when real post-quantum crypto is enabled, 0 otherwise.
+export fn zqlite_pq_available() c_int {
+    const pq = zqlite.getPQCapability();
+    return if (pq.enabled) 1 else 0;
+}
+
+/// Returns the current post-quantum status message.
+export fn zqlite_pq_status() [*:0]const u8 {
+    const pq = zqlite.getPQCapability();
+    return switch (pq.backend) {
+        .none => "Post-quantum crypto not compiled (use -Dcrypto=true)",
+        .native_fallback => "Classical crypto only (Ed25519). PQ is experimental scaffolding.",
+    };
+}
+
+/// Returns the current post-quantum backend name.
+export fn zqlite_pq_backend() [*:0]const u8 {
+    return switch (zqlite.getPQCapability().backend) {
+        .none => "none",
+        .native_fallback => "native_fallback",
+    };
+}
+
 /// Cleanup global resources
 export fn zqlite_shutdown() void {
     _ = gpa.deinit();
@@ -556,4 +579,17 @@ test "c api prepared statements" {
     // Test binding parameters
     try testing.expectEqual(ZQLITE_OK, zqlite_bind_int(stmt, 0, 123));
     try testing.expectEqual(ZQLITE_OK, zqlite_bind_text(stmt, 1, "test"));
+}
+
+test "c api pq capability exports" {
+    const testing = std.testing;
+
+    const pq_status = zqlite_pq_status();
+    const pq_backend = zqlite_pq_backend();
+
+    try testing.expect(std.mem.len(pq_status) > 0);
+    try testing.expect(std.mem.len(pq_backend) > 0);
+
+    const pq_available = zqlite_pq_available();
+    try testing.expect(pq_available == 0 or pq_available == 1);
 }

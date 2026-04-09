@@ -398,6 +398,12 @@ pub const Token = union(enum) {
     Using,
     Match, // For FTS MATCH operator
     Fts5, // Full-text search
+    // RETURNING and UPSERT support
+    Returning,
+    Conflict,
+    Do,
+    Nothing,
+    Excluded, // For referencing excluded row in ON CONFLICT
 
     // Operators
     Equal,
@@ -641,6 +647,17 @@ fn getKeyword(identifier: []const u8) ?Token {
         .{ "fts5", .Fts5 },
         .{ "FTS4", .Fts5 }, // Map FTS4 to FTS5 for compatibility
         .{ "fts4", .Fts5 },
+        // RETURNING and UPSERT keywords
+        .{ "RETURNING", .Returning },
+        .{ "returning", .Returning },
+        .{ "CONFLICT", .Conflict },
+        .{ "conflict", .Conflict },
+        .{ "DO", .Do },
+        .{ "do", .Do },
+        .{ "NOTHING", .Nothing },
+        .{ "nothing", .Nothing },
+        .{ "EXCLUDED", .Excluded },
+        .{ "excluded", .Excluded },
         // Window function keywords
         .{ "OVER", .Over },
         .{ "over", .Over },

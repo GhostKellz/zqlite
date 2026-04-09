@@ -10,7 +10,7 @@ const SQLiteCompat = zqlite.sqlite_compat.SQLiteCompat;
 /// Security test suite for ZQLite
 /// Tests SQL injection protection via prepared statements and WAL size limits
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -180,9 +180,10 @@ fn testQuoteEscapeInjection(allocator: std.mem.Allocator) bool {
         stmt.bind(0, payload) catch {
             continue;
         };
-        _ = stmt.execute() catch {
+        var exec_result = stmt.execute() catch {
             continue;
         };
+        exec_result.deinit();
         stmt.reset();
     }
 
@@ -198,10 +199,11 @@ fn testQuoteEscapeInjection(allocator: std.mem.Allocator) bool {
     };
     defer verify_stmt.deinit();
 
-    _ = verify_stmt.execute() catch |err| {
+    var verify_result = verify_stmt.execute() catch |err| {
         std.debug.print("FAILED - table dropped ({})\n", .{err});
         return false;
     };
+    verify_result.deinit();
 
     std.debug.print("✅ PASSED\n", .{});
     return true;
@@ -318,11 +320,11 @@ fn testCommentInjection(allocator: std.mem.Allocator) bool {
             continue;
         };
 
-        _ = stmt.execute() catch {
+        var exec_result = stmt.execute() catch {
             stmt.reset();
             continue;
         };
-
+        exec_result.deinit();
         stmt.reset();
     }
 
@@ -394,11 +396,12 @@ fn testNullByteInjection(allocator: std.mem.Allocator) bool {
         return true;
     };
 
-    _ = stmt.execute() catch {
+    var null_exec_result = stmt.execute() catch {
         // Execution failure is acceptable - null byte caused issues
         std.debug.print("✅ PASSED (rejected null byte on execute)\n", .{});
         return true;
     };
+    null_exec_result.deinit();
 
     // If we get here, the null byte was stored - verify table wasn't corrupted
     // Use a count query with prepared statement which is more robust
@@ -481,10 +484,11 @@ fn testParameterBindingTypes(allocator: std.mem.Allocator) bool {
         return false;
     };
 
-    _ = stmt.execute() catch |err| {
+    var insert_result = stmt.execute() catch |err| {
         std.debug.print("FAILED - execute ({})\n", .{err});
         return false;
     };
+    insert_result.deinit();
 
     // Verify data stored correctly using a prepared statement
     var verify_stmt = conn.prepare("SELECT txt FROM types WHERE id = ?") catch |err| {

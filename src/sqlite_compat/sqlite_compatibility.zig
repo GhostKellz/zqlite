@@ -43,7 +43,12 @@ pub const SQLiteCompat = struct {
             try rows.append(storage.Row{ .values = try self.allocator.dupe(storage.Value, &[_]storage.Value{row_value}) });
         } else if (std.mem.eql(u8, pragma_name, "journal_mode")) {
             if (value) |val| {
+                // Free previous value if owned
+                if (self.pragma_settings.journal_mode_owned) {
+                    self.allocator.free(self.pragma_settings.journal_mode);
+                }
                 self.pragma_settings.journal_mode = try self.allocator.dupe(u8, val);
+                self.pragma_settings.journal_mode_owned = true;
             }
             const row_value = storage.Value{ .Text = self.pragma_settings.journal_mode };
             try rows.append(storage.Row{ .values = try self.allocator.dupe(storage.Value, &[_]storage.Value{row_value}) });
@@ -246,7 +251,7 @@ pub const SQLiteCompat = struct {
             return switch (current) {
                 .string => |s| storage.Value{ .Text = try allocator.dupe(u8, s) },
                 .integer => |i| storage.Value{ .Integer = i },
-                .float => |f| storage.Value{ .Float = f },
+                .float => |f| storage.Value{ .Real = f },
                 .bool => |b| storage.Value{ .Integer = if (b) 1 else 0 },
                 .null => storage.Value.Null,
                 else => storage.Value.Null, // Objects and arrays returned as NULL (use json() for full extraction)
@@ -472,7 +477,7 @@ pub const SQLiteCompat = struct {
         }
         self.fts_indexes.deinit();
 
-        if (self.pragma_settings.journal_mode.len > 0) {
+        if (self.pragma_settings.journal_mode_owned and self.pragma_settings.journal_mode.len > 0) {
             self.allocator.free(self.pragma_settings.journal_mode);
         }
     }
@@ -482,6 +487,7 @@ const PragmaSettings = struct {
     page_size: u32,
     cache_size: i32,
     journal_mode: []const u8,
+    journal_mode_owned: bool,
     foreign_keys: bool,
 
     pub fn default() PragmaSettings {
@@ -489,6 +495,7 @@ const PragmaSettings = struct {
             .page_size = 4096,
             .cache_size = -2000, // 2MB default
             .journal_mode = "DELETE",
+            .journal_mode_owned = false, // Static string, don't free
             .foreign_keys = true, // SECURITY: Enable foreign key constraints by default
         };
     }
@@ -499,6 +506,7 @@ const PragmaSettings = struct {
             .page_size = 4096,
             .cache_size = -2000,
             .journal_mode = "DELETE",
+            .journal_mode_owned = false, // Static string, don't free
             .foreign_keys = false, // WARNING: Foreign keys disabled - may cause data integrity issues
         };
     }

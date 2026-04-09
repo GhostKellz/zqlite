@@ -1,6 +1,7 @@
 const std = @import("std");
-const parser = @import("src/parser/parser.zig");
-const ast = @import("src/parser/ast.zig");
+const zqlite = @import("zqlite");
+const parser = zqlite.parser;
+const ast = zqlite.ast;
 
 test "SQL Comments Support" {
     const allocator = std.testing.allocator;
@@ -224,4 +225,163 @@ test "Foreign Key Constraints" {
         }
     }
     try std.testing.expect(has_fk);
+}
+
+test "RETURNING Clause - INSERT" {
+    const allocator = std.testing.allocator;
+
+    const sql =
+        \\INSERT INTO users (name, email) VALUES ('John', 'john@example.com') RETURNING id, name
+    ;
+
+    var result = parser.parse(allocator, sql) catch |err| {
+        std.debug.print("RETURNING INSERT parse error: {}\n", .{err});
+        return err;
+    };
+    defer result.deinit();
+
+    try std.testing.expect(std.meta.activeTag(result.statement) == .Insert);
+    const insert_stmt = result.statement.Insert;
+    try std.testing.expect(insert_stmt.returning != null);
+    try std.testing.expect(insert_stmt.returning.?.columns.len == 2);
+    try std.testing.expect(std.mem.eql(u8, insert_stmt.returning.?.columns[0], "id"));
+    try std.testing.expect(std.mem.eql(u8, insert_stmt.returning.?.columns[1], "name"));
+}
+
+test "RETURNING Clause - UPDATE" {
+    const allocator = std.testing.allocator;
+
+    const sql =
+        \\UPDATE users SET name = 'Jane' WHERE id = 1 RETURNING *
+    ;
+
+    var result = parser.parse(allocator, sql) catch |err| {
+        std.debug.print("RETURNING UPDATE parse error: {}\n", .{err});
+        return err;
+    };
+    defer result.deinit();
+
+    try std.testing.expect(std.meta.activeTag(result.statement) == .Update);
+    const update_stmt = result.statement.Update;
+    try std.testing.expect(update_stmt.returning != null);
+    try std.testing.expect(update_stmt.returning.?.columns.len == 1);
+    try std.testing.expect(std.mem.eql(u8, update_stmt.returning.?.columns[0], "*"));
+}
+
+test "RETURNING Clause - DELETE" {
+    const allocator = std.testing.allocator;
+
+    const sql =
+        \\DELETE FROM users WHERE active = 0 RETURNING id, name, email
+    ;
+
+    var result = parser.parse(allocator, sql) catch |err| {
+        std.debug.print("RETURNING DELETE parse error: {}\n", .{err});
+        return err;
+    };
+    defer result.deinit();
+
+    try std.testing.expect(std.meta.activeTag(result.statement) == .Delete);
+    const delete_stmt = result.statement.Delete;
+    try std.testing.expect(delete_stmt.returning != null);
+    try std.testing.expect(delete_stmt.returning.?.columns.len == 3);
+}
+
+test "ON CONFLICT DO NOTHING - UPSERT" {
+    const allocator = std.testing.allocator;
+
+    const sql =
+        \\INSERT INTO users (id, name) VALUES (1, 'John') ON CONFLICT DO NOTHING
+    ;
+
+    var result = parser.parse(allocator, sql) catch |err| {
+        std.debug.print("UPSERT DO NOTHING parse error: {}\n", .{err});
+        return err;
+    };
+    defer result.deinit();
+
+    try std.testing.expect(std.meta.activeTag(result.statement) == .Insert);
+    const insert_stmt = result.statement.Insert;
+    try std.testing.expect(insert_stmt.on_conflict != null);
+    try std.testing.expect(insert_stmt.on_conflict.?.action == .DoNothing);
+}
+
+test "ON CONFLICT DO UPDATE - UPSERT" {
+    const allocator = std.testing.allocator;
+
+    const sql =
+        \\INSERT INTO users (id, name, email) VALUES (1, 'John', 'john@example.com')
+        \\ON CONFLICT (id) DO UPDATE SET name = 'Jane', email = 'jane@example.com'
+    ;
+
+    var result = parser.parse(allocator, sql) catch |err| {
+        std.debug.print("UPSERT DO UPDATE parse error: {}\n", .{err});
+        return err;
+    };
+    defer result.deinit();
+
+    try std.testing.expect(std.meta.activeTag(result.statement) == .Insert);
+    const insert_stmt = result.statement.Insert;
+    try std.testing.expect(insert_stmt.on_conflict != null);
+    try std.testing.expect(insert_stmt.on_conflict.?.target_columns != null);
+    try std.testing.expect(insert_stmt.on_conflict.?.target_columns.?[0].len == 1); // "id"
+    try std.testing.expect(insert_stmt.on_conflict.?.action == .DoUpdate);
+
+    // Verify assignments
+    const action = insert_stmt.on_conflict.?.action;
+    switch (action) {
+        .DoUpdate => |update| {
+            try std.testing.expect(update.assignments.len == 2);
+        },
+        else => return error.UnexpectedAction,
+    }
+}
+
+test "ON CONFLICT with WHERE clause" {
+    const allocator = std.testing.allocator;
+
+    const sql =
+        \\INSERT INTO users (id, name) VALUES (1, 'John')
+        \\ON CONFLICT (id) DO UPDATE SET name = 'Updated' WHERE active = 1
+    ;
+
+    var result = parser.parse(allocator, sql) catch |err| {
+        std.debug.print("UPSERT with WHERE parse error: {}\n", .{err});
+        return err;
+    };
+    defer result.deinit();
+
+    try std.testing.expect(std.meta.activeTag(result.statement) == .Insert);
+    const insert_stmt = result.statement.Insert;
+    try std.testing.expect(insert_stmt.on_conflict != null);
+
+    const action = insert_stmt.on_conflict.?.action;
+    switch (action) {
+        .DoUpdate => |update| {
+            try std.testing.expect(update.where_clause != null);
+        },
+        else => return error.UnexpectedAction,
+    }
+}
+
+test "UPSERT with RETURNING" {
+    const allocator = std.testing.allocator;
+
+    const sql =
+        \\INSERT INTO users (id, name) VALUES (1, 'John')
+        \\ON CONFLICT (id) DO UPDATE SET name = 'Jane'
+        \\RETURNING id, name
+    ;
+
+    var result = parser.parse(allocator, sql) catch |err| {
+        std.debug.print("UPSERT with RETURNING parse error: {}\n", .{err});
+        return err;
+    };
+    defer result.deinit();
+
+    try std.testing.expect(std.meta.activeTag(result.statement) == .Insert);
+    const insert_stmt = result.statement.Insert;
+    try std.testing.expect(insert_stmt.on_conflict != null);
+    try std.testing.expect(insert_stmt.returning != null);
+    try std.testing.expect(insert_stmt.returning.?.columns.len == 2);
 }

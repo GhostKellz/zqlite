@@ -1,16 +1,17 @@
 const std = @import("std");
 const zqlite = @import("zqlite");
 
-/// 🚀 ZQLite v0.6.0 Post-Quantum Showcase
-/// Demonstrating cutting-edge cryptographic database features
-/// Powered by ZQLite v0.6.0 with modular crypto backends
+/// ZQLite v1.6.0 Post-Quantum Showcase (EXPERIMENTAL)
+/// Demonstrating cryptographic database feature scaffolding
+/// Powered by ZQLite v1.6.0 with modular crypto backends
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("🌟 Welcome to ZQLite v0.5.0 Post-Quantum Showcase!\n", .{});
-    std.debug.print("=================================================\n\n", .{});
+    std.debug.print("EXPERIMENTAL DEMO: This showcase uses PQ-related scaffolding and fallback paths. Do not treat it as production-ready cryptography.\n\n", .{});
+    std.debug.print("ZQLite v1.6.0 Post-Quantum Showcase\n", .{});
+    std.debug.print("===================================\n\n", .{});
 
     // Demo 1: Post-Quantum Database Encryption
     try demoPostQuantumEncryption(allocator);
@@ -30,8 +31,8 @@ pub fn main() !void {
     // Demo 6: Advanced Cryptographic Features
     try demoAdvancedCrypto(allocator);
 
-    std.debug.print("\n🎉 All demos completed successfully!\n", .{});
-    std.debug.print("ZQLite v0.5.0 is ready for the post-quantum future! 🚀\n", .{});
+    std.debug.print("\nAll demos completed successfully.\n", .{});
+    std.debug.print("ZQLite v1.6.0 PQ scaffolding demonstration complete.\n", .{});
 }
 
 /// Demo 1: Post-Quantum Database Encryption
@@ -40,7 +41,7 @@ fn demoPostQuantumEncryption(allocator: std.mem.Allocator) !void {
     std.debug.print("--------------------------------------------\n", .{});
 
     // Create in-memory database with post-quantum crypto
-    const conn = try zqlite.openMemory();
+    const conn = try zqlite.openMemory(allocator);
     defer conn.close();
 
     // Initialize crypto engine with post-quantum features

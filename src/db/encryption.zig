@@ -79,10 +79,9 @@ pub const Encryption = struct {
     /// SECURITY WARNING: Data will not be encrypted at rest. Use init() with a password
     /// for production deployments handling sensitive data.
     pub fn initPlain() Self {
-        // Emit warning in debug builds
-        if (@import("builtin").mode == .Debug) {
-            std.log.warn("SECURITY: Database opened without encryption. Data is stored in plaintext.", .{});
-        }
+        // Note: Security warning is intentionally omitted from runtime output.
+        // The warning is documented here and in the API docs.
+        // Use init() with encryption for production deployments.
         return Self{
             .key = undefined,
             .salt = undefined,

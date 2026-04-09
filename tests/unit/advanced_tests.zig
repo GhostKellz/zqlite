@@ -20,7 +20,7 @@ fn queryHasRows(conn: *zqlite.Connection, sql: []const u8) !bool {
 // ============================================================================
 
 test "stress: high volume insertions" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -51,7 +51,7 @@ test "stress: high volume insertions" {
 }
 
 test "stress: rapid connection cycling" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leaked = gpa.deinit();
         if (leaked != .ok) {
@@ -72,7 +72,7 @@ test "stress: rapid connection cycling" {
 }
 
 test "stress: large result sets" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -102,7 +102,7 @@ test "stress: large result sets" {
 }
 
 test "stress: repeated queries" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -125,7 +125,7 @@ test "stress: repeated queries" {
 // ============================================================================
 
 test "security: SQL injection via text parameter" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -154,7 +154,7 @@ test "security: SQL injection via text parameter" {
 }
 
 test "security: special characters in text" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -192,7 +192,7 @@ test "security: special characters in text" {
 }
 
 test "security: numeric overflow handling" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -229,7 +229,7 @@ test "security: numeric overflow handling" {
 // ============================================================================
 
 test "edge: empty table operations" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -250,7 +250,7 @@ test "edge: empty table operations" {
 }
 
 test "edge: long text values" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -279,7 +279,7 @@ test "edge: long text values" {
 }
 
 test "edge: boundary integer values" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -320,7 +320,7 @@ test "edge: boundary integer values" {
 }
 
 test "edge: null value handling in all positions" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -354,7 +354,7 @@ test "edge: null value handling in all positions" {
 }
 
 test "edge: table with many columns" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -387,7 +387,7 @@ test "edge: table with many columns" {
 // ============================================================================
 
 test "regression: consecutive execute calls" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -411,7 +411,7 @@ test "regression: consecutive execute calls" {
 }
 
 test "regression: query after modify operations" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -454,7 +454,7 @@ test "regression: query after modify operations" {
 // ============================================================================
 
 test "sql: BETWEEN operator" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -478,7 +478,7 @@ test "sql: BETWEEN operator" {
 }
 
 test "sql: LIKE pattern matching" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -510,7 +510,7 @@ test "sql: LIKE pattern matching" {
 }
 
 test "sql: CASE WHEN expressions" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -547,7 +547,7 @@ test "sql: CASE WHEN expressions" {
 }
 
 test "sql: COALESCE, NULLIF, IFNULL functions" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -593,7 +593,7 @@ test "sql: COALESCE, NULLIF, IFNULL functions" {
 }
 
 test "sql: String functions (UPPER, LOWER, SUBSTR, LENGTH, TRIM)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -643,7 +643,7 @@ test "sql: String functions (UPPER, LOWER, SUBSTR, LENGTH, TRIM)" {
 }
 
 test "introspection: PRAGMA table_info" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -691,7 +691,7 @@ test "introspection: PRAGMA table_info" {
 }
 
 test "introspection: EXPLAIN QUERY PLAN" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leak = gpa.deinit();
         if (leak != .ok) {
@@ -716,4 +716,92 @@ test "introspection: EXPLAIN QUERY PLAN" {
     // First row should have correct structure (id, parent, notused, detail)
     const rows = result.rows.items;
     try std.testing.expectEqual(@as(usize, 4), rows[0].values.len); // Should have 4 columns
+}
+
+test "introspection: PRAGMA database_list includes attached memory database" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const conn = try zqlite.open(allocator, ":memory:");
+    defer conn.close();
+
+    try conn.execute("ATTACH DATABASE ':memory:' AS aux");
+
+    var result = try conn.query("PRAGMA database_list");
+    defer result.deinit();
+
+    try std.testing.expect(result.count() >= 2);
+
+    var found_aux = false;
+    for (result.rows.items) |row| {
+        if (std.mem.eql(u8, row.values[1].Text, "aux")) {
+            found_aux = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_aux);
+}
+
+test "secure mode rejects relative attach paths" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const conn = try zqlite.db.Connection.openMemoryWithOptions(allocator, .{ .secure_mode = true });
+    defer conn.close();
+
+    try std.testing.expectError(error.RelativePathNotAllowed, conn.attachDatabase("relative.db", "aux"));
+}
+
+test "fts virtual table match query executes" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const conn = try zqlite.open(allocator, ":memory:");
+    defer conn.close();
+
+    try conn.execute("CREATE VIRTUAL TABLE docs USING fts5(title, body)");
+    try conn.execute("INSERT INTO docs VALUES ('Guide', 'quantum safe storage guide')");
+    try conn.execute("INSERT INTO docs VALUES ('Notes', 'classical crypto fallback details')");
+
+    var result = try conn.query("SELECT title FROM docs WHERE body MATCH 'quantum guide'");
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.count());
+    try std.testing.expectEqualStrings("Guide", result.rows.items[0].values[0].Text);
+}
+
+test "prepared statement lifecycle can be reused safely" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const conn = try zqlite.open(allocator, ":memory:");
+    defer conn.close();
+
+    try conn.execute("CREATE TABLE prep_users (id INTEGER PRIMARY KEY, name TEXT)");
+
+    var stmt = try conn.prepare("INSERT INTO prep_users VALUES (?, ?)");
+    defer stmt.deinit();
+
+    try stmt.bindParameter(0, zqlite.storage.Value{ .Integer = 1 });
+    try stmt.bindParameter(1, zqlite.storage.Value{ .Text = "Alice" });
+    var first = try stmt.execute();
+    first.deinit();
+    stmt.reset();
+
+    try stmt.bindParameter(0, zqlite.storage.Value{ .Integer = 2 });
+    try stmt.bindParameter(1, zqlite.storage.Value{ .Text = "Bob" });
+    var second = try stmt.execute();
+    second.deinit();
+    stmt.reset();
+
+    var result = try conn.query("SELECT name FROM prep_users ORDER BY id");
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), result.count());
+    try std.testing.expectEqualStrings("Alice", result.rows.items[0].values[0].Text);
+    try std.testing.expectEqualStrings("Bob", result.rows.items[1].values[0].Text);
 }

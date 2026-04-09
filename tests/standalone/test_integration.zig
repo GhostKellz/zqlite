@@ -1,12 +1,12 @@
 const std = @import("std");
-const zqlite = @import("src/zqlite.zig");
+const zqlite = @import("zqlite");
 
 /// Integration test for the three high-priority features:
 /// 1. Parameter placeholder parsing (? in SQL)
 /// 2. Complex function calls (strftime in DEFAULT clauses)
 /// 3. Parameter substitution in VM execution
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

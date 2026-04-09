@@ -55,13 +55,13 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "git_commit", git_commit);
     build_options.addOption([]const u8, "build_date", build_date);
     build_options.addOption([]const u8, "build_mode", build_mode);
-    
+
     // Add zsync dependency for async operations
     const zsync = b.dependency("zsync", .{
         .target = target,
         .optimize = optimize,
     });
-    
+
     // Create the zqlite library - now with only zsync dependency!
     const lib = b.addLibrary(.{
         .name = "zqlite",
@@ -193,7 +193,7 @@ pub fn build(b: *std.Build) void {
     const validation_test = b.addExecutable(.{
         .name = "test_validation",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("test_validation.zig"),
+            .root_source_file = b.path("tests/standalone/test_validation.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -431,6 +431,26 @@ pub fn build(b: *std.Build) void {
     const security_test_step = b.step("test-security", "Run security tests (SQL injection, integrity verification, WAL limits)");
     security_test_step.dependOn(&run_security_test.step);
 
+    if (enable_ffi) {
+        const c_api_tests = b.addTest(.{
+            .name = "c_api_tests",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/ffi/c_api.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+
+        c_api_tests.root_module.addImport("zqlite", lib.root_module);
+        c_api_tests.root_module.addImport("zsync", zsync.module("zsync"));
+        c_api_tests.root_module.addOptions("build_options", build_options);
+
+        const run_c_api_tests = b.addRunArtifact(c_api_tests);
+
+        const c_api_test_step = b.step("test-c-api", "Run C API unit tests");
+        c_api_test_step.dependOn(&run_c_api_tests.step);
+    }
+
     // Add simple benchmark suite (avoids B-tree OrderMismatch bug)
     const benchmark_suite = b.addExecutable(.{
         .name = "benchmark_suite",
@@ -500,9 +520,6 @@ pub fn build(b: *std.Build) void {
     createDemo(b, "window_functions_demo", lib, target, optimize, zsync, build_options);
     createDemo(b, "query_cache_demo", lib, target, optimize, zsync, build_options);
     createDemo(b, "array_operations_demo", lib, target, optimize, zsync, build_options);
-
-    // Ghostwire integration demo
-    createBasicExample(b, "ghostwire_integration_demo", lib, target, optimize, zsync, build_options);
 }
 
 fn createBasicExample(b: *std.Build, name: []const u8, lib: *std.Build.Step.Compile, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, zsync: *std.Build.Dependency, build_options: *std.Build.Step.Options) void {

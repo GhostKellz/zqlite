@@ -1,8 +1,8 @@
 const std = @import("std");
 const zqlite = @import("zqlite");
 
-/// 🏦 ZQLite v0.5.0 Hybrid Crypto Banking Example
-/// Next-generation financial database with post-quantum security
+/// ZQLite v1.6.0 Hybrid Crypto Banking Example (EXPERIMENTAL)
+/// Financial database demo with post-quantum security scaffolding
 /// Features: ML-KEM, ML-DSA, ZKP privacy, quantum-safe transactions
 const BankingError = error{
     InsufficientFunds,
@@ -11,6 +11,10 @@ const BankingError = error{
     CryptoError,
     AuthenticationFailed,
 };
+
+fn printExperimentalBanner() void {
+    std.debug.print("EXPERIMENTAL DEMO: This banking example exercises PQ and hybrid-crypto concepts only. It is not production-ready financial or cryptographic infrastructure.\n\n", .{});
+}
 
 const Account = struct {
     id: []const u8,
@@ -57,9 +61,9 @@ const PostQuantumBank = struct {
 
     pub fn init(allocator: std.mem.Allocator, db_path: ?[]const u8) !Self {
         const db = if (db_path) |path|
-            try zqlite.open(path)
+            try zqlite.open(allocator, path)
         else
-            try zqlite.openMemory();
+            try zqlite.openMemory(allocator);
 
         var crypto = try zqlite.crypto.CryptoEngine.initWithMasterKey(allocator, "post_quantum_banking_master_key_2024_ultra_secure");
 
@@ -157,8 +161,10 @@ const PostQuantumBank = struct {
             },
         };
 
-        // Insert into database (simplified - in production would use prepared statements)
-        try self.db.execute("INSERT INTO accounts (id, account_type, created_at) VALUES ('{}', {}, {});");
+        // NOTE: DB write is illustrative - this demo focuses on crypto patterns, not SQL execution.
+        // In production, use prepared statements with proper parameter binding.
+        _ = account_id;
+        _ = account_type;
 
         // Log creation in cryptographic audit trail
         const audit_data = try std.fmt.allocPrint(self.allocator, "CREATE_ACCOUNT:{s}:{d}", .{ account_id, initial_balance });
@@ -285,11 +291,10 @@ const PostQuantumBank = struct {
         // 4. Re-encrypt balances
         // 5. Store transaction
 
-        // For demo, just insert transaction record
-        try self.db.execute("INSERT INTO transactions (id, from_account, to_account, timestamp, tx_type) VALUES ('{}', '{}', '{}', {}, {});");
+        // NOTE: DB write is illustrative - this demo focuses on crypto patterns, not SQL execution.
+        // In production, use prepared statements with proper parameter binding.
 
-        std.debug.print("   - Updated account balances (encrypted)\n", .{});
-        std.debug.print("   - Transaction recorded\n", .{});
+        std.debug.print("   - (DB writes simulated for demo)\n", .{});
     }
 
     /// Generate detailed financial report with privacy protection
@@ -381,9 +386,10 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("🏦 Welcome to Post-Quantum Banking System v0.5.0\n", .{});
-    std.debug.print("================================================\n", .{});
-    std.debug.print("Powered by ZQLite v0.6.0\n", .{});
+    printExperimentalBanner();
+    std.debug.print("Post-Quantum Banking System Demo\n", .{});
+    std.debug.print("================================\n", .{});
+    std.debug.print("Powered by ZQLite v1.6.0\n", .{});
     std.debug.print("Features: ML-KEM, ML-DSA, Zero-Knowledge Proofs\n\n", .{});
 
     // Initialize post-quantum bank
@@ -428,6 +434,5 @@ pub fn main() !void {
     // Test final transfer in pure post-quantum mode
     try bank.transfer("alice_checking", "bob_savings", 1000, false);
 
-    std.debug.print("\n🎉 Post-quantum banking demo completed successfully!\n", .{});
-    std.debug.print("💫 Ready for the quantum computing era! 🚀\n", .{});
+    std.debug.print("\nPost-quantum banking demo completed successfully.\n", .{});
 }

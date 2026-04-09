@@ -1089,6 +1089,10 @@ pub const VirtualMachine = struct {
             return error.TableNotFound;
         };
 
+        // Track current table so ON CONFLICT expressions and conditions can
+        // resolve column references against the target schema.
+        self.current_table = table;
+
         for (insert.values) |row_values| {
             // Build final values array for all table columns
             var final_values = try self.connection.allocator.alloc(storage.Value, table.schema.columns.len);
@@ -1137,21 +1141,29 @@ pub const VirtualMachine = struct {
                 }
             } else {
                 // INSERT without column specification: INSERT INTO table VALUES (...)
-                // Values are provided in table column order
+                // Values are provided in table column order. FTS virtual tables keep
+                // an implicit rowid backing column, so user-provided VALUES start at 1.
+                const column_offset: usize = if (self.connection.storage_engine.isFTSTable(insert.table_name)) 1 else 0;
                 for (row_values, 0..) |value, i| {
-                    if (i >= table.schema.columns.len) {
+                    const target_idx = i + column_offset;
+                    if (target_idx >= table.schema.columns.len) {
                         return error.TooManyValues;
                     }
                     // resolveValue already returns owned/cloned values
                     const resolved_value = try self.resolveValue(value);
-                    final_values[i] = resolved_value;
-                    values_initialized = i + 1;
+                    final_values[target_idx] = resolved_value;
+                    values_initialized = target_idx + 1;
                 }
             }
 
             // Apply default values for columns that weren't specified
             for (table.schema.columns, 0..) |column, i| {
                 if (final_values[i] == .Null) {
+                    if (self.connection.storage_engine.isFTSTable(insert.table_name) and i == 0 and column.is_primary_key) {
+                        final_values[i] = storage.Value{ .Integer = @intCast(table.row_count) };
+                        values_initialized = @max(values_initialized, i + 1);
+                        continue;
+                    }
                     if (column.default_value) |default_value| {
                         // Replace NULL with evaluated default value
                         const default_val = try self.evaluateStorageDefaultValue(default_value);
@@ -1162,6 +1174,129 @@ pub const VirtualMachine = struct {
                         return error.MissingRequiredValue;
                     }
                     // For nullable columns without defaults, keep as NULL
+                }
+            }
+
+            // Handle ON CONFLICT - check for primary key conflict before insert
+            if (insert.on_conflict != null) {
+                // Find primary key column index
+                var pk_col_idx: ?usize = null;
+                for (table.schema.columns, 0..) |col, idx| {
+                    if (col.is_primary_key) {
+                        pk_col_idx = idx;
+                        break;
+                    }
+                }
+
+                if (pk_col_idx) |pk_idx| {
+                    // Check if a row with this primary key already exists
+                    const all_rows = try table.btree.selectAllWithKeys(self.connection.allocator);
+                    defer {
+                        for (all_rows) |item| {
+                            for (item.row.values) |value| {
+                                value.deinit(self.connection.allocator);
+                            }
+                            self.connection.allocator.free(item.row.values);
+                        }
+                        self.connection.allocator.free(all_rows);
+                    }
+
+                    var conflict_row_key: ?u64 = null;
+                    for (all_rows) |item| {
+                        if (!table.deleted_keys.contains(item.key)) {
+                            if (self.valuesEqual(item.row.values[pk_idx], final_values[pk_idx])) {
+                                conflict_row_key = item.key;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (conflict_row_key != null) {
+                        switch (insert.on_conflict.?) {
+                            .DoNothing => {
+                                // Clean up final_values since we're not inserting
+                                for (final_values) |val| {
+                                    val.deinit(self.connection.allocator);
+                                }
+                                self.connection.allocator.free(final_values);
+                                continue;
+                            },
+                            .DoUpdate => |on_conflict_update| {
+                                // Get the existing row
+                                if (try table.btree.search(conflict_row_key.?)) |existing_row| {
+                                    defer {
+                                        for (existing_row.values) |value| {
+                                            value.deinit(self.connection.allocator);
+                                        }
+                                        self.connection.allocator.free(existing_row.values);
+                                    }
+
+                                    // Apply the update assignments
+                                    for (on_conflict_update.assignments) |assignment| {
+                                        for (table.schema.columns, 0..) |col, col_idx| {
+                                            if (std.mem.eql(u8, col.name, assignment.column)) {
+                                                const new_value = try self.evaluateExpression(&assignment.expr, &existing_row);
+                                                existing_row.values[col_idx].deinit(self.connection.allocator);
+                                                existing_row.values[col_idx] = new_value;
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    if (on_conflict_update.condition) |condition| {
+                                        if (!try self.evaluateCondition(&condition, &existing_row)) {
+                                            for (final_values) |val| {
+                                                val.deinit(self.connection.allocator);
+                                            }
+                                            self.connection.allocator.free(final_values);
+                                            continue;
+                                        }
+                                    }
+
+                                    var replacement_values = try self.connection.allocator.alloc(storage.Value, existing_row.values.len);
+                                    var replacement_initialized: usize = 0;
+                                    errdefer {
+                                        for (replacement_values[0..replacement_initialized]) |value| {
+                                            value.deinit(self.connection.allocator);
+                                        }
+                                        self.connection.allocator.free(replacement_values);
+                                    }
+
+                                    for (existing_row.values, 0..) |value, i| {
+                                        replacement_values[i] = try value.clone(self.connection.allocator);
+                                        replacement_initialized = i + 1;
+                                    }
+
+                                    const new_row_id: i64 = @intCast(table.row_count);
+
+                                    if (self.connection.in_transaction) {
+                                        const table_name_copy = try self.connection.allocator.dupe(u8, insert.table_name);
+                                        try self.connection.logUndo(db.UndoEntry{
+                                            .operation = .Update,
+                                            .table_name = table_name_copy,
+                                            .row_id = @intCast(conflict_row_key.?),
+                                            .new_row_id = new_row_id,
+                                            .old_values = null,
+                                        });
+                                    }
+
+                                    try table.updateRow(self.connection.allocator, @intCast(conflict_row_key.?), replacement_values);
+                                    result.affected_rows += 1;
+
+                                    // Handle RETURNING for upserted row
+                                    if (insert.returning_columns) |ret_cols| {
+                                        try self.addReturningRow(result, table, existing_row.values, ret_cols);
+                                    }
+                                }
+                                // Clean up final_values since we did update instead
+                                for (final_values) |val| {
+                                    val.deinit(self.connection.allocator);
+                                }
+                                self.connection.allocator.free(final_values);
+                                continue;
+                            },
+                        }
+                    }
                 }
             }
 
@@ -1181,8 +1316,67 @@ pub const VirtualMachine = struct {
                 });
             }
 
+            if (self.connection.storage_engine.getFTSIndex(insert.table_name)) |fts_index| {
+                if (try table.btree.search(@intCast(row_id))) |inserted_row| {
+                    defer {
+                        for (inserted_row.values) |value| {
+                            value.deinit(self.connection.allocator);
+                        }
+                        self.connection.allocator.free(inserted_row.values);
+                    }
+
+                    const fts_values = if (inserted_row.values.len > 1) inserted_row.values[1..] else inserted_row.values;
+                    try fts_index.indexDocument(@intCast(row_id), fts_values);
+                }
+            }
+
             result.affected_rows += 1;
+
+            // Handle RETURNING clause - add inserted row to result
+            if (insert.returning_columns) |ret_cols| {
+                // Retrieve the just-inserted row from btree
+                if (try table.btree.search(@intCast(row_id))) |inserted_row| {
+                    defer {
+                        for (inserted_row.values) |value| {
+                            value.deinit(self.connection.allocator);
+                        }
+                        self.connection.allocator.free(inserted_row.values);
+                    }
+                    try self.addReturningRow(result, table, inserted_row.values, ret_cols);
+                }
+            }
         }
+
+        // Invalidate query result cache for this table
+        self.connection.invalidateResultCache(insert.table_name);
+    }
+
+    /// Helper to add a row to result based on RETURNING columns
+    fn addReturningRow(self: *Self, result: *ExecutionResult, table: *storage.Table, row_values: []storage.Value, ret_cols: [][]const u8) !void {
+        var return_values = try self.connection.allocator.alloc(storage.Value, ret_cols.len);
+        errdefer self.connection.allocator.free(return_values);
+
+        for (ret_cols, 0..) |col_name, ret_idx| {
+            if (std.mem.eql(u8, col_name, "*")) {
+                // RETURNING * - return all columns (resize array if needed)
+                self.connection.allocator.free(return_values);
+                return_values = try self.connection.allocator.alloc(storage.Value, row_values.len);
+                for (row_values, 0..) |val, i| {
+                    return_values[i] = try val.clone(self.connection.allocator);
+                }
+                break;
+            } else {
+                // Find specific column
+                for (table.schema.columns, 0..) |col, col_idx| {
+                    if (std.mem.eql(u8, col.name, col_name)) {
+                        return_values[ret_idx] = try row_values[col_idx].clone(self.connection.allocator);
+                        break;
+                    }
+                }
+            }
+        }
+
+        try result.rows.append(self.connection.allocator, storage.Row{ .values = return_values });
     }
 
     /// Execute create table
@@ -1297,6 +1491,29 @@ pub const VirtualMachine = struct {
                     }
                 }
 
+                var returning_values: ?[]storage.Value = null;
+                errdefer if (returning_values) |values| {
+                    for (values) |value| {
+                        value.deinit(self.connection.allocator);
+                    }
+                    self.connection.allocator.free(values);
+                };
+
+                if (update.returning_columns != null) {
+                    returning_values = try self.connection.allocator.alloc(storage.Value, updated_values.len);
+                    var returning_initialized: usize = 0;
+                    errdefer if (returning_values) |values| {
+                        for (values[0..returning_initialized]) |value| {
+                            value.deinit(self.connection.allocator);
+                        }
+                    };
+
+                    for (updated_values, 0..) |value, i| {
+                        returning_values.?[i] = try value.clone(self.connection.allocator);
+                        returning_initialized = i + 1;
+                    }
+                }
+
                 // Get the new row_id before updating (it will be table.row_count)
                 const new_row_id: i64 = @intCast(table.row_count);
 
@@ -1315,10 +1532,23 @@ pub const VirtualMachine = struct {
                 // Perform logical update (marks old as deleted, inserts new)
                 try table.updateRow(self.connection.allocator, item.key, updated_values);
                 updated_count += 1;
+
+                // Handle RETURNING clause - return the updated row values
+                if (update.returning_columns) |ret_cols| {
+                    try self.addReturningRow(result, table, returning_values.?, ret_cols);
+                    for (returning_values.?) |value| {
+                        value.deinit(self.connection.allocator);
+                    }
+                    self.connection.allocator.free(returning_values.?);
+                    returning_values = null;
+                }
             }
         }
 
         result.affected_rows = updated_count;
+
+        // Invalidate query result cache for this table
+        self.connection.invalidateResultCache(update.table_name);
     }
 
     /// Execute delete using logical deletes with transaction undo support
@@ -1352,6 +1582,11 @@ pub const VirtualMachine = struct {
             }
 
             if (should_delete) {
+                // Handle RETURNING clause - capture row values BEFORE delete
+                if (delete.returning_columns) |ret_cols| {
+                    try self.addReturningRow(result, table, item.row.values, ret_cols);
+                }
+
                 // Log undo entry before deleting (if in transaction)
                 if (self.connection.in_transaction) {
                     const table_name_copy = try self.connection.allocator.dupe(u8, delete.table_name);
@@ -1371,6 +1606,9 @@ pub const VirtualMachine = struct {
         }
 
         result.affected_rows = deleted_count;
+
+        // Invalidate query result cache for this table
+        self.connection.invalidateResultCache(delete.table_name);
     }
 
     /// Evaluate a condition against a row
@@ -2777,6 +3015,7 @@ pub const VirtualMachine = struct {
 
         // Create a single row with the aggregate result
         var aggregate_row_values = try self.connection.allocator.alloc(storage.Value, 1);
+        errdefer self.connection.allocator.free(aggregate_row_values);
         aggregate_row_values[0] = aggregate_value;
 
         try result.rows.append(self.connection.allocator, storage.Row{ .values = aggregate_row_values });
@@ -3311,6 +3550,25 @@ pub const VirtualMachine = struct {
             try result.rows.append(allocator, storage.Row{
                 .values = try row_values.toOwnedSlice(allocator),
             });
+
+            var seq: i64 = 1;
+            var attached_iter = self.connection.attached_databases.iterator();
+            while (attached_iter.next()) |entry| {
+                var attached_row: std.ArrayListUnmanaged(storage.Value) = .empty;
+                try attached_row.append(allocator, storage.Value{ .Integer = seq });
+                try attached_row.append(allocator, storage.Value{ .Text = try allocator.dupe(u8, entry.key_ptr.*) });
+
+                const attached_file = if (entry.value_ptr.*.is_memory)
+                    ":memory:"
+                else
+                    entry.value_ptr.*.path orelse "";
+                try attached_row.append(allocator, storage.Value{ .Text = try allocator.dupe(u8, attached_file) });
+
+                try result.rows.append(allocator, storage.Row{
+                    .values = try attached_row.toOwnedSlice(allocator),
+                });
+                seq += 1;
+            }
         } else if (std.ascii.eqlIgnoreCase(pragma.name, "table_list")) {
             // PRAGMA table_list
             // Returns: schema, name, type, ncol, wr, strict
@@ -3403,6 +3661,15 @@ pub const VirtualMachine = struct {
         // Create the backing table for FTS with rowid and indexed columns
         var columns = try allocator.alloc(storage.Column, create_vt.columns.len + 1);
         var columns_owned = false;
+        for (columns) |*col| {
+            col.* = .{
+                .name = "",
+                .data_type = .Text,
+                .is_nullable = true,
+                .is_primary_key = false,
+                .default_value = null,
+            };
+        }
         errdefer {
             // Clean up on error: free all column names and the array only if not yet owned by table
             if (!columns_owned) {
@@ -3433,9 +3700,10 @@ pub const VirtualMachine = struct {
             };
         }
 
-        const schema = storage.TableSchema{ .columns = columns };
+        var schema = storage.TableSchema{ .columns = columns };
         try self.connection.storage_engine.createTable(create_vt.table_name, schema);
-        columns_owned = true; // Table now owns the columns
+        schema.deinit(allocator);
+        columns_owned = true; // Temporary schema has been cleaned up
 
         // Mark this table as an FTS virtual table by creating a special FTS index
         // The FTS functionality will be handled by the MATCH operator in WHERE clause

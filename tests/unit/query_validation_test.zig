@@ -3,7 +3,7 @@ const testing = std.testing;
 const zqlite = @import("zqlite");
 
 test "Query Validation - Complex SELECT Statements" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -63,7 +63,7 @@ test "Query Validation - Complex SELECT Statements" {
 }
 
 test "Query Validation - Subqueries and Window Functions" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -103,7 +103,7 @@ test "Query Validation - Subqueries and Window Functions" {
 }
 
 test "Query Validation - Date and Time Functions" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -146,7 +146,7 @@ test "Query Validation - Date and Time Functions" {
 }
 
 test "Query Validation - Transaction Integrity" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -195,7 +195,7 @@ test "Query Validation - Transaction Integrity" {
 }
 
 test "Query Validation - Error Handling and Edge Cases" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -228,7 +228,7 @@ test "Query Validation - Error Handling and Edge Cases" {
 }
 
 test "Query Validation - Index Performance" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -271,7 +271,7 @@ test "Query Validation - Index Performance" {
 }
 
 test "Query Validation - NULL Handling" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

@@ -4,7 +4,7 @@ const zqlite = @import("zqlite");
 
 /// Intensive memory leak detection test for ZQLite
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leaked = gpa.deinit();
         if (leaked == .leak) {

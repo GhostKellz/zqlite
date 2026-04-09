@@ -6,6 +6,7 @@ const parser = @import("../parser/parser.zig");
 const planner = @import("../executor/planner.zig");
 const vm = @import("../executor/vm.zig");
 const cache_manager = @import("../performance/cache_manager.zig");
+const query_cache = @import("../performance/query_cache.zig");
 const posix = std.posix;
 
 /// SECURITY: Path policy for ATTACH DATABASE operations
@@ -30,6 +31,25 @@ pub const AttachPathPolicy = struct {
         .allow_memory = true,
         .allow_relative = false, // Require absolute paths
     };
+
+    /// Check if a path is under a root directory with proper segment boundary checking
+    /// Prevents "/var/db" from matching "/var/database" (must have separator or end)
+    fn isPathUnderRoot(path: []const u8, root: []const u8) bool {
+        if (!std.mem.startsWith(u8, path, root)) return false;
+
+        // Exact match is allowed
+        if (path.len == root.len) return true;
+
+        // Must have path separator after root
+        // Handle root with trailing separator
+        const root_len = if (root.len > 0 and root[root.len - 1] == std.fs.path.sep)
+            root.len - 1
+        else
+            root.len;
+
+        if (path.len <= root_len) return false;
+        return path[root_len] == std.fs.path.sep;
+    }
 
     /// Validate and canonicalize a path against this policy
     pub fn validatePath(self: AttachPathPolicy, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
@@ -75,9 +95,9 @@ pub const AttachPathPolicy = struct {
             return error.RelativePathWithRootsNotSupported;
         }
 
-        // Check if path is under an allowed root
+        // Check if path is under an allowed root (segment-aware boundary check)
         for (self.allowed_roots) |allowed_root| {
-            if (std.mem.startsWith(u8, validated_path, allowed_root)) {
+            if (isPathUnderRoot(validated_path, allowed_root)) {
                 return validated_path;
             }
         }
@@ -85,6 +105,17 @@ pub const AttachPathPolicy = struct {
         allocator.free(validated_path);
         return error.PathNotInAllowedRoots;
     }
+};
+
+/// Connection options for security and behavior configuration
+pub const ConnectionOptions = struct {
+    /// Enable secure mode: uses SECURE_DEFAULT attach policy, stricter validation
+    secure_mode: bool = false,
+    /// Custom attach path policy (overrides secure_mode if set)
+    attach_policy: ?AttachPathPolicy = null,
+
+    pub const DEFAULT = ConnectionOptions{};
+    pub const SECURE = ConnectionOptions{ .secure_mode = true };
 };
 
 /// Undo log entry for transaction rollback
@@ -117,14 +148,20 @@ pub const Connection = struct {
     in_transaction: bool,
     undo_log: std.ArrayListUnmanaged(UndoEntry),
     plan_cache: ?cache_manager.QueryPlanCache,
+    result_cache: ?*query_cache.QueryCache, // Optional result cache for SELECT queries
     attached_databases: std.StringHashMap(*Self), // ATTACH DATABASE schema_name -> connection
     /// SECURITY: Path policy for ATTACH operations (default allows all for backwards compatibility)
     attach_path_policy: AttachPathPolicy,
 
     const Self = @This();
 
-    /// Open a database file
+    /// Open a database file with default options (backwards compatible)
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !*Self {
+        return openWithOptions(allocator, path, ConnectionOptions.DEFAULT);
+    }
+
+    /// Open a database file with options
+    pub fn openWithOptions(allocator: std.mem.Allocator, path: []const u8, options: ConnectionOptions) !*Self {
         var conn = try allocator.create(Self);
         conn.allocator = allocator;
         conn.storage_engine = try storage.StorageEngine.init(allocator, path);
@@ -135,8 +172,17 @@ pub const Connection = struct {
         conn.in_transaction = false;
         conn.undo_log = .empty;
         conn.plan_cache = try cache_manager.QueryPlanCache.init(allocator, 100);
+        conn.result_cache = null; // Caller can set via setResultCache()
         conn.attached_databases = std.StringHashMap(*Self).init(allocator);
-        conn.attach_path_policy = AttachPathPolicy.ALLOW_ALL; // Default for backwards compatibility
+
+        // Apply security options
+        if (options.attach_policy) |policy| {
+            conn.attach_path_policy = policy;
+        } else if (options.secure_mode) {
+            conn.attach_path_policy = AttachPathPolicy.SECURE_DEFAULT;
+        } else {
+            conn.attach_path_policy = AttachPathPolicy.ALLOW_ALL;
+        }
 
         // Replay WAL on startup to recover any uncommitted changes
         if (conn.wal) |w| {
@@ -146,8 +192,13 @@ pub const Connection = struct {
         return conn;
     }
 
-    /// Open an in-memory database
+    /// Open an in-memory database with default options (backwards compatible)
     pub fn openMemory(allocator: std.mem.Allocator) !*Self {
+        return openMemoryWithOptions(allocator, ConnectionOptions.DEFAULT);
+    }
+
+    /// Open an in-memory database with options
+    pub fn openMemoryWithOptions(allocator: std.mem.Allocator, options: ConnectionOptions) !*Self {
         var conn = try allocator.create(Self);
         conn.allocator = allocator;
         conn.storage_engine = try storage.StorageEngine.initMemory(allocator);
@@ -158,14 +209,28 @@ pub const Connection = struct {
         conn.in_transaction = false;
         conn.undo_log = .empty;
         conn.plan_cache = try cache_manager.QueryPlanCache.init(allocator, 100);
+        conn.result_cache = null;
         conn.attached_databases = std.StringHashMap(*Self).init(allocator);
-        conn.attach_path_policy = AttachPathPolicy.ALLOW_ALL; // Default for backwards compatibility
+
+        // Apply security options
+        if (options.attach_policy) |policy| {
+            conn.attach_path_policy = policy;
+        } else if (options.secure_mode) {
+            conn.attach_path_policy = AttachPathPolicy.SECURE_DEFAULT;
+        } else {
+            conn.attach_path_policy = AttachPathPolicy.ALLOW_ALL;
+        }
 
         return conn;
     }
 
     /// Create connection with shared storage engine (for connection pools)
     pub fn openWithSharedStorage(allocator: std.mem.Allocator, shared_storage: *storage.StorageEngine) !*Self {
+        return openWithSharedStorageAndOptions(allocator, shared_storage, ConnectionOptions.DEFAULT);
+    }
+
+    /// Create connection with shared storage engine and options
+    pub fn openWithSharedStorageAndOptions(allocator: std.mem.Allocator, shared_storage: *storage.StorageEngine, options: ConnectionOptions) !*Self {
         var conn = try allocator.create(Self);
         conn.allocator = allocator;
         conn.storage_engine = shared_storage;
@@ -176,8 +241,17 @@ pub const Connection = struct {
         conn.in_transaction = false;
         conn.undo_log = .empty;
         conn.plan_cache = try cache_manager.QueryPlanCache.init(allocator, 100);
+        conn.result_cache = null;
         conn.attached_databases = std.StringHashMap(*Self).init(allocator);
-        conn.attach_path_policy = AttachPathPolicy.ALLOW_ALL; // Default for backwards compatibility
+
+        // Apply security options
+        if (options.attach_policy) |policy| {
+            conn.attach_path_policy = policy;
+        } else if (options.secure_mode) {
+            conn.attach_path_policy = AttachPathPolicy.SECURE_DEFAULT;
+        } else {
+            conn.attach_path_policy = AttachPathPolicy.ALLOW_ALL;
+        }
 
         return conn;
     }
@@ -330,6 +404,19 @@ pub const Connection = struct {
 
     /// Execute SQL and return structured results (SQLite-style)
     pub fn query(self: *Self, sql: []const u8) !ResultSet {
+        if (self.result_cache) |cache| {
+            const sql_hash = query_cache.QueryHasher.hashQuery(sql);
+            if (cache.get(sql_hash)) |cached_result| {
+                return ResultSet{
+                    .allocator = self.allocator,
+                    .connection = self,
+                    .rows = try cloneCachedRows(self.allocator, cached_result.rows),
+                    .current_index = 0,
+                    .column_names = try self.extractColumnNamesFromSql(sql),
+                };
+            }
+        }
+
         // Parse the SQL
         var parsed = try parser.parse(self.allocator, sql);
         defer parsed.deinit();
@@ -381,6 +468,11 @@ pub const Connection = struct {
         result_set.rows = result.rows;
         // Prevent result.deinit from freeing the rows (we've transferred ownership)
         result.rows = .empty;
+
+        if (self.result_cache != null and parsed.statement == .Select) {
+            const sql_hash = query_cache.QueryHasher.hashQuery(sql);
+            self.result_cache.?.put(sql_hash, sql, result_set.rows.items) catch {};
+        }
 
         return result_set;
     }
@@ -465,11 +557,87 @@ pub const Connection = struct {
                 }
                 return column_names;
             },
+            .Insert => |insert| {
+                if (insert.returning) |ret| {
+                    return try self.extractReturningColumnNames(insert.table, ret.columns);
+                }
+                return try self.allocator.alloc([]const u8, 0);
+            },
+            .Update => |update| {
+                if (update.returning) |ret| {
+                    return try self.extractReturningColumnNames(update.table, ret.columns);
+                }
+                return try self.allocator.alloc([]const u8, 0);
+            },
+            .Delete => |delete| {
+                if (delete.returning) |ret| {
+                    return try self.extractReturningColumnNames(delete.table, ret.columns);
+                }
+                return try self.allocator.alloc([]const u8, 0);
+            },
             else => {
                 // Non-SELECT statements have no columns
                 return try self.allocator.alloc([]const u8, 0);
             },
         }
+    }
+
+    fn extractReturningColumnNames(self: *Self, table_name: []const u8, columns: [][]const u8) ![][]const u8 {
+        if (columns.len == 1 and std.mem.eql(u8, columns[0], "*")) {
+            const table = self.storage_engine.getTable(table_name);
+            if (table) |t| {
+                var all_columns = try self.allocator.alloc([]const u8, t.schema.columns.len);
+                for (t.schema.columns, 0..) |column, i| {
+                    all_columns[i] = try self.allocator.dupe(u8, column.name);
+                }
+                return all_columns;
+            }
+        }
+
+        var names = try self.allocator.alloc([]const u8, columns.len);
+        for (columns, 0..) |column, i| {
+            names[i] = try self.allocator.dupe(u8, column);
+        }
+        return names;
+    }
+
+    fn extractColumnNamesFromSql(self: *Self, sql: []const u8) ![][]const u8 {
+        var parsed = try parser.parse(self.allocator, sql);
+        defer parsed.deinit();
+        return try self.extractColumnNames(&parsed.statement);
+    }
+
+    fn cloneCachedRows(allocator: std.mem.Allocator, rows: []storage.Row) !std.ArrayListUnmanaged(storage.Row) {
+        var cloned: std.ArrayListUnmanaged(storage.Row) = .empty;
+        errdefer {
+            for (cloned.items) |row| {
+                for (row.values) |value| {
+                    value.deinit(allocator);
+                }
+                allocator.free(row.values);
+            }
+            cloned.deinit(allocator);
+        }
+
+        try cloned.ensureTotalCapacity(allocator, rows.len);
+        for (rows) |row| {
+            var values = try allocator.alloc(storage.Value, row.values.len);
+            var values_initialized: usize = 0;
+            errdefer {
+                for (values[0..values_initialized]) |value| {
+                    value.deinit(allocator);
+                }
+                allocator.free(values);
+            }
+
+            for (row.values, 0..) |value, i| {
+                values[i] = try value.clone(allocator);
+                values_initialized = i + 1;
+            }
+            cloned.appendAssumeCapacity(storage.Row{ .values = values });
+        }
+
+        return cloned;
     }
 
     // ========== END BROAD API SURFACES ==========
@@ -524,6 +692,19 @@ pub const Connection = struct {
         };
     }
 
+    /// Set query result cache for this connection
+    pub fn setResultCache(self: *Self, cache: *query_cache.QueryCache) void {
+        self.result_cache = cache;
+    }
+
+    /// Invalidate query result cache entries for a specific table
+    /// Called by VM after INSERT/UPDATE/DELETE operations
+    pub fn invalidateResultCache(self: *Self, table_name: []const u8) void {
+        if (self.result_cache) |cache| {
+            cache.invalidateTable(table_name) catch {};
+        }
+    }
+
     /// Attach an external database file with a schema name
     /// SECURITY: Path is validated against the connection's attach_path_policy
     pub fn attachDatabase(self: *Self, file_path: []const u8, schema_name: []const u8) !void {
@@ -541,8 +722,13 @@ pub const Connection = struct {
         const validated_path = try self.attach_path_policy.validatePath(self.allocator, file_path);
         defer self.allocator.free(validated_path);
 
-        // Open connection to the external database using validated path
-        const attached_conn = try Self.open(self.allocator, validated_path);
+        // Open connection to the external database using validated path.
+        // Keep :memory: attachments on the in-memory path so ATTACH DATABASE ':memory:'
+        // does not go through file-backed startup and leak/load bogus state.
+        const attached_conn = if (std.mem.eql(u8, validated_path, ":memory:"))
+            try Self.openMemoryWithOptions(self.allocator, .{ .attach_policy = self.attach_path_policy })
+        else
+            try Self.openWithOptions(self.allocator, validated_path, .{ .attach_policy = self.attach_path_policy });
         errdefer attached_conn.close();
 
         // Inherit the same path policy to attached databases

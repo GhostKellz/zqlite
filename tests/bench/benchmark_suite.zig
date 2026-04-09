@@ -25,9 +25,7 @@ const BenchmarkResult = struct {
 };
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{
-        .safety = false, // Disable strict ordering checks for benchmarks
-    }){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leaked = gpa.deinit();
         if (leaked == .leak) {

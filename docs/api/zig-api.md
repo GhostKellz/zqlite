@@ -1,6 +1,4 @@
-# ZQLite API Reference
-
-**Version:** 1.5.3
+# ZQLite Zig API Reference
 
 ## Core API
 

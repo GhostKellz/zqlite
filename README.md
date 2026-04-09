@@ -1,354 +1,142 @@
-<div align="center">
-  <img src="assets/zqlite-logo.png" alt="ZQLite Logo" width="200" height="200">
-</div>
+<h1 align="center">ZQLite</h1>
 
-# zqlite 🚀🔐
+<p align="center">
+  <strong>Embedded SQL Database in Pure Zig</strong>
+</p>
 
-![Zig](https://img.shields.io/badge/zig-0.16.0--dev-f7a41d?style=flat-square)
-![Status](https://img.shields.io/badge/status-beta-yellow?style=flat-square)
-![Crypto](https://img.shields.io/badge/PQC-experimental-orange?style=flat-square)
-![Platform](https://img.shields.io/badge/platform-cross--platform-lightgrey?style=flat-square)
-![Performance](https://img.shields.io/badge/performance-high--speed-brightgreen?style=flat-square)
+<p align="center">
+  <img src="https://img.shields.io/badge/Zig-F7A41D?style=for-the-badge&logo=zig&logoColor=white" alt="Zig">
+  <img src="https://img.shields.io/badge/SQLite_Compatible-003B57?style=for-the-badge&logo=sqlite&logoColor=white" alt="SQLite Compatible">
+  <img src="https://img.shields.io/badge/PostgreSQL_Features-4169E1?style=for-the-badge&logo=postgresql&logoColor=white" alt="PostgreSQL Features">
+  <img src="https://img.shields.io/badge/ChaCha20--Poly1305-8B5CF6?style=for-the-badge&logo=keycdn&logoColor=white" alt="ChaCha20-Poly1305">
+</p>
 
-> **High-performance embedded database and query engine for Zig**
-> A standalone embedded database offering SQLite compatibility with experimental post-quantum cryptographic features. Powers [Ghostchain](https://github.com/ghostkellz/ghostchain) and [Ghostwire](https://github.com/ghostkellz/ghostwire).
-
-**Note**: Post-quantum cryptography features (ML-KEM, ML-DSA, ZKP) are **experimental proof-of-concept** implementations. The core database engine (SQLite-compatible storage, SQL parsing, WAL) is the primary focus for production use.
-
----
-
-## 🌟 Key Features
-
-### 🗃️ **Core Database (Production Ready)**
-- **SQLite Compatibility**: Drop-in replacement for embedded applications
-- **PostgreSQL-style SQL**: Extended data types (UUID, JSON, timestamps)
-- **B+ Tree Storage**: Efficient indexing with Write-Ahead Logging (WAL)
-- **Zero Configuration**: Single-file database, no server setup required
-- **Memory-Safe**: Pure Zig implementation with no undefined behavior
-- **Interactive CLI**: Full SQL shell with tab completion
-
-### 🔐 **Encryption (Stable)**
-- **Field-Level Encryption**: ChaCha20-Poly1305 AEAD per column
-- **Secure Key Derivation**: Argon2 password hashing
-- **Transparent Encryption**: Automatic encrypt/decrypt on read/write
-
-### 🔮 **Post-Quantum Crypto (Experimental)**
-> ⚠️ **Proof of Concept** - Not for production use
-
-- **ML-KEM-768**: NIST post-quantum key encapsulation (experimental)
-- **ML-DSA-65**: Post-quantum digital signatures (experimental)
-- **Hybrid Signatures**: Ed25519 + ML-DSA (experimental)
-- **Bulletproofs ZKP**: Zero-knowledge range proofs (experimental)
-
-### 🌐 **Networking (Experimental)**
-- **QUIC Transport**: Modern UDP-based transport layer
-- **Hybrid Key Exchange**: X25519 + ML-KEM-768
-- **CNS Integration**: Ghostchain name resolution
+<p align="center">
+  <img src="https://img.shields.io/badge/Zero_Dependencies-22C55E?style=for-the-badge&logo=checkmarx&logoColor=white" alt="Zero Dependencies">
+  <img src="https://img.shields.io/badge/Memory_Safe-10B981?style=for-the-badge&logo=verified&logoColor=white" alt="Memory Safe">
+  <img src="https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker">
+  <img src="https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Linux">
+</p>
 
 ---
 
-## 🚀 Quick Start
+## What is ZQLite?
 
-### One-Line Installation
+An embedded SQL database written in Zig. SQLite-style simplicity with some PostgreSQL conveniences.
+
+**Stable features:**
+- SQL parser (SELECT, INSERT, UPDATE, DELETE, JOINs, aggregates, subqueries)
+- B+ tree storage with write-ahead logging
+- In-memory and file-based databases
+- Prepared statements with parameter binding
+- Field-level encryption (ChaCha20-Poly1305)
+- C FFI bindings
+
+**Experimental features** (not stable):
+- Post-quantum crypto scaffolding (ML-KEM, ML-DSA)
+- Transport layer hooks
+
+See [Stable vs Experimental](docs/security/stable-vs-experimental.md) for details.
+
+## Install
+
+Requires Zig 0.16.0-dev.2960 or later
+
 ```bash
-curl -sSL https://raw.githubusercontent.com/ghostkellz/zqlite/main/install.sh | bash
+# Tagged release (recommended)
+zig fetch --save https://github.com/ghostkellz/zqlite/archive/refs/tags/v1.6.0.tar.gz
+
+# Or main branch
+zig fetch --save https://github.com/ghostkellz/zqlite/archive/main.tar.gz
 ```
 
-### Zig Integration
-```bash
-zig fetch --save https://github.com/ghostkellz/zqlite/archive/refs/heads/main.tar.gz
+```zig
+// build.zig
+const zqlite = b.dependency("zqlite", .{});
+exe.root_module.addImport("zqlite", zqlite.module("zqlite"));
 ```
 
-### Manual Installation
-```bash
-git clone https://github.com/ghostkellz/zqlite
-cd zqlite
-zig build
-./zig-out/bin/zqlite shell
-```
+## Usage
 
-### Run Post-Quantum Demos
-```bash
-# Showcase all new features
-zig build run-pq-showcase
-
-# CNS Ghostchain integration demo
-zig build run-cns-demo
-
-# Banking system with hybrid crypto
-zig build run-banking
-
-# Other examples
-zig build run-nextgen
-zig build run-powerdns
-```
-
----
-
-## 📋 Feature Status
-
-| Feature | Status | Notes |
-|---------|--------|-------|
-| SQL Parser | ✅ Stable | CREATE, INSERT, SELECT, UPDATE, DELETE, JOIN |
-| B+ Tree Storage | ✅ Stable | Efficient indexing and retrieval |
-| Write-Ahead Log | ✅ Stable | Durability and crash recovery |
-| Page-based Storage | ✅ Stable | 4KB pages with buffer pool |
-| In-Memory Mode | ✅ Stable | Fast ephemeral databases |
-| File-based Mode | ✅ Stable | Persistent storage |
-| Interactive CLI | ✅ Stable | SQL shell with dot commands |
-| ChaCha20-Poly1305 | ✅ Stable | Field-level encryption |
-| Connection Pooling | ✅ Stable | Multi-connection support |
-| ML-KEM-768 | 🧪 Experimental | Post-quantum key exchange |
-| ML-DSA-65 | 🧪 Experimental | Post-quantum signatures |
-| Bulletproofs ZKP | 🧪 Experimental | Zero-knowledge proofs |
-| QUIC Transport | 🧪 Experimental | Network layer |
-| CNS Adapter | 🧪 Experimental | Ghostchain integration |
-
----
-
-## 🛠 Usage Examples
-
-### Basic Database Operations
 ```zig
 const zqlite = @import("zqlite");
 
-// Open a file-based database
-const conn = try zqlite.open(allocator, "mydata.db");
-defer conn.close();
+pub fn main() !void {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
-// Create a table
-try conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);");
+    const conn = try zqlite.openMemory(allocator);
+    defer conn.close();
 
-// Insert data
-try conn.execute("INSERT INTO users (id, name, email) VALUES (1, 'Alice', 'alice@example.com');");
+    try conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+    try conn.execute("INSERT INTO users (name) VALUES ('Alice')");
 
-// Query with results
-var result = try conn.query("SELECT * FROM users WHERE id = 1;");
-defer result.deinit();
+    var stmt = try conn.prepare("SELECT * FROM users WHERE name = ?");
+    defer stmt.deinit();
 
-while (result.next()) |row| {
-    const name = row.getTextByName("name");
-    std.debug.print("User: {s}\n", .{name orelse "unknown"});
+    try stmt.bind(0, "Alice");
+    var result = try stmt.execute();
+    defer result.deinit();
+
+    for (result.rows.items) |row| {
+        // process row
+    }
 }
 ```
 
-### In-Memory Database
-```zig
-// Create an in-memory database (no file I/O)
-const conn = try zqlite.openMemory(allocator);
-defer conn.close();
-
-// Use like any other database
-try conn.execute("CREATE TABLE temp (value INTEGER);");
-_ = try conn.exec("INSERT INTO temp VALUES (42);");
-```
-
-### Transactions
-```zig
-// Manual transaction control
-try conn.begin();
-errdefer conn.rollback() catch {};
-
-try conn.execute("INSERT INTO accounts VALUES (1, 1000);");
-try conn.execute("INSERT INTO accounts VALUES (2, 500);");
-
-try conn.commit();
-```
-
-### Prepared Statements
-```zig
-// Prepare for repeated execution
-var stmt = try conn.prepare("INSERT INTO users (name, email) VALUES (?, ?);");
-defer stmt.deinit();
-
-try stmt.bind(0, "Bob");
-try stmt.bind(1, "bob@example.com");
-_ = try stmt.execute();
-```
-
-### Experimental: Post-Quantum Crypto
-> ⚠️ These APIs are experimental and subject to change
-
-```zig
-// See src/crypto/ for experimental PQC features
-// These are proof-of-concept implementations
-```
-
----
-
-## 🏗 Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    zqlite Architecture                     │
-├─────────────────────────────────────────────────────────────┤
-│  SQL Interface & CLI  │  Examples & Demos  │  Public API   │
-├─────────────────────────────────────────────────────────────┤
-│           Post-Quantum QUIC Transport Layer                │
-│  ┌─────────────────┐ ┌─────────────────┐ ┌──────────────┐ │
-│  │   PQ-QUIC      │ │  ZKP Queries    │ │ Hybrid Sigs  │ │
-│  │  ML-KEM + X25519│ │  Bulletproofs   │ │ Ed25519+MLDSA│ │
-│  └─────────────────┘ └─────────────────┘ └──────────────┘ │
-├─────────────────────────────────────────────────────────────┤
-│              Enhanced Crypto Engine (zcrypto)              │
-│  ┌─────────────────┐ ┌─────────────────┐ ┌──────────────┐ │
-│  │  ML-KEM-768    │ │   ML-DSA-65     │ │  ChaCha20    │ │
-│  │  Post-Quantum  │ │  PQ Signatures  │ │  Poly1305    │ │
-│  │  Key Exchange  │ │   + Ed25519     │ │  AEAD        │ │
-│  └─────────────────┘ └─────────────────┘ └──────────────┘ │
-├─────────────────────────────────────────────────────────────┤
-│                    Core Database Engine                     │
-│  ┌─────────────────┐ ┌─────────────────┐ ┌──────────────┐ │
-│  │   SQL Parser   │ │    B+ Trees     │ │     WAL      │ │
-│  │   & Executor   │ │   + Indexes     │ │   Logging    │ │
-│  └─────────────────┘ └─────────────────┘ └──────────────┘ │
-├─────────────────────────────────────────────────────────────┤
-│                    Storage & Memory                         │
-│           File System  │  Memory Pools  │  Page Cache     │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 📊 Performance
-
-zqlite delivers cutting-edge performance:
-
-### Post-Quantum Operations
-- **ML-KEM-768 Keygen**: >50,000 ops/sec
-- **ML-KEM-768 Encaps/Decaps**: >30,000 ops/sec  
-- **Hybrid Key Exchange**: >25,000 ops/sec
-- **ML-DSA-65 Signing**: >15,000 ops/sec
-
-### QUIC Transport
-- **PQ Handshake**: <2ms
-- **Packet Encryption**: >10M packets/sec
-- **Zero-Copy Processing**: Minimal overhead
-
-### Traditional Database
-- **Inserts**: >100,000 ops/sec
-- **Queries**: >500,000 ops/sec
-- **Memory Usage**: <10MB baseline
-
----
-
-## 🎯 Use Cases
-
-### 🏦 **Financial Services**
-- Post-quantum secure banking databases
-- Zero-knowledge compliance reporting
-- Quantum-safe transaction processing
-- Privacy-preserving financial analytics
-
-### 🏥 **Healthcare & Privacy**
-- HIPAA-compliant patient databases
-- Zero-knowledge medical research
-- Quantum-safe health records
-- Private genomic data storage
-
-### 🌐 **DNS & Networking**
-- Post-quantum DNSSEC databases
-- Secure DNS record storage
-- Quantum-safe name resolution
-- High-performance DNS servers
-
-### 🔐 **Cryptocurrency & Blockchain**
-- Quantum-resistant wallet databases
-- Zero-knowledge transaction proofs
-- Post-quantum consensus systems
-- Private DeFi applications
-
-### 🎮 **Gaming & Real-Time**
-- Secure multiplayer databases
-- Anti-cheat with zero-knowledge
-- Real-time encrypted data sync
-- Privacy-preserving leaderboards
-
----
-
-## 🧪 Testing
-
-Run the comprehensive test suite:
+## Build from Source
 
 ```bash
-# All tests
+git clone https://github.com/ghostkellz/zqlite.git
+cd zqlite
+zig build
 zig build test
-
-# Specific test categories
-zig build test -- --filter "crypto"
-zig build test -- --filter "post_quantum"
-zig build test -- --filter "zkp"
 ```
 
-### Test Coverage
-- ✅ NIST post-quantum test vectors (ML-KEM, ML-DSA)
-- ✅ Zero-knowledge proof correctness
-- ✅ QUIC crypto operations  
-- ✅ Hybrid signature verification
-- ✅ Database encryption/decryption
-- ✅ SQL compatibility
-- ✅ Performance benchmarks
+## Test
 
----
+```bash
+zig build test                    # Unit tests
+zig build test-security           # Security tests
+zig build test-memory-leaks       # Memory leak detection
+zig build test-comprehensive      # Full test suite
+```
 
-## 📈 Roadmap
+Docker testing:
+```bash
+docker-compose -f docker/docker-compose.yml run --rm zqlite-full
+```
 
-### Future Enhancements
-- **Formal Verification**: Mathematical proof of security properties
-- **Hardware Security Modules**: HSM integration for key storage
-- **Machine Learning Security**: AI-powered threat detection
-- **Quantum Key Distribution**: QKD protocol support
-- **Multi-Party Computation**: Secure distributed queries
-- **Homomorphic Encryption**: Compute on encrypted data
-- **Advanced ZKP**: Recursive proofs and STARKs
-- **Cross-Language Bindings**: Python, Go, Rust FFI
+## Documentation
 
----
+- [Installation](docs/getting-started/installation.md)
+- [Quickstart](docs/getting-started/quickstart.md)
+- [Zig API](docs/api/zig-api.md)
+- [C API](docs/api/c-api.md)
+- [Transactions](docs/guides/transactions.md)
+- [Encryption](docs/guides/encryption.md)
+- [Secure Mode](docs/guides/secure-mode.md)
+- [SQLite Compatibility](docs/compatibility/sqlite.md)
+- [PostgreSQL Features](docs/compatibility/postgresql.md)
 
-## 🤝 Contributing
+## Project Status
 
-We welcome contributions! zqlite represents the cutting edge of cryptographic database technology.
+**v1.6.0** - Beta
 
-### Getting Started
-1. Fork the repository
-2. Create a feature branch
-3. Add tests for new functionality  
-4. Ensure all tests pass
-5. Submit a pull request
+Core database functionality is stable and tested. The project is under active development.
 
-### Areas of Interest
-- Post-quantum cryptography optimizations
-- Zero-knowledge proof systems
-- QUIC transport improvements
-- New database features
-- Performance optimizations
+What works well:
+- Basic CRUD operations
+- JOINs, GROUP BY, ORDER BY, LIMIT
+- RETURNING clause, ON CONFLICT (upsert)
+- Prepared statements
+- Encryption at rest
 
----
+What's still experimental:
+- Post-quantum crypto (scaffolding only)
+- Some edge cases in complex queries
 
-## 📄 License
+## License
 
-MIT License - see [LICENSE](LICENSE) for details.
-
----
-
-## 🙏 Acknowledgments
-
-- **zcrypto**: [@ghostkellz](https://github.com/ghostkellz) for world-class post-quantum cryptography
-- **NIST**: For standardizing ML-KEM and ML-DSA algorithms
-- **Zig Team**: For the amazing systems programming language
-- **Community**: For feedback, testing, and contributions
-
----
-
-## 📞 Support & Community
-
-- **GitHub Issues**: Bug reports and feature requests
-- **Discussions**: Community support and questions  
-- **Discord**: Real-time chat (link in issues)
-- **Documentation**: Complete API reference in `/docs`
-
----
-
-**🚀 zqlite - The world's most advanced post-quantum cryptographic database!**
-
-*Ready for the quantum computing era* 🌟
+MIT

@@ -829,10 +829,7 @@ pub const BTree = struct {
             .JSON => |json| storage.Value{ .JSON = try self.allocator.dupe(u8, json) },
             .JSONB => |jsonb| storage.Value{ .JSONB = storage.JSONBValue.init(self.allocator, try jsonb.toString(self.allocator)) catch return storage.Value.Null },
             .UUID => |uuid| storage.Value{ .UUID = uuid },
-            .Array => |array| storage.Value{ .Array = storage.ArrayValue{
-                .element_type = array.element_type,
-                .elements = try self.allocator.dupe(storage.Value, array.elements),
-            } },
+            .Array => |array| storage.Value{ .Array = try array.clone(self.allocator) },
             .Boolean => |b| storage.Value{ .Boolean = b },
             .Timestamp => |ts| storage.Value{ .Timestamp = ts },
             .TimestampTZ => |tstz| storage.Value{ .TimestampTZ = tstz },
@@ -1329,6 +1326,138 @@ pub const Node = struct {
                     const param_index = std.mem.readInt(u32, buffer[pos..][0..4], .little);
                     pos += 4;
                     break :blk storage.Value{ .Parameter = param_index };
+                },
+                6 => blk: {
+                    // JSON
+                    if (buffer.len < pos + 4) return error.BufferTooSmall;
+                    const len = std.mem.readInt(u32, buffer[pos..][0..4], .little);
+                    pos += 4;
+                    if (buffer.len < pos + len) return error.BufferTooSmall;
+                    const json = try allocator.alloc(u8, len);
+                    @memcpy(json, buffer[pos..][0..len]);
+                    pos += len;
+                    break :blk storage.Value{ .JSON = json };
+                },
+                7 => blk: {
+                    // JSONB (stored as JSON text, parsed on load)
+                    if (buffer.len < pos + 4) return error.BufferTooSmall;
+                    const len = std.mem.readInt(u32, buffer[pos..][0..4], .little);
+                    pos += 4;
+                    if (buffer.len < pos + len) return error.BufferTooSmall;
+                    const json_text = buffer[pos..][0..len];
+                    pos += len;
+                    const jsonb = storage.JSONBValue.init(allocator, json_text) catch {
+                        break :blk storage.Value.Null;
+                    };
+                    break :blk storage.Value{ .JSONB = jsonb };
+                },
+                8 => blk: {
+                    // UUID
+                    if (buffer.len < pos + 16) return error.BufferTooSmall;
+                    var uuid: [16]u8 = undefined;
+                    @memcpy(&uuid, buffer[pos..][0..16]);
+                    pos += 16;
+                    break :blk storage.Value{ .UUID = uuid };
+                },
+                9 => blk: {
+                    // Array (stored as JSON text, parsed on load)
+                    if (buffer.len < pos + 4) return error.BufferTooSmall;
+                    const len = std.mem.readInt(u32, buffer[pos..][0..4], .little);
+                    pos += 4;
+                    if (buffer.len < pos + len) return error.BufferTooSmall;
+                    // For now, store as empty array - full array deserialization would need type info
+                    pos += len;
+                    break :blk storage.Value{ .Array = storage.ArrayValue{
+                        .element_type = .Text,
+                        .elements = &[_]storage.Value{},
+                    } };
+                },
+                10 => blk: {
+                    // Boolean
+                    if (buffer.len < pos + 1) return error.BufferTooSmall;
+                    const b = buffer[pos] != 0;
+                    pos += 1;
+                    break :blk storage.Value{ .Boolean = b };
+                },
+                11 => blk: {
+                    // Timestamp
+                    if (buffer.len < pos + 8) return error.BufferTooSmall;
+                    const ts = std.mem.readInt(i64, buffer[pos..][0..8], .little);
+                    pos += 8;
+                    break :blk storage.Value{ .Timestamp = ts };
+                },
+                12 => blk: {
+                    // TimestampTZ
+                    if (buffer.len < pos + 12) return error.BufferTooSmall;
+                    const ts = std.mem.readInt(i64, buffer[pos..][0..8], .little);
+                    pos += 8;
+                    const tz_len = std.mem.readInt(u32, buffer[pos..][0..4], .little);
+                    pos += 4;
+                    if (buffer.len < pos + tz_len) return error.BufferTooSmall;
+                    const tz = try allocator.alloc(u8, tz_len);
+                    @memcpy(tz, buffer[pos..][0..tz_len]);
+                    pos += tz_len;
+                    break :blk storage.Value{ .TimestampTZ = storage.TimestampTZValue{
+                        .timestamp = ts,
+                        .timezone = tz,
+                    } };
+                },
+                13 => blk: {
+                    // Date
+                    if (buffer.len < pos + 4) return error.BufferTooSmall;
+                    const d = std.mem.readInt(i32, buffer[pos..][0..4], .little);
+                    pos += 4;
+                    break :blk storage.Value{ .Date = d };
+                },
+                14 => blk: {
+                    // Time
+                    if (buffer.len < pos + 8) return error.BufferTooSmall;
+                    const t = std.mem.readInt(i64, buffer[pos..][0..8], .little);
+                    pos += 8;
+                    break :blk storage.Value{ .Time = t };
+                },
+                15 => blk: {
+                    // Interval
+                    if (buffer.len < pos + 8) return error.BufferTooSmall;
+                    const interval = std.mem.readInt(i64, buffer[pos..][0..8], .little);
+                    pos += 8;
+                    break :blk storage.Value{ .Interval = interval };
+                },
+                16 => blk: {
+                    // Numeric
+                    if (buffer.len < pos + 9) return error.BufferTooSmall;
+                    const precision = std.mem.readInt(u16, buffer[pos..][0..2], .little);
+                    pos += 2;
+                    const scale = std.mem.readInt(u16, buffer[pos..][0..2], .little);
+                    pos += 2;
+                    const is_negative = buffer[pos] != 0;
+                    pos += 1;
+                    const digits_len = std.mem.readInt(u32, buffer[pos..][0..4], .little);
+                    pos += 4;
+                    if (buffer.len < pos + digits_len) return error.BufferTooSmall;
+                    const digits = try allocator.alloc(u8, digits_len);
+                    @memcpy(digits, buffer[pos..][0..digits_len]);
+                    pos += digits_len;
+                    break :blk storage.Value{ .Numeric = storage.NumericValue{
+                        .precision = precision,
+                        .scale = scale,
+                        .is_negative = is_negative,
+                        .digits = digits,
+                    } };
+                },
+                17 => blk: {
+                    // SmallInt
+                    if (buffer.len < pos + 2) return error.BufferTooSmall;
+                    const si = std.mem.readInt(i16, buffer[pos..][0..2], .little);
+                    pos += 2;
+                    break :blk storage.Value{ .SmallInt = si };
+                },
+                18 => blk: {
+                    // BigInt
+                    if (buffer.len < pos + 8) return error.BufferTooSmall;
+                    const bi = std.mem.readInt(i64, buffer[pos..][0..8], .little);
+                    pos += 8;
+                    break :blk storage.Value{ .BigInt = bi };
                 },
                 else => return error.InvalidValueType,
             };

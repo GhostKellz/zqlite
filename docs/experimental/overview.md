@@ -60,7 +60,7 @@ A demonstration of post-quantum secure database transport combining QUIC with ML
 Post-quantum key encapsulation and digital signatures based on NIST standards.
 
 **Current Limitations:**
-- Full implementation requires Shroud cryptographic backend
+- PQ algorithms (ML-KEM, ML-DSA) are experimental scaffolding only
 - `hybrid_mode` flag signals intent but falls back to classical crypto
 - No actual ML-KEM encapsulation or ML-DSA signing
 - ZKP (zero-knowledge proofs) support is stubbed

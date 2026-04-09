@@ -112,11 +112,11 @@ pub const CryptoEngine = struct {
     }
 
     /// Enable post-quantum only mode.
-    /// Note: Full post-quantum support requires the Shroud backend.
-    /// This enables hybrid mode flag which uses PQ algorithms where available.
+    /// Note: PQ algorithms (ML-KEM, ML-DSA) are experimental scaffolding only.
+    /// This enables hybrid mode flag which uses PQ algorithms when implemented.
     pub fn enablePostQuantumOnlyMode(self: *Self) void {
         self.hybrid_mode = true;
-        // When Shroud backend is integrated, this will switch to PQ-only algorithms:
+        // PQ algorithms not yet implemented:
         // - ML-KEM-768 for key encapsulation
         // - ML-DSA-65 for digital signatures
         // For now, hybrid_mode flag signals intent to use PQ when available
@@ -147,7 +147,10 @@ pub const CryptoEngine = struct {
 
     /// Generate secure keypair (classical Ed25519)
     pub fn generateKeyPair(self: *Self) !KeyPair {
-        _ = self;
+        if (self.hybrid_mode and !self.crypto.hasPQCrypto()) {
+            std.log.warn("EXPERIMENTAL: Post-quantum crypto requested but unavailable; falling back to classical Ed25519.", .{});
+        }
+
         // Use native Ed25519 for classical crypto
         var seed: [64]u8 = undefined;
         std.crypto.random.bytes(&seed);
@@ -272,7 +275,7 @@ pub const CryptoEngine = struct {
 
     /// Enable zero-knowledge proofs (if backend supports it)
     pub fn enableZKP(self: *Self) void {
-        // ZKP is automatically enabled if Shroud backend is available
+        // ZKP is experimental scaffolding - not yet implemented
         _ = self; // Placeholder for future implementation
     }
 

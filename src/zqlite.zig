@@ -187,9 +187,37 @@ pub fn printBuildInfo() void {
     if (build_options.enable_ffi) std.debug.print("    - C API (FFI)\n", .{});
 }
 
+// Import crypto interface for PQ capability (always available)
+const crypto_interface = @import("crypto/interface.zig");
+
+/// Query post-quantum cryptography capability status
+/// Returns detailed information about PQ crypto availability and algorithms
+pub const PQCapability = crypto_interface.PQCapability;
+
+/// Get current PQ capability status
+pub fn getPQCapability() PQCapability {
+    return crypto_interface.getPQCapability();
+}
+
+/// Get full crypto module status
+pub fn getCryptoStatus() @TypeOf(crypto_interface.getCryptoStatus()) {
+    return crypto_interface.getCryptoStatus();
+}
+
+/// Print PQ capability status for diagnostics
+pub fn printPQStatus() void {
+    const pq = getPQCapability();
+    std.debug.print("Post-Quantum Crypto Status:\n", .{});
+    std.debug.print("  Compiled: {}\n", .{pq.compiled});
+    std.debug.print("  Enabled: {}\n", .{pq.enabled});
+    std.debug.print("  Backend: {s}\n", .{@tagName(pq.backend)});
+    std.debug.print("  Algorithms: {s}\n", .{pq.algorithmSummary()});
+    std.debug.print("  Status: {s}\n", .{pq.status_message});
+}
+
 // Tests
 test "zqlite version info" {
-    try std.testing.expect(std.mem.eql(u8, version.VERSION_STRING, "1.5.4"));
+    try std.testing.expect(std.mem.eql(u8, version.VERSION_STRING, "1.6.0"));
 }
 
 test "build info contains version" {

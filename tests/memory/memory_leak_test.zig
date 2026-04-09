@@ -6,9 +6,7 @@ const zqlite = @import("zqlite");
 /// vm.executeTableScan, vm.executeFilter, vm.executeProject
 /// Run with: zig build test-memory-leaks
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{
-        .stack_trace_frames = 16,
-    }){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leaked = gpa.deinit();
         if (leaked == .ok) {

@@ -1,8 +1,8 @@
 const std = @import("std");
-const zqlite = @import("src/zqlite.zig");
+const zqlite = @import("zqlite");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leaked = gpa.deinit();
         if (leaked == .leak) {

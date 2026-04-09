@@ -3,7 +3,7 @@ const testing = std.testing;
 const zqlite = @import("zqlite");
 
 test "Memory Management - No Leaks with DEFAULT CURRENT_TIMESTAMP" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .track_allocations = true }){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leaked = gpa.deinit();
         if (leaked != .ok) {
@@ -35,7 +35,7 @@ test "Memory Management - No Leaks with DEFAULT CURRENT_TIMESTAMP" {
 }
 
 test "Memory Management - Complex INSERT/UPDATE/DELETE Cycle" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .track_allocations = true }){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leaked = gpa.deinit();
         if (leaked != .ok) {
@@ -82,7 +82,7 @@ test "Memory Management - Complex INSERT/UPDATE/DELETE Cycle" {
 }
 
 test "Memory Management - Function Call DEFAULT Values" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .track_allocations = true }){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leaked = gpa.deinit();
         if (leaked != .ok) {
@@ -124,7 +124,7 @@ test "Memory Management - Function Call DEFAULT Values" {
 }
 
 test "Memory Management - Large Text Fields" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .track_allocations = true }){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leaked = gpa.deinit();
         if (leaked != .ok) {
@@ -167,7 +167,7 @@ test "Memory Management - Large Text Fields" {
 }
 
 test "Memory Management - Connection Lifecycle" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .track_allocations = true }){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leaked = gpa.deinit();
         if (leaked != .ok) {
@@ -196,7 +196,7 @@ test "Memory Management - Connection Lifecycle" {
 }
 
 test "Memory Management - Prepared Statement Reuse" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .track_allocations = true }){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leaked = gpa.deinit();
         if (leaked != .ok) {

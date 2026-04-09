@@ -3,7 +3,7 @@ const testing = std.testing;
 const zqlite = @import("zqlite");
 
 test "SQLite Basic CRUD Operations" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -35,7 +35,7 @@ test "SQLite Basic CRUD Operations" {
 }
 
 test "SQLite Data Types Support" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -84,7 +84,7 @@ test "SQLite Data Types Support" {
 }
 
 test "SQLite WHERE Clauses and Filtering" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -118,7 +118,7 @@ test "SQLite WHERE Clauses and Filtering" {
 }
 
 test "SQLite UPDATE and DELETE Operations" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -161,7 +161,7 @@ test "SQLite UPDATE and DELETE Operations" {
 }
 
 test "SQLite JOINS" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -195,7 +195,11 @@ test "SQLite JOINS" {
 }
 
 test "SQLite GROUP BY and Aggregation" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    try runGroupByAggregationExecution();
+}
+
+pub fn runGroupByAggregationExecution() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -217,15 +221,24 @@ test "SQLite GROUP BY and Aggregation" {
 
     try testing.expect(result.rows.items.len == 2);
 
-    // Check North region total
-    switch (result.rows.items[0].values[1]) {
-        .Real => |total| try testing.expect(@abs(total - 2500.0) < 0.01),
-        else => return error.UnexpectedValueType,
+    var found_north = false;
+    for (result.rows.items) |row| {
+        if (row.values.len < 2) return error.UnexpectedValueType;
+        if (row.values[0] == .Text and std.mem.eql(u8, row.values[0].Text, "North")) {
+            found_north = true;
+            switch (row.values[1]) {
+                .Real => |total| try testing.expect(@abs(total - 2500.0) < 0.01),
+                .Integer => |total| try testing.expectEqual(@as(i64, 2500), total),
+                else => return error.UnexpectedValueType,
+            }
+        }
     }
+
+    try testing.expect(found_north);
 }
 
 test "SQLite DEFAULT CURRENT_TIMESTAMP" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -255,4 +268,165 @@ test "SQLite DEFAULT CURRENT_TIMESTAMP" {
         },
         else => return error.ExpectedTimestamp,
     }
+}
+
+test "SQLite INSERT RETURNING execution" {
+    try runInsertReturningExecution();
+}
+
+pub fn runInsertReturningExecution() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const conn = try zqlite.open(allocator, ":memory:");
+    defer conn.close();
+
+    try conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER DEFAULT 21)");
+
+    var result = try conn.query("INSERT INTO users (id, name) VALUES (1, 'Alice') RETURNING id, name, age");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.count());
+    var row = result.next().?;
+    defer row.deinit();
+    try testing.expectEqual(@as(usize, 3), row.columnCount());
+    try testing.expectEqual(@as(i64, 1), row.getIntByName("id").?);
+    try testing.expectEqualStrings("Alice", row.getTextByName("name").?);
+    try testing.expectEqual(@as(i64, 21), row.getIntByName("age").?);
+}
+
+test "SQLite UPDATE RETURNING execution" {
+    try runUpdateReturningExecution();
+}
+
+pub fn runUpdateReturningExecution() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const conn = try zqlite.open(allocator, ":memory:");
+    defer conn.close();
+
+    try conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+    try conn.execute("INSERT INTO users VALUES (1, 'Alice')");
+    try conn.execute("INSERT INTO users VALUES (2, 'Bob')");
+
+    var result = try conn.query("UPDATE users SET name = 'Updated' WHERE id >= 1 RETURNING id, name");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 2), result.count());
+    var row1 = result.next().?;
+    defer row1.deinit();
+    var row2 = result.next().?;
+    defer row2.deinit();
+    try testing.expectEqualStrings("Updated", row1.getTextByName("name").?);
+    try testing.expectEqualStrings("Updated", row2.getTextByName("name").?);
+}
+
+test "SQLite DELETE RETURNING execution" {
+    try runDeleteReturningExecution();
+}
+
+pub fn runDeleteReturningExecution() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const conn = try zqlite.open(allocator, ":memory:");
+    defer conn.close();
+
+    try conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+    try conn.execute("INSERT INTO users VALUES (1, 'Alice')");
+    try conn.execute("INSERT INTO users VALUES (2, 'Bob')");
+
+    var result = try conn.query("DELETE FROM users WHERE id = 2 RETURNING id, name");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.count());
+    var row = result.next().?;
+    defer row.deinit();
+    try testing.expectEqual(@as(i64, 2), row.getIntByName("id").?);
+    try testing.expectEqualStrings("Bob", row.getTextByName("name").?);
+
+    var check = try conn.query("SELECT COUNT(*) FROM users");
+    defer check.deinit();
+    var check_row = check.next().?;
+    defer check_row.deinit();
+    try testing.expectEqual(@as(i64, 1), check_row.getInt(0).?);
+}
+
+test "SQLite ON CONFLICT DO NOTHING execution" {
+    try runOnConflictDoNothingExecution();
+}
+
+pub fn runOnConflictDoNothingExecution() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const conn = try zqlite.open(allocator, ":memory:");
+    defer conn.close();
+
+    try conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+    try conn.execute("INSERT INTO users VALUES (1, 'Alice')");
+    const affected = try conn.exec("INSERT INTO users VALUES (1, 'Bob') ON CONFLICT DO NOTHING");
+    try testing.expectEqual(@as(u32, 0), affected);
+
+    var result = try conn.query("SELECT name FROM users WHERE id = 1");
+    defer result.deinit();
+    var row = result.next().?;
+    defer row.deinit();
+    try testing.expectEqualStrings("Alice", row.getText(0).?);
+}
+
+test "SQLite ON CONFLICT DO UPDATE execution" {
+    try runOnConflictDoUpdateExecution();
+}
+
+pub fn runOnConflictDoUpdateExecution() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const conn = try zqlite.open(allocator, ":memory:");
+    defer conn.close();
+
+    try conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, active INTEGER)");
+    try conn.execute("INSERT INTO users VALUES (1, 'Alice', 1)");
+    const affected = try conn.exec("INSERT INTO users VALUES (1, 'Bob', 1) ON CONFLICT (id) DO UPDATE SET name = 'Bob' WHERE active = 1");
+    try testing.expectEqual(@as(u32, 1), affected);
+
+    var result = try conn.query("SELECT name FROM users WHERE id = 1");
+    defer result.deinit();
+    var row = result.next().?;
+    defer row.deinit();
+    try testing.expectEqualStrings("Bob", row.getText(0).?);
+}
+
+test "SQLite UPSERT with RETURNING execution" {
+    try runUpsertReturningExecution();
+}
+
+pub fn runUpsertReturningExecution() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const conn = try zqlite.open(allocator, ":memory:");
+    defer conn.close();
+
+    try conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+
+    var insert_result = try conn.query("INSERT INTO users VALUES (1, 'Alice') ON CONFLICT (id) DO UPDATE SET name = 'Alice' RETURNING id, name");
+    defer insert_result.deinit();
+    var insert_row = insert_result.next().?;
+    defer insert_row.deinit();
+    try testing.expectEqualStrings("Alice", insert_row.getTextByName("name").?);
+
+    var update_result = try conn.query("INSERT INTO users VALUES (1, 'Bob') ON CONFLICT (id) DO UPDATE SET name = 'Bob' RETURNING id, name");
+    defer update_result.deinit();
+    var update_row = update_result.next().?;
+    defer update_row.deinit();
+    try testing.expectEqualStrings("Bob", update_row.getTextByName("name").?);
 }

@@ -55,8 +55,9 @@ pub const PreparedStatement = struct {
             return error.ParameterTypeMismatch;
         }
 
-        // Store the bound parameter value
-        self.parameters[index] = value;
+        // Replace any previously bound owned value before storing the new one.
+        self.parameters[index].deinit(self.allocator);
+        self.parameters[index] = try value.clone(self.allocator);
     }
 
     /// Execute the prepared statement with bound parameters
@@ -333,10 +334,31 @@ pub const PreparedStatement = struct {
     /// Clone rows for caching
     fn cloneRows(self: *Self, rows: []storage.Row) ![]storage.Row {
         const cloned = try self.allocator.alloc(storage.Row, rows.len);
+        var rows_cloned: usize = 0;
+        errdefer {
+            for (cloned[0..rows_cloned]) |*row| {
+                row.deinit(self.allocator);
+            }
+            self.allocator.free(cloned);
+        }
+
         for (rows, 0..) |row, i| {
-            cloned[i] = storage.Row{
-                .values = try self.allocator.dupe(storage.Value, row.values),
-            };
+            const values = try self.allocator.alloc(storage.Value, row.values.len);
+            var values_cloned: usize = 0;
+            errdefer {
+                for (values[0..values_cloned]) |value| {
+                    value.deinit(self.allocator);
+                }
+                self.allocator.free(values);
+            }
+
+            for (row.values, 0..) |value, j| {
+                values[j] = try value.clone(self.allocator);
+                values_cloned = j + 1;
+            }
+
+            cloned[i] = storage.Row{ .values = values };
+            rows_cloned = i + 1;
         }
         return cloned;
     }
@@ -367,6 +389,9 @@ pub const PreparedStatement = struct {
         }
 
         if (self.parameters.len > 0) {
+            for (self.parameters) |param| {
+                param.deinit(self.allocator);
+            }
             self.allocator.free(self.parameters);
         }
 
@@ -381,6 +406,7 @@ pub const PreparedStatement = struct {
     /// Reset all bound parameters to Null (for reuse)
     pub fn resetParameters(self: *Self) void {
         for (self.parameters) |*param| {
+            param.deinit(self.allocator);
             param.* = storage.Value.Null;
         }
     }

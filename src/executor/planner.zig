@@ -326,11 +326,52 @@ pub const Planner = struct {
             try values.append(self.allocator, try cloned_row.toOwnedSlice(self.allocator));
         }
 
+        // Clone ON CONFLICT if provided
+        var on_conflict: ?OnConflictAction = null;
+        if (insert.on_conflict) |oc| {
+            switch (oc.action) {
+                .DoNothing => {
+                    on_conflict = .{ .DoNothing = {} };
+                },
+                .DoUpdate => |update| {
+                    var cloned_assignments: std.ArrayListUnmanaged(UpdateAssignment) = .empty;
+                    for (update.assignments) |assignment| {
+                        try cloned_assignments.append(self.allocator, UpdateAssignment{
+                            .column = try self.allocator.dupe(u8, assignment.column),
+                            .expr = try self.cloneExpression(assignment.expr),
+                        });
+                    }
+                    var cloned_condition: ?ast.Condition = null;
+                    if (update.where_clause) |where| {
+                        cloned_condition = try self.cloneCondition(&where.condition);
+                    }
+                    on_conflict = .{
+                        .DoUpdate = .{
+                            .assignments = try cloned_assignments.toOwnedSlice(self.allocator),
+                            .condition = cloned_condition,
+                        },
+                    };
+                },
+            }
+        }
+
+        // Clone RETURNING columns if provided
+        var returning_columns: ?[][]const u8 = null;
+        if (insert.returning) |ret| {
+            var cloned_ret: std.ArrayListUnmanaged([]const u8) = .empty;
+            for (ret.columns) |col| {
+                try cloned_ret.append(self.allocator, try self.allocator.dupe(u8, col));
+            }
+            returning_columns = try cloned_ret.toOwnedSlice(self.allocator);
+        }
+
         try steps.append(self.allocator, ExecutionStep{
             .Insert = InsertStep{
                 .table_name = try self.allocator.dupe(u8, insert.table),
                 .columns = columns,
                 .values = try values.toOwnedSlice(self.allocator),
+                .on_conflict = on_conflict,
+                .returning_columns = returning_columns,
             },
         });
 
@@ -432,11 +473,22 @@ pub const Planner = struct {
             condition = try self.cloneCondition(&where_clause.condition);
         }
 
+        // Clone RETURNING columns if provided
+        var returning_columns: ?[][]const u8 = null;
+        if (update.returning) |ret| {
+            var cloned_ret: std.ArrayListUnmanaged([]const u8) = .empty;
+            for (ret.columns) |col| {
+                try cloned_ret.append(self.allocator, try self.allocator.dupe(u8, col));
+            }
+            returning_columns = try cloned_ret.toOwnedSlice(self.allocator);
+        }
+
         try steps.append(self.allocator, ExecutionStep{
             .Update = UpdateStep{
                 .table_name = try self.allocator.dupe(u8, update.table),
                 .assignments = try assignments.toOwnedSlice(self.allocator),
                 .condition = condition,
+                .returning_columns = returning_columns,
             },
         });
 
@@ -455,10 +507,21 @@ pub const Planner = struct {
             condition = try self.cloneCondition(&where_clause.condition);
         }
 
+        // Clone RETURNING columns if provided
+        var returning_columns: ?[][]const u8 = null;
+        if (delete.returning) |ret| {
+            var cloned_ret: std.ArrayListUnmanaged([]const u8) = .empty;
+            for (ret.columns) |col| {
+                try cloned_ret.append(self.allocator, try self.allocator.dupe(u8, col));
+            }
+            returning_columns = try cloned_ret.toOwnedSlice(self.allocator);
+        }
+
         try steps.append(self.allocator, ExecutionStep{
             .Delete = DeleteStep{
                 .table_name = try self.allocator.dupe(u8, delete.table),
                 .condition = condition,
+                .returning_columns = returning_columns,
             },
         });
 
@@ -1292,11 +1355,37 @@ pub const LimitStep = struct {
     offset: u32,
 };
 
+/// On conflict action for UPSERT
+pub const OnConflictAction = union(enum) {
+    DoNothing: void,
+    DoUpdate: struct {
+        assignments: []UpdateAssignment,
+        condition: ?ast.Condition,
+    },
+
+    pub fn deinit(self: *OnConflictAction, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .DoUpdate => |*update| {
+                for (update.assignments) |*assignment| {
+                    @constCast(assignment).deinit(allocator);
+                }
+                allocator.free(update.assignments);
+                if (update.condition) |*cond| {
+                    cond.deinit(allocator);
+                }
+            },
+            .DoNothing => {},
+        }
+    }
+};
+
 /// Insert step
 pub const InsertStep = struct {
     table_name: []const u8,
     columns: ?[][]const u8,
     values: [][]storage.Value,
+    on_conflict: ?OnConflictAction,
+    returning_columns: ?[][]const u8,
 
     pub fn deinit(self: *InsertStep, allocator: std.mem.Allocator) void {
         // Free table name
@@ -1321,6 +1410,19 @@ pub const InsertStep = struct {
         }
         // Free the values array
         allocator.free(self.values);
+
+        // Free on_conflict
+        if (self.on_conflict) |*oc| {
+            oc.deinit(allocator);
+        }
+
+        // Free returning columns
+        if (self.returning_columns) |cols| {
+            for (cols) |col| {
+                allocator.free(col);
+            }
+            allocator.free(cols);
+        }
     }
 };
 
@@ -1347,6 +1449,7 @@ pub const UpdateStep = struct {
     table_name: []const u8,
     assignments: []UpdateAssignment,
     condition: ?ast.Condition,
+    returning_columns: ?[][]const u8,
 
     pub fn deinit(self: *UpdateStep, allocator: std.mem.Allocator) void {
         allocator.free(self.table_name);
@@ -1357,6 +1460,12 @@ pub const UpdateStep = struct {
         if (self.condition) |*cond| {
             cond.deinit(allocator);
         }
+        if (self.returning_columns) |cols| {
+            for (cols) |col| {
+                allocator.free(col);
+            }
+            allocator.free(cols);
+        }
     }
 };
 
@@ -1364,11 +1473,18 @@ pub const UpdateStep = struct {
 pub const DeleteStep = struct {
     table_name: []const u8,
     condition: ?ast.Condition,
+    returning_columns: ?[][]const u8,
 
     pub fn deinit(self: *DeleteStep, allocator: std.mem.Allocator) void {
         allocator.free(self.table_name);
         if (self.condition) |*cond| {
             cond.deinit(allocator);
+        }
+        if (self.returning_columns) |cols| {
+            for (cols) |col| {
+                allocator.free(col);
+            }
+            allocator.free(cols);
         }
     }
 };

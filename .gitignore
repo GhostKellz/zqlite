@@ -16,7 +16,11 @@ zig-pkg/
 *.db-shm
 *.wal
 :memory:
+:memory:-wal
 :memory:.wal
+
+# Valgrind core dumps
+vgcore.*
 
 # Logs
 *.log
@@ -53,3 +57,4 @@ archive/
 # Claude context
 .claude/
 CLAUDE.md
+tasks/

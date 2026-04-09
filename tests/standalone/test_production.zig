@@ -1,12 +1,11 @@
 const std = @import("std");
-const zqlite = @import("src/zqlite.zig");
-const shroud = @import("shroud");
+const zqlite = @import("zqlite");
 
 /// Production-ready test suite for ZQLite
 /// Tests all major components: SQL execution, async operations, PQ-QUIC transport,
 /// MVCC transactions, secure storage, and error handling
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

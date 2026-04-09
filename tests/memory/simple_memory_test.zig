@@ -3,7 +3,7 @@ const zqlite = @import("zqlite");
 
 /// Simple memory leak test that avoids triggering the btree bug
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const leaked = gpa.deinit();
         if (leaked == .leak) {

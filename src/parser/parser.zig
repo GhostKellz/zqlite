@@ -531,13 +531,138 @@ pub const Parser = struct {
             }
         }
 
+        // Parse optional ON CONFLICT clause
+        var on_conflict: ?ast.OnConflictClause = null;
+        if (std.meta.activeTag(self.current_token) == .On) {
+            on_conflict = try self.parseOnConflict();
+        }
+
+        // Parse optional RETURNING clause
+        var returning: ?ast.ReturningClause = null;
+        if (std.meta.activeTag(self.current_token) == .Returning) {
+            returning = try self.parseReturning();
+        }
+
         return ast.Statement{
             .Insert = ast.InsertStatement{
                 .table = table_name,
                 .columns = columns,
                 .values = try values.toOwnedSlice(self.allocator),
                 .or_conflict = or_conflict,
+                .on_conflict = on_conflict,
+                .returning = returning,
             },
+        };
+    }
+
+    /// Parse ON CONFLICT clause for UPSERT
+    fn parseOnConflict(self: *Self) !ast.OnConflictClause {
+        try self.expect(.On);
+        try self.expect(.Conflict);
+
+        // Parse optional target columns
+        var target_columns: ?[][]const u8 = null;
+        if (std.meta.activeTag(self.current_token) == .LeftParen) {
+            try self.advance();
+            var cols: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer cols.deinit(self.allocator);
+
+            while (true) {
+                const col = try self.expectIdentifier();
+                try cols.append(self.allocator, col);
+
+                if (std.meta.activeTag(self.current_token) == .Comma) {
+                    try self.advance();
+                } else {
+                    break;
+                }
+            }
+            try self.expect(.RightParen);
+            target_columns = try cols.toOwnedSlice(self.allocator);
+        }
+
+        try self.expect(.Do);
+
+        // Parse action: NOTHING or UPDATE
+        if (std.meta.activeTag(self.current_token) == .Nothing) {
+            try self.advance();
+            return ast.OnConflictClause{
+                .target_columns = target_columns,
+                .action = .{ .DoNothing = {} },
+            };
+        }
+
+        if (std.meta.activeTag(self.current_token) == .Update) {
+            try self.advance();
+            try self.expect(.Set);
+
+            // Parse assignments
+            var assignments: std.ArrayListUnmanaged(ast.Assignment) = .empty;
+            defer assignments.deinit(self.allocator);
+
+            while (true) {
+                const column = try self.expectIdentifier();
+                try self.expect(.Equal);
+                const expr = try self.parseExpression();
+
+                try assignments.append(self.allocator, ast.Assignment{
+                    .column = column,
+                    .expr = expr,
+                });
+
+                if (std.meta.activeTag(self.current_token) == .Comma) {
+                    try self.advance();
+                } else {
+                    break;
+                }
+            }
+
+            // Parse optional WHERE clause
+            var where_clause: ?ast.WhereClause = null;
+            if (std.meta.activeTag(self.current_token) == .Where) {
+                try self.advance();
+                where_clause = try self.parseWhere();
+            }
+
+            return ast.OnConflictClause{
+                .target_columns = target_columns,
+                .action = .{
+                    .DoUpdate = .{
+                        .assignments = try assignments.toOwnedSlice(self.allocator),
+                        .where_clause = where_clause,
+                    },
+                },
+            };
+        }
+
+        return error.UnexpectedToken;
+    }
+
+    /// Parse RETURNING clause
+    fn parseReturning(self: *Self) !ast.ReturningClause {
+        try self.expect(.Returning);
+
+        var columns: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer columns.deinit(self.allocator);
+
+        while (true) {
+            if (std.meta.activeTag(self.current_token) == .Asterisk) {
+                try self.advance();
+                try columns.append(self.allocator, try self.allocator.dupe(u8, "*"));
+            } else {
+                const col = try self.expectIdentifier();
+                try columns.append(self.allocator, col);
+            }
+
+            if (std.meta.activeTag(self.current_token) == .Comma) {
+                try self.advance();
+            } else {
+                break;
+            }
+        }
+
+        return ast.ReturningClause{
+            .columns = try columns.toOwnedSlice(self.allocator),
         };
     }
 
@@ -795,7 +920,14 @@ pub const Parser = struct {
         try self.expect(.Using);
 
         // Module name (fts5, fts4, etc.)
-        const module_name = try self.expectIdentifier();
+        const module_name = switch (self.current_token) {
+            .Identifier => try self.expectIdentifier(),
+            .Fts5 => blk: {
+                try self.advance();
+                break :blk try self.allocator.dupe(u8, "fts5");
+            },
+            else => return error.ExpectedIdentifier,
+        };
         errdefer self.allocator.free(module_name);
 
         // Column list (col1, col2, ...)
@@ -1000,11 +1132,18 @@ pub const Parser = struct {
             if (where_clause) |*wc| wc.deinit(self.allocator);
         }
 
+        // Parse optional RETURNING clause
+        var returning: ?ast.ReturningClause = null;
+        if (std.meta.activeTag(self.current_token) == .Returning) {
+            returning = try self.parseReturning();
+        }
+
         return ast.Statement{
             .Update = ast.UpdateStatement{
                 .table = table_name,
                 .assignments = try assignments.toOwnedSlice(self.allocator),
                 .where_clause = where_clause,
+                .returning = returning,
             },
         };
     }
@@ -1025,10 +1164,17 @@ pub const Parser = struct {
             if (where_clause) |*wc| wc.deinit(self.allocator);
         }
 
+        // Parse optional RETURNING clause
+        var returning: ?ast.ReturningClause = null;
+        if (std.meta.activeTag(self.current_token) == .Returning) {
+            returning = try self.parseReturning();
+        }
+
         return ast.Statement{
             .Delete = ast.DeleteStatement{
                 .table = table_name,
                 .where_clause = where_clause,
+                .returning = returning,
             },
         };
     }
@@ -2272,9 +2418,11 @@ pub const Parser = struct {
 
     /// Create detailed error message
     fn createError(self: *Self, expected: []const u8, context: []const u8) void {
-        // For now, just log the error. In production, you'd want to store
-        // the error details for better debugging.
-        std.log.err("Parse error at position {d}: Expected {s}, found {any} {s}", .{ self.tokenizer.position, expected, self.current_token, context });
+        // Error details are returned via the error union - no logging needed.
+        // Parse errors are often expected (e.g., rejecting SQL injection attempts).
+        _ = expected;
+        _ = context;
+        _ = self;
     }
 
     /// Expect a specific token
