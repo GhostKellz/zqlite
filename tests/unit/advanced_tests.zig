@@ -773,6 +773,34 @@ test "fts virtual table match query executes" {
     try std.testing.expectEqualStrings("Guide", result.rows.items[0].values[0].Text);
 }
 
+test "fts MATCH supports phrase and boolean operators" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const conn = try zqlite.open(allocator, ":memory:");
+    defer conn.close();
+
+    try conn.execute("CREATE VIRTUAL TABLE docs USING fts5(title, body)");
+    try conn.execute("INSERT INTO docs VALUES ('Guide', 'quantum safe storage guide')");
+    try conn.execute("INSERT INTO docs VALUES ('Fallback', 'classical fallback details')");
+    try conn.execute("INSERT INTO docs VALUES ('Hybrid', 'quantum fallback hybrid plan')");
+
+    var phrase = try conn.query("SELECT title FROM docs WHERE body MATCH '" ++ "\"safe storage\"'");
+    defer phrase.deinit();
+    try std.testing.expectEqual(@as(usize, 1), phrase.count());
+    try std.testing.expectEqualStrings("Guide", phrase.rows.items[0].values[0].Text);
+
+    var boolean_or = try conn.query("SELECT title FROM docs WHERE body MATCH 'quantum OR classical'");
+    defer boolean_or.deinit();
+    try std.testing.expectEqual(@as(usize, 3), boolean_or.count());
+
+    var boolean_not = try conn.query("SELECT title FROM docs WHERE body MATCH 'quantum NOT hybrid'");
+    defer boolean_not.deinit();
+    try std.testing.expectEqual(@as(usize, 1), boolean_not.count());
+    try std.testing.expectEqualStrings("Guide", boolean_not.rows.items[0].values[0].Text);
+}
+
 test "prepared statement lifecycle can be reused safely" {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();

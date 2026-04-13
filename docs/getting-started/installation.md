@@ -10,7 +10,7 @@
 Add ZQLite as a dependency:
 
 ```bash
-zig fetch --save https://github.com/ghostkellz/zqlite/archive/refs/heads/main.tar.gz
+zig fetch --save https://github.com/ghostkellz/zqlite/archive/refs/tags/v1.6.2.tar.gz
 ```
 
 In your `build.zig`:
@@ -46,12 +46,17 @@ zig build bench              # Performance benchmarks
 After building, the CLI is available at:
 
 ```bash
-./zig-out/bin/zqlite shell
+./zig-out/bin/zqlite --help
+./zig-out/bin/zqlite
 ```
 
-## Verified Installation Script
+The CLI supports direct startup plus flags such as `--help`, `--version`, `--db`, and `--sql`.
+
+## Installation Script
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/ghostkellz/zqlite/main/install.sh -o install.sh
 chmod +x install.sh && ./install.sh
 ```
+
+Note: review `install.sh` before relying on it in automation. The canonical verified path is still `zig build` from source.

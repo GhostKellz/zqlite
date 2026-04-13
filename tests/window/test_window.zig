@@ -149,5 +149,29 @@ pub fn main() !void {
     }
     std.debug.print("  PASSED\n\n", .{});
 
+    std.debug.print("Test 7: named WINDOW clause support\n", .{});
+    {
+        var rs = try conn.query("SELECT name, department, salary, ROW_NUMBER() OVER dept_salary FROM employees WINDOW dept_salary AS (PARTITION BY department ORDER BY salary DESC)");
+        defer rs.deinit();
+
+        var engineering_seen = false;
+        while (rs.next()) |row| {
+            var r = row;
+            defer r.deinit();
+
+            const dept = r.getText(1) orelse "NULL";
+            const name = r.getText(0) orelse "NULL";
+            const rank = r.getInt(3) orelse 0;
+
+            if (std.mem.eql(u8, dept, "Engineering") and std.mem.eql(u8, name, "Bob")) {
+                engineering_seen = true;
+                std.debug.assert(rank == 1);
+            }
+        }
+
+        std.debug.assert(engineering_seen);
+    }
+    std.debug.print("  PASSED\n\n", .{});
+
     std.debug.print("=== All Window Function Tests Completed ===\n", .{});
 }

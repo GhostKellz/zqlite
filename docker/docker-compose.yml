@@ -1,81 +1,100 @@
 services:
   zqlite-test:
-    image: alpine:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      network: host
     network_mode: host
     volumes:
-      - ..:/workspace/zqlite
       - /opt/zig-0.16.0-dev:/opt/zig:ro
-    working_dir: /workspace/zqlite
     command: /opt/zig/zig build test --summary all
 
   zqlite-memory:
-    image: alpine:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      network: host
     network_mode: host
     volumes:
-      - ..:/workspace/zqlite
       - /opt/zig-0.16.0-dev:/opt/zig:ro
-    working_dir: /workspace/zqlite
     command: sh -c "/opt/zig/zig build test-memory-leaks && /opt/zig/zig build test-comprehensive-memory"
 
   zqlite-valgrind:
-    image: zqlite-valgrind
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.valgrind
+      network: host
     network_mode: host
     volumes:
-      - ..:/workspace/zqlite
       - /opt/zig-0.16.0-dev:/opt/zig:ro
-    working_dir: /workspace/zqlite
-    command: sh -c "/opt/zig/zig build test-memory-leaks && /opt/zig/zig build test-comprehensive-memory"
+    command: sh /workspace/zqlite/docker/scripts/run-valgrind.sh
+
+  zqlite-audit:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.valgrind
+      network: host
+    network_mode: host
+    volumes:
+      - /opt/zig-0.16.0-dev:/opt/zig:ro
+    command: sh /workspace/zqlite/docker/scripts/run-audit.sh
 
   zqlite-full:
-    image: alpine:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      network: host
     network_mode: host
     volumes:
-      - ..:/workspace/zqlite
       - /opt/zig-0.16.0-dev:/opt/zig:ro
-    working_dir: /workspace/zqlite
     command: /workspace/zqlite/docker/scripts/full-validation.sh
 
   zqlite-stress:
-    image: alpine:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      network: host
     network_mode: host
     volumes:
-      - ..:/workspace/zqlite
       - /opt/zig-0.16.0-dev:/opt/zig:ro
-    working_dir: /workspace/zqlite
     command: /workspace/zqlite/docker/scripts/stress-test.sh
 
   zqlite-chaos:
-    image: alpine:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      network: host
     network_mode: host
     volumes:
-      - ..:/workspace/zqlite
       - /opt/zig-0.16.0-dev:/opt/zig:ro
-    working_dir: /workspace/zqlite
     command: /workspace/zqlite/docker/scripts/chaos-test.sh 10
 
   zqlite-perf:
-    image: alpine:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      network: host
     network_mode: host
     volumes:
-      - ..:/workspace/zqlite
       - /opt/zig-0.16.0-dev:/opt/zig:ro
-    working_dir: /workspace/zqlite
     command: /workspace/zqlite/docker/scripts/perf-baseline.sh
 
   zqlite-file-storage:
-    image: alpine:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      network: host
     network_mode: host
     volumes:
-      - ..:/workspace/zqlite
       - /opt/zig-0.16.0-dev:/opt/zig:ro
-    working_dir: /workspace/zqlite
     command: /workspace/zqlite/docker/scripts/test-file-storage.sh
 
   zqlite-critical:
-    image: alpine:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      network: host
     network_mode: host
     volumes:
-      - ..:/workspace/zqlite
       - /opt/zig-0.16.0-dev:/opt/zig:ro
-    working_dir: /workspace/zqlite
     command: /workspace/zqlite/docker/scripts/test-critical.sh

@@ -1,6 +1,6 @@
 # Encryption
 
-ZQLite supports field-level encryption using ChaCha20-Poly1305.
+ZQLite contains internal encryption primitives and secure-storage building blocks, but transparent database-at-rest encryption is not currently exposed as a stable connection feature.
 
 ## Overview
 
@@ -9,43 +9,35 @@ ZQLite supports field-level encryption using ChaCha20-Poly1305.
 - **Nonce**: 96-bit (randomly generated per encryption)
 - **Authentication**: Built-in with Poly1305 MAC
 
-## Usage
+## Current Reality
 
 ```zig
 const zqlite = @import("zqlite");
 
-// Open with encryption key
-var conn = try zqlite.openWithOptions(allocator, "mydb.db", .{
-    .encryption_key = "my-32-byte-encryption-key-here!",
-});
+var conn = try zqlite.open(allocator, "mydb.db");
 defer conn.close();
-
-// Data is encrypted at rest
-try conn.execute("CREATE TABLE secrets (id INTEGER PRIMARY KEY, data TEXT)");
-try conn.execute("INSERT INTO secrets (data) VALUES ('sensitive info')");
 ```
 
-## Key Management
+At the moment, this guide should be read as implementation context, not as a promise that opening a normal ZQLite database automatically encrypts stored table data or WAL contents.
 
-- Keys must be exactly 32 bytes
-- ZQLite does not store keys - you manage key storage
-- Changing keys requires re-encrypting the database
+## Internal Building Blocks
 
-## What Gets Encrypted
+- ChaCha20-Poly1305 is present in internal secure-storage code
+- key management and secure-mode infrastructure exist as lower-level components
+- experimental PQ scaffolding exists separately and is not production-ready
 
-- Field values in storage
-- WAL entries
+## What Is Not Yet A Stable Public Feature
 
-## What's NOT Encrypted
-
-- Schema metadata (table names, column names)
-- Indexes (by design, for query performance)
+- opening a normal database with an application-provided at-rest encryption key
+- transparent encryption of table pages on disk
+- transparent encryption of WAL contents on disk
+- end-user key rotation workflow for ordinary databases
 
 ## Security Notes
 
-- Encryption protects data at rest
-- Does not protect against memory inspection while database is open
-- For production use, combine with OS-level protections
+- do not assume database files are encrypted at rest unless you have added and verified that behavior yourself
+- experimental PQ scaffolding is not production-ready
+- for production data-at-rest protection today, use filesystem or volume encryption outside ZQLite
 
 ## Experimental: Post-Quantum
 

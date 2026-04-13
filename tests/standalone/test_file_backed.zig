@@ -1,7 +1,6 @@
 const std = @import("std");
 const zqlite = @import("zqlite");
 
-/// Comprehensive file-backed storage tests
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
@@ -137,23 +136,36 @@ fn testLargeDataset(allocator: std.mem.Allocator) !void {
     std.log.info("[TEST] Large dataset (100 rows)", .{});
     const path = "/tmp/zqlite_test_large.db";
 
-    var conn = try zqlite.open(allocator, path);
-    defer conn.close();
+    {
+        var conn = try zqlite.open(allocator, path);
+        defer conn.close();
 
-    try conn.execute("CREATE TABLE IF NOT EXISTS numbers (id INTEGER, value INTEGER)");
-    try conn.execute("DELETE FROM numbers");
+        try conn.execute("CREATE TABLE IF NOT EXISTS numbers (id INTEGER, value INTEGER)");
+        try conn.execute("DELETE FROM numbers");
 
-    // Insert 100 rows
-    var i: usize = 0;
-    while (i < 100) : (i += 1) {
-        var buf: [128]u8 = undefined;
-        const sql = std.fmt.bufPrint(&buf, "INSERT INTO numbers (id, value) VALUES ({d}, {d})", .{ i, i * 10 }) catch unreachable;
-        try conn.execute(sql);
+        // Insert 100 rows
+        var i: usize = 0;
+        while (i < 100) : (i += 1) {
+            var buf: [128]u8 = undefined;
+            const sql = std.fmt.bufPrint(&buf, "INSERT INTO numbers (id, value) VALUES ({d}, {d})", .{ i, i * 10 }) catch unreachable;
+            try conn.execute(sql);
+        }
+
+        var result = try conn.query("SELECT * FROM numbers");
+        defer result.deinit();
+
+        std.debug.assert(result.rows.items.len == 100);
+        std.log.info("[PASS] Large dataset in active connection: {d} rows", .{result.rows.items.len});
     }
 
-    var result = try conn.query("SELECT * FROM numbers");
-    defer result.deinit();
+    {
+        var conn = try zqlite.open(allocator, path);
+        defer conn.close();
 
-    std.debug.assert(result.rows.items.len == 100);
-    std.log.info("[PASS] Large dataset: {d} rows", .{result.rows.items.len});
+        var result = try conn.query("SELECT * FROM numbers");
+        defer result.deinit();
+
+        std.debug.assert(result.rows.items.len == 100);
+        std.log.info("[PASS] Large dataset after reopen: {d} rows", .{result.rows.items.len});
+    }
 }

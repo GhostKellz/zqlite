@@ -4,13 +4,13 @@ Linux is the primary development and test platform.
 
 ## Requirements
 
-- Zig 0.16.0 or later
+- Zig 0.16.0-dev or later
 - POSIX-compliant filesystem
 
 ## Build
 
 ```bash
-git clone https://github.com/your-org/zqlite.git
+git clone https://github.com/ghostkellz/zqlite.git
 cd zqlite
 zig build
 ```
@@ -25,7 +25,7 @@ zig build test-quick         # Quick validation
 
 ## Features
 
-All features are fully supported:
+Stable core features are supported on Linux:
 
 | Feature | Status |
 |---------|--------|
@@ -35,9 +35,9 @@ All features are fully supported:
 | B-tree storage | Supported |
 | Full-text search | Supported |
 | Connection pooling | Supported |
-| Field encryption | Supported |
+| Field encryption | Experimental / internal only |
 | Secure mode | Supported |
-| C FFI | Supported |
+| C FFI | Supported with `-Dffi=true` |
 
 ## File Locations
 
@@ -51,10 +51,8 @@ Database files require read/write access. WAL requires same directory write acce
 
 ## Distribution Notes
 
-Tested on:
-- Arch Linux (primary)
-- Ubuntu/Debian
-- Fedora
-- Other glibc-based distributions
+Verified regularly on:
+- Arch Linux (primary host)
+- Debian-based Docker environments for validation and Valgrind
 
-musl libc should work but is less tested.
+Other Linux distributions may work, but should be treated as less verified unless explicitly tested.

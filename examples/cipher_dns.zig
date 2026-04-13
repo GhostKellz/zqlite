@@ -276,8 +276,7 @@ pub fn runCipherDemo() !void {
     try cipher.listZones();
 
     std.debug.print("\n🎉 Cipher DNS demonstration completed!\n", .{});
-    std.debug.print("💡 Ready for integration with your zigDNS resolver\n", .{});
-    std.debug.print("🚀 Perfect backend for your all-in-one DNS solution\n", .{});
+    std.debug.print("💡 This example shows zqlite-backed DNS record storage patterns.\n", .{});
 }
 
 pub fn main() !void {

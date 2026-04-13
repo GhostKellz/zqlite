@@ -6,7 +6,7 @@ ZQLite includes a growing set of PostgreSQL-style features, but it is not a Post
 
 - `RETURNING` on data modification statements
 - `ON CONFLICT` / UPSERT forms
-- window functions
+- window functions (partial, with supported ranking/partition paths)
 - CTE-related AST/planner support where implemented
 - richer value types than a minimal SQLite-style engine
 - capability/status introspection for experimental crypto surfaces
@@ -23,7 +23,7 @@ Do not position it as:
 - a full PostgreSQL operational replacement,
 - or a drop-in backend for applications expecting full PostgreSQL semantics.
 
-## Near-Term Priorities After v1.6.0
+## Near-Term Priorities After v1.6.2
 
 - broader `RETURNING` coverage and edge cases
 - richer date/time behavior

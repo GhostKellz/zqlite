@@ -1,9 +1,8 @@
 const std = @import("std");
 const zqlite = @import("zqlite");
 
-/// ZQLite v1.6.0 Hybrid Crypto Banking Example (EXPERIMENTAL)
+/// Hybrid Crypto Banking Example (EXPERIMENTAL)
 /// Financial database demo with post-quantum security scaffolding
-/// Features: ML-KEM, ML-DSA, ZKP privacy, quantum-safe transactions
 const BankingError = error{
     InsufficientFunds,
     AccountNotFound,
@@ -388,9 +387,7 @@ pub fn main() !void {
 
     printExperimentalBanner();
     std.debug.print("Post-Quantum Banking System Demo\n", .{});
-    std.debug.print("================================\n", .{});
-    std.debug.print("Powered by ZQLite v1.6.0\n", .{});
-    std.debug.print("Features: ML-KEM, ML-DSA, Zero-Knowledge Proofs\n\n", .{});
+    std.debug.print("================================\n\n", .{});
 
     // Initialize post-quantum bank
     var bank = try PostQuantumBank.init(allocator, null); // In-memory database

@@ -1,12 +1,18 @@
-# ZQLite Testing Environment - Lightweight
-# Mounts host Zig, no download needed
+# ZQLite testing environment
+# Uses Alpine, host networking, and host Zig bind only.
 
-FROM debian:bookworm-slim
+FROM alpine:latest
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apk add --no-cache \
+    bash \
+    build-base \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    git \
+    linux-headers \
+    musl-dev
 
 WORKDIR /workspace/zqlite
 
-CMD ["zig", "build", "test"]
+COPY . /workspace/zqlite
+
+CMD ["/opt/zig/zig", "build", "test"]

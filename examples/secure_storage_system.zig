@@ -1,5 +1,5 @@
 const std = @import("std");
-const zqlite = @import("../src/zqlite.zig");
+const zqlite = @import("zqlite");
 
 /// 🔒 ZQLite Secure Storage System
 /// Enterprise-grade secure file storage with encryption, versioning, and access control
@@ -176,7 +176,7 @@ pub const SecureStorageSystem = struct {
 
     /// Initialize secure storage system
     pub fn init(allocator: std.mem.Allocator, storage_path: []const u8) !Self {
-        const version = @import("../src/version.zig");
+        const version = zqlite.version;
         std.debug.print("🔒 Initializing {s} - Secure Storage System\n", .{version.FULL_VERSION_STRING});
         std.debug.print("Storage Path: {s}\n", .{storage_path});
 
@@ -560,6 +560,6 @@ pub fn main() !void {
     stats.print();
 
     std.debug.print("\n✅ Secure Storage System Demo completed!\n", .{});
-    const version = @import("../src/version.zig");
+    const version = zqlite.version;
     std.debug.print("{s} provides enterprise-grade secure file storage\n", .{version.FULL_VERSION_STRING});
 }

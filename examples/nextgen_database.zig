@@ -1,9 +1,8 @@
 const std = @import("std");
 const zqlite = @import("zqlite");
 
-/// Next-Generation Database Demo
-/// Shows zqlite as a "SQLite killer" with crypto + async features
-/// Perfect for Jarvis AI Agent, GhostMesh VPN, and crypto projects
+/// Database Demo (EXPERIMENTAL)
+/// Demonstrates crypto + async features - these are scaffolding only
 const NextGenDatabase = struct {
     allocator: std.mem.Allocator,
     async_db: *zqlite.async_ops.AsyncDatabase,
@@ -217,10 +216,9 @@ pub fn runNextGenDemo() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("🔥 ZQLITE - Next Generation SQLite Killer Demo\n", .{});
-    std.debug.print("===============================================\n", .{});
-    std.debug.print("🎯 Features: Async + Crypto + Advanced Indexing\n", .{});
-    std.debug.print("🚀 Use Cases: AI Agents, VPN, Crypto, Real-time Apps\n\n", .{});
+    std.debug.print("ZQLite Feature Demo (EXPERIMENTAL)\n", .{});
+    std.debug.print("===================================\n", .{});
+    std.debug.print("Demonstrates: async ops, crypto, indexing (scaffolding only)\n\n", .{});
 
     // Initialize next-gen database
     var nextgen_db = try NextGenDatabase.init(allocator, ":memory:", "ultra_secure_master_key_2024");
@@ -249,12 +247,7 @@ pub fn runNextGenDemo() !void {
     // Demonstrate indexing features
     try nextgen_db.indexDemo();
 
-    std.debug.print("\n🎉 Next-Generation Database Demo Complete!\n", .{});
-    std.debug.print("💡 Ready for production use in:\n", .{});
-    std.debug.print("   🤖 Jarvis AI Agent (encrypted credentials + async queries)\n", .{});
-    std.debug.print("   🔒 GhostMesh VPN (secure connection logs + real-time updates)\n", .{});
-    std.debug.print("   ₿  Crypto Projects (encrypted wallets + transaction integrity)\n", .{});
-    std.debug.print("   ⚡ Any high-performance application requiring security + speed\n", .{});
+    std.debug.print("\nDemo complete. Note: async/crypto features shown are experimental scaffolding.\n", .{});
 }
 
 pub fn main() !void {

@@ -1,7 +1,6 @@
 const std = @import("std");
 const zqlite = @import("zqlite");
 
-/// Test transaction atomicity with file storage
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();

@@ -3,7 +3,7 @@ const crypto_interface = @import("interface.zig");
 const storage = @import("../db/storage.zig");
 const time_utils = @import("../time_utils.zig");
 
-/// 🚀 ZQLite Crypto Engine - Production-ready database encryption
+/// ZQLite Crypto Engine - Database encryption layer
 /// Features: ZCrypto integration, Modular crypto backends, Native Zig crypto fallback
 pub const CryptoEngine = struct {
     allocator: std.mem.Allocator,

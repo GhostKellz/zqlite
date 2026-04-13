@@ -8,7 +8,7 @@ FFI bindings for C/C++ integration. Requires build with `-Dffi=true`.
 zig build -Dffi=true
 ```
 
-This produces a shared library (`libzqlite.so` / `zqlite.dll`).
+This produces a shared library based on the `zqlite_c` target (`libzqlite_c.so` / `zqlite_c.dll`, depending on platform).
 
 ## Error Codes
 
@@ -26,7 +26,7 @@ This produces a shared library (`libzqlite.so` / `zqlite.dll`).
 ### Connection
 
 ```c
-// Open database (NULL path for in-memory)
+// Open database (use ":memory:" for in-memory)
 zqlite_connection_t* zqlite_open(const char* path);
 
 // Close connection
@@ -148,5 +148,5 @@ int main() {
 
 - All `zqlite_result_t*` must be freed with `zqlite_result_free()`
 - All `zqlite_stmt_t*` must be freed with `zqlite_finalize()`
-- Strings returned by `zqlite_result_get_text()` are valid until result is freed
+- Strings returned by `zqlite_result_get_text()` must be freed with `zqlite_free_string()`
 - Call `zqlite_shutdown()` at program exit to clean up global state

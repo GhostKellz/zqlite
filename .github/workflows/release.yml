@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release-linux:
+    name: Build Linux Release
+    runs-on: self-hosted
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clean workspace
+        run: rm -rf zig-out /tmp/zqlite_*.db
+
+      - name: Zig version
+        run: zig version
+
+      - name: Run release validation
+        run: ./scripts/test-release.sh
+
+      - name: Build Linux release artifacts
+        run: zig build -Doptimize=ReleaseFast -Dffi=true
+
+      - name: Create Linux archive
+        run: |
+          set -euo pipefail
+          VERSION="${{ github.ref_name }}"
+          TARGET="x86_64-unknown-linux-gnu"
+          ARCHIVE_DIR="zqlite-${VERSION}-${TARGET}"
+
+          mkdir -p "$ARCHIVE_DIR/bin" "$ARCHIVE_DIR/lib"
+          cp zig-out/bin/zqlite "$ARCHIVE_DIR/bin/"
+          if [ -f zig-out/lib/libzqlite.so ]; then
+            cp zig-out/lib/libzqlite.so "$ARCHIVE_DIR/lib/"
+          fi
+          if [ -f zig-out/lib/libzqlite_c.so ]; then
+            cp zig-out/lib/libzqlite_c.so "$ARCHIVE_DIR/lib/"
+          fi
+          cp README.md CHANGELOG.md LICENSE install.sh "$ARCHIVE_DIR/"
+
+          tar -czvf "zqlite-${VERSION}-${TARGET}.tar.gz" "$ARCHIVE_DIR"
+
+      - name: Generate SHA256 checksum
+        run: |
+          set -euo pipefail
+          VERSION="${{ github.ref_name }}"
+          TARGET="x86_64-unknown-linux-gnu"
+          sha256sum "zqlite-${VERSION}-${TARGET}.tar.gz" > "zqlite-${VERSION}-${TARGET}.tar.gz.sha256"
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: |
+            zqlite-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
+            zqlite-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz.sha256
+
+  create-release:
+    name: Create GitHub Release
+    needs: [release-linux]
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/linux-release/*
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
+          generate_release_notes: true
+          body: |
+            ## ZQLite ${{ github.ref_name }}
+
+            ### Downloads
+
+            | Platform | File | Checksum |
+            |----------|------|----------|
+            | Linux (x86_64) | `zqlite-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz` | `.sha256` |
+
+            ### Quick Install
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/ghostkellz/zqlite/refs/heads/main/install.sh | bash
+            ```
+
+            ### Manual Install
+
+            ```bash
+            tar -xzf zqlite-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
+            cp zqlite-${{ github.ref_name }}-x86_64-unknown-linux-gnu/bin/zqlite ~/.local/bin/
+            zqlite --version
+            ```
+
+            ### Verify Checksum
+
+            ```bash
+            sha256sum -c zqlite-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz.sha256
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

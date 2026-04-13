@@ -1,6 +1,6 @@
 # Transactions
 
-ZQLite supports ACID transactions with write-ahead logging.
+ZQLite supports transaction boundaries with write-ahead logging and verified commit/rollback behavior on the tested paths.
 
 ## Basic Usage
 
@@ -55,10 +55,12 @@ try conn.transactionExec(&statements);
 
 ## Write-Ahead Logging
 
-Transactions use WAL for durability:
-- Changes written to log before commit
-- Crash recovery replays uncommitted changes
-- Checkpoint flushes log to main database
+Transactions use WAL-backed logging and rollback state:
+- changes are recorded before commit completes
+- commit and rollback behavior is covered by transaction atomicity tests
+- checkpointing flushes durable state back to the main database
+
+Avoid reading this as a blanket claim that every ACID/crash-recovery edge case is fully characterized across all experimental subsystems.
 
 ## Notes
 

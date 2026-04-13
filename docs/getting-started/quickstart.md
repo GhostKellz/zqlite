@@ -37,7 +37,7 @@ try conn.execute("INSERT INTO users (name) VALUES ('Alice')");
 var stmt = try conn.prepare("SELECT id, name FROM users WHERE id = ?");
 defer stmt.deinit();
 
-stmt.bind(0, @as(i64, 1)) catch unreachable;
+try stmt.bind(0, @as(i64, 1));
 
 var result = try stmt.execute();
 defer result.deinit();

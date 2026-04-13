@@ -5,6 +5,82 @@ All notable changes to ZQLite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.2] - 2026-04-13
+
+### Fixed
+- **Build metadata portability** - Changed from dynamic git/date shell commands to static values
+  - Ensures builds work from source archives and non-git environments
+  - `git_commit` set to "release", `build_date` updated at release time
+- **File-backed metadata persistence after B-tree root splits** - Closing non-transaction file-backed connections now saves refreshed table metadata before pager flush/deinit
+  - Fixes the `100 inserted -> 31 visible after reopen` failure reproduced by `tests/standalone/test_concurrent_access.zig`
+  - Large file-backed datasets now retain the correct root page and row count across close/reopen cycles
+- **Normal index correctness across create/reopen/write cycles** - Persisted index definitions now rebuild and refresh index contents from live table rows
+  - Fixes normal indexes loading with definitions present but stale or empty contents after reopen
+  - Fixes indexed lookups missing rows inserted after create or after reopening a file-backed database
+- **Unique index persistence after reopen** - Unique index definitions now round-trip through metadata and continue enforcing uniqueness after close/reopen
+  - Prevents duplicate inserts from succeeding after reopening a database with persisted unique indexes
+- **FTS virtual-table persistence** - FTS table identity and indexed columns now persist across close/reopen cycles
+  - Reopened file-backed FTS tables retain `MATCH` behavior and continue indexing new inserts
+- **Column default persistence** - Column literal and function defaults now survive file-backed close/reopen cycles
+  - Reopened schemas retain default metadata for inserts and `PRAGMA table_info`
+- **Identifier handling for aggregate-keyword names** - Parser now accepts names like `count` consistently in non-aggregate identifier positions
+  - Fixes `CREATE TABLE counter (id INTEGER, count INTEGER)`
+  - Fixes `INSERT INTO counter (id, count) VALUES (...)`
+  - Fixes `UPDATE counter SET count = count + 1 ...`
+  - Fixes bare column queries like `SELECT count FROM counter WHERE id = 1`
+- **FTS MATCH boolean parser hang** - Phrase and boolean `MATCH` queries no longer spin indefinitely on non-matching rows
+  - Fixes an infinite loop caused by short-circuit parsing logic that failed to advance the token cursor
+  - Validates quoted phrases and `AND` / `OR` / `NOT` matching on FTS queries
+- **Named WINDOW clause support and window execution ordering** - Named window definitions now survive parse/plan/prepared-statement paths and window ranking respects per-partition ordering
+  - Fixes `WINDOW name AS (...)` clauses being dropped before execution
+  - Fixes prepared statements using named windows on stable SQL paths
+  - Fixes partitioned window ranking using scan order instead of window `ORDER BY`
+
+### Changed
+- **Production-readiness messaging cleanup** - Removed misleading claims from examples and source
+  - `examples/production_database_server.zig` - renamed to "Database Server Example"
+  - `examples/cipher_dns.zig` - removed "Ready for integration" claim
+  - `examples/improved_api_demo.zig` - removed production-ready claim
+  - `examples/nextgen_database.zig` - removed "SQLite killer" and production claims
+  - `examples/simple_api_test.zig` - removed "Ready for integration" claim
+  - `examples/insert_memory_regression_test.zig` - removed production-ready claim
+  - `src/crypto/secure_storage.zig` - removed "Production-ready" from comment
+  - `src/concurrent/secure_storage.zig` - removed "Production-ready" from comment
+  - `src/concurrent/async_operations.zig` - removed "Production-ready" from comment
+- **Documentation accuracy** - Updated docs to reflect actual project state
+  - `docs/project/release-process.md` - updated for static build metadata
+  - `docs/project/maintainer-workflow.md` - updated build metadata section, status levels
+  - `docs/experimental/overview.md` - changed "Production Ready" column to "Usable"
+- **Experimental roadmap accuracy** - `docs/experimental/overview.md` now reflects completed `v1.6.x` near-term work and current FTS/query-cache behavior
+- **Query cache invalidation coverage** - Cache invalidation now includes schema mutations for the affected table, not only row writes
+- **Cluster health evaluation** - Cluster health now evaluates node staleness from `last_seen` timestamps instead of only reporting static status snapshots
+- **Memory test target layout** - Redundant memory-related build targets were reduced by reusing the primary leak/regression suites behind existing step names
+- **Release hardening coverage** - Stable file-backed, index, FTS, default-value, prepared-statement, and window-function paths received narrow hostile verification before release
+
+### Added
+- **Build profile documentation** - Added to `docs/project/maintainer-workflow.md`
+  - Documents `core`, `advanced`, `full` profiles and their feature sets
+  - Shows how to use `-Dprofile=` and individual feature flags
+- **Test target documentation** - Comprehensive table of all test targets
+  - Categorized by purpose: core, storage, memory, advanced, benchmarks, fuzzing
+- **Examples README** - Created `examples/README.md`
+  - Categorizes examples as reference, experimental showcase, or domain-specific
+  - Documents build requirements and usage notes
+- **Standalone persistence regressions**
+  - Added `tests/standalone/test_fts_persistence.zig`
+  - Added `tests/standalone/test_default_persistence.zig`
+  - Expanded `tests/standalone/test_index_persistence.zig` to verify actual index lookup behavior after reopen and post-reopen writes
+- **Docker combined audit flow**
+  - Added `docker/scripts/run-audit.sh`
+  - Added dedicated `zqlite-audit` compose service on the Debian-based Valgrind image
+  - Docker validation now includes a reproducible combined critical/full/Valgrind audit path
+
+### Removed
+- **Broken standalone tests**
+  - `tests/standalone/test_production.zig` - broken APIs, misleading production claims
+  - `tests/standalone/test_all_features.zig` - stale v0.8.0 references, broken APIs
+- **Stale version strings** - Removed version litter from example files
+
 ## [1.6.1] - 2026-04-09
 
 ### Fixed

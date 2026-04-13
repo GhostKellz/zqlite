@@ -53,10 +53,8 @@ pub fn main() !void {
     try connection.execute("INSERT INTO regression_test (id, name, active, data) VALUES (100, 'complex test', 1, 'binary data here')");
     std.debug.print("   ✓ Complex INSERT successful\n\n", .{});
 
-    std.debug.print("🎉 All Regression Tests Passed!\n", .{});
-    std.debug.print("   • No segfaults occurred\n", .{});
-    std.debug.print("   • Memory management fixes are working correctly\n", .{});
-    std.debug.print("   • INSERT operations are now production-ready\n\n", .{});
+    std.debug.print("All Regression Tests Passed\n", .{});
+    std.debug.print("   No segfaults, memory management working\n\n", .{});
 
     std.debug.print("📊 Test Summary:\n", .{});
     std.debug.print("   • Basic INSERTs: ✅ PASS\n", .{});

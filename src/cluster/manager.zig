@@ -178,6 +178,11 @@ pub const ClusterManager = struct {
 
     /// Get cluster health status
     pub fn getClusterHealth(self: *Self) ClusterHealth {
+        self.health_monitor.evaluateNodeHealth(self.local_node);
+        var node_iterator = self.nodes.iterator();
+        while (node_iterator.next()) |entry| {
+            self.health_monitor.evaluateNodeHealth(entry.value_ptr.*);
+        }
         return self.health_monitor.getClusterHealth();
     }
 
@@ -434,6 +439,7 @@ const HealthMonitor = struct {
     allocator: std.mem.Allocator,
     nodes: std.ArrayListUnmanaged(*Node),
     health_check_interval_ms: u64,
+    stale_threshold_ms: u64,
 
     const Self = @This();
 
@@ -442,6 +448,7 @@ const HealthMonitor = struct {
             .allocator = allocator,
             .nodes = .{},
             .health_check_interval_ms = 5000,
+            .stale_threshold_ms = 15000,
         };
     }
 
@@ -456,6 +463,18 @@ const HealthMonitor = struct {
                 break;
             }
         }
+    }
+
+    pub fn evaluateNodeHealth(self: *Self, node: *Node) void {
+        _ = self;
+        if (node.status == .Maintenance or node.status == .Disconnected) return;
+
+        const ts = time_utils.getTimespec();
+        const now_ms: i64 = ts.sec * std.time.ms_per_s + @divTrunc(ts.nsec, std.time.ns_per_ms);
+        const last_seen_ms: i64 = node.last_seen * std.time.ms_per_s;
+        const elapsed_ms: u64 = @intCast(@max(now_ms - last_seen_ms, 0));
+
+        node.status = if (elapsed_ms > 15000) .Unhealthy else .Healthy;
     }
 
     pub fn getClusterHealth(self: *Self) ClusterHealth {
@@ -534,7 +553,6 @@ const ShardManager = struct {
     }
 
     pub fn assignShardsToNode(self: *Self, node: *Node, shard_count: u32) !void {
-        _ = self;
         node.allocated_shards.clearRetainingCapacity();
 
         for (0..shard_count) |i| {
@@ -771,6 +789,27 @@ test "cluster health monitor with mixed node states" {
     // Unhealthy: node2 = 1
     // Maintenance: node3 = 1 (excluded from health calculation)
     try testing.expect(health.healthy_nodes >= 1);
+}
+
+test "cluster health monitor marks stale nodes unhealthy" {
+    const testing = std.testing;
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var cluster = try ClusterManager.init(allocator, "test_cluster", "node1");
+    defer cluster.deinit();
+
+    try cluster.addNode("node2", "127.0.0.2", 8081);
+
+    if (cluster.nodes.get("node2")) |node| {
+        const ts = time_utils.getTimespec();
+        node.last_seen = ts.sec - 60;
+    }
+
+    const health = cluster.getClusterHealth();
+    try testing.expect(health.total_nodes == 2);
+    try testing.expect(health.unhealthy_nodes == 1);
 }
 
 test "cluster query routing by type" {

@@ -575,3 +575,28 @@ test "connection result cache keeps overlapping table names isolated" {
     try std.testing.expect(cache.get(singular_hash) == null);
     try std.testing.expect(cache.get(plural_hash) != null);
 }
+
+test "schema changes invalidate cached selects for the table" {
+    const zqlite = @import("../zqlite.zig");
+    const allocator = std.testing.allocator;
+
+    const conn = try zqlite.open(allocator, ":memory:");
+    defer conn.close();
+
+    const cache = try QueryCache.init(allocator, 16, 1024 * 1024);
+    defer cache.deinit();
+    conn.setResultCache(cache);
+
+    try conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)");
+    try conn.execute("INSERT INTO items VALUES (1, 'one')");
+
+    const sql = "SELECT value FROM items WHERE id = 1";
+    const hash = QueryHasher.hashQuery(sql);
+
+    var first = try conn.query(sql);
+    defer first.deinit();
+    try std.testing.expect(cache.get(hash) != null);
+
+    try conn.execute("DROP TABLE items");
+    try std.testing.expect(cache.get(hash) == null);
+}

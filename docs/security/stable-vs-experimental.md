@@ -14,8 +14,8 @@ These features have stable APIs and are the primary focus:
 | In-Memory Mode | Stable |
 | Prepared Statements | Stable |
 | Connection Pooling | Stable |
-| Field Encryption | Stable |
-| Full-Text Search | Partial, core MATCH support only |
+| Field Encryption | Experimental / internal building blocks only |
+| Full-Text Search | Stable with phrase, boolean, and file-backed reopen coverage |
 | ATTACH DATABASE | Stable |
 | Secure Mode | Stable |
 

@@ -38,11 +38,10 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_concurrent", enable_concurrent);
     build_options.addOption(bool, "enable_ffi", enable_ffi);
 
-    // Get Git commit hash (simplified for Zig 0.16 compatibility)
-    const git_commit = "dev";
-
-    // Get build date (simplified for Zig 0.16 compatibility)
-    const build_date = "2026-01-14";
+    // Build metadata - static values for reproducible builds from source archives
+    // These are intentionally not dynamic to ensure tarball builds work without git/shell
+    const git_commit = "release";
+    const build_date = "2026-04-13";
 
     // Build mode string
     const build_mode = switch (optimize) {
@@ -208,24 +207,7 @@ pub fn build(b: *std.Build) void {
     const validation_step = b.step("test-quick", "Run quick validation test");
     validation_step.dependOn(&run_validation_test.step);
 
-    // Add intensive memory test
-    const memory_test = b.addExecutable(.{
-        .name = "intensive_memory_test",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/memory/intensive_memory_test.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-
-    memory_test.root_module.addImport("zqlite", lib.root_module);
-    memory_test.root_module.addImport("zsync", zsync.module("zsync"));
-    memory_test.root_module.addOptions("build_options", build_options);
-
-    const run_memory_test = b.addRunArtifact(memory_test);
-
-    const memory_test_step = b.step("test-memory", "Run intensive memory leak detection tests");
-    memory_test_step.dependOn(&run_memory_test.step);
+    const memory_test_step = b.step("test-memory", "Run primary memory leak detection suite");
 
     // Add advanced tests (stress, security, edge cases)
     const advanced_tests = b.addTest(.{
@@ -246,43 +228,9 @@ pub fn build(b: *std.Build) void {
     const advanced_test_step = b.step("test-advanced", "Run advanced tests (stress, security, edge cases)");
     advanced_test_step.dependOn(&run_advanced_tests.step);
 
-    // Add simple memory test (avoiding btree bug)
-    const simple_memory_test = b.addExecutable(.{
-        .name = "simple_memory_test",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/memory/simple_memory_test.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
+    const simple_memory_test_step = b.step("test-memory-safe", "Run focused CREATE TABLE/default memory regression");
 
-    simple_memory_test.root_module.addImport("zqlite", lib.root_module);
-    simple_memory_test.root_module.addImport("zsync", zsync.module("zsync"));
-    simple_memory_test.root_module.addOptions("build_options", build_options);
-
-    const run_simple_memory_test = b.addRunArtifact(simple_memory_test);
-
-    const simple_memory_test_step = b.step("test-memory-safe", "Run safe memory tests (avoiding btree bug)");
-    simple_memory_test_step.dependOn(&run_simple_memory_test.step);
-
-    // Add comprehensive leak detection test
-    const leak_detection_test = b.addExecutable(.{
-        .name = "leak_detection_test",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/memory/leak_detection_test.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-
-    leak_detection_test.root_module.addImport("zqlite", lib.root_module);
-    leak_detection_test.root_module.addImport("zsync", zsync.module("zsync"));
-    leak_detection_test.root_module.addOptions("build_options", build_options);
-
-    const run_leak_detection_test = b.addRunArtifact(leak_detection_test);
-
-    const leak_detection_step = b.step("test-leak-detection", "Run comprehensive memory leak detection");
-    leak_detection_step.dependOn(&run_leak_detection_test.step);
+    const leak_detection_step = b.step("test-leak-detection", "Run compatibility alias for primary memory leak suite");
 
     // Add CREATE TABLE specific leak test (validates DEFAULT constraint fixes)
     const create_table_leak_test = b.addExecutable(.{
@@ -321,6 +269,8 @@ pub fn build(b: *std.Build) void {
 
     const memory_leak_step = b.step("test-memory-leaks", "Run dedicated memory leak detection");
     memory_leak_step.dependOn(&run_memory_leak_test.step);
+    memory_test_step.dependOn(&run_memory_leak_test.step);
+    leak_detection_step.dependOn(&run_memory_leak_test.step);
 
     // Add window function test
     const window_test = b.addExecutable(.{
@@ -341,24 +291,10 @@ pub fn build(b: *std.Build) void {
     const window_test_step = b.step("test-window", "Run window function tests");
     window_test_step.dependOn(&run_window_test.step);
 
-    // Add comprehensive memory test (INSERT/SELECT/DELETE, JOINs, transactions, etc.)
-    const comprehensive_memory_test = b.addExecutable(.{
-        .name = "comprehensive_memory_test",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/memory/comprehensive_test.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-
-    comprehensive_memory_test.root_module.addImport("zqlite", lib.root_module);
-    comprehensive_memory_test.root_module.addImport("zsync", zsync.module("zsync"));
-    comprehensive_memory_test.root_module.addOptions("build_options", build_options);
-
-    const run_comprehensive_memory_test = b.addRunArtifact(comprehensive_memory_test);
-
-    const comprehensive_memory_test_step = b.step("test-comprehensive-memory", "Run comprehensive memory tests");
-    comprehensive_memory_test_step.dependOn(&run_comprehensive_memory_test.step);
+    const comprehensive_memory_test_step = b.step("test-comprehensive-memory", "Run compatibility alias for primary memory leak suite and focused regression");
+    comprehensive_memory_test_step.dependOn(&run_memory_leak_test.step);
+    simple_memory_test_step.dependOn(&run_create_table_leak_test.step);
+    comprehensive_memory_test_step.dependOn(&run_create_table_leak_test.step);
 
     // Add SQL parser fuzzer
     const sql_parser_fuzzer = b.addExecutable(.{
@@ -430,6 +366,70 @@ pub fn build(b: *std.Build) void {
 
     const security_test_step = b.step("test-security", "Run security tests (SQL injection, integrity verification, WAL limits)");
     security_test_step.dependOn(&run_security_test.step);
+
+    // File-backed storage tests (persistence across connections)
+    const file_backed_test = b.addExecutable(.{
+        .name = "test_file_backed",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/standalone/test_file_backed.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    file_backed_test.root_module.addImport("zqlite", lib.root_module);
+    file_backed_test.root_module.addImport("zsync", zsync.module("zsync"));
+    file_backed_test.root_module.addOptions("build_options", build_options);
+
+    const run_file_backed_test = b.addRunArtifact(file_backed_test);
+
+    // Cleanup for file-backed tests
+    const cleanup_file_backed = b.addSystemCommand(&.{ "rm", "-f" });
+    cleanup_file_backed.addArgs(&.{
+        "/tmp/zqlite_test_basic.db",
+        "/tmp/zqlite_test_insert.db",
+        "/tmp/zqlite_test_multi.db",
+        "/tmp/zqlite_test_persist.db",
+        "/tmp/zqlite_test_update.db",
+        "/tmp/zqlite_test_large.db",
+    });
+    run_file_backed_test.step.dependOn(&cleanup_file_backed.step);
+
+    const file_backed_step = b.step("test-file-backed", "Run file-backed storage persistence tests");
+    file_backed_step.dependOn(&run_file_backed_test.step);
+
+    // Transaction atomicity tests (COMMIT/ROLLBACK persistence)
+    const transaction_test = b.addExecutable(.{
+        .name = "test_transaction_atomicity",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/standalone/test_transaction_atomicity.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    transaction_test.root_module.addImport("zqlite", lib.root_module);
+    transaction_test.root_module.addImport("zsync", zsync.module("zsync"));
+    transaction_test.root_module.addOptions("build_options", build_options);
+
+    const run_transaction_test = b.addRunArtifact(transaction_test);
+
+    // Cleanup for transaction tests
+    const cleanup_transaction = b.addSystemCommand(&.{ "rm", "-f" });
+    cleanup_transaction.addArgs(&.{
+        "/tmp/zqlite_txn_commit.db",
+        "/tmp/zqlite_txn_rollback.db",
+        "/tmp/zqlite_txn_nested.db",
+    });
+    run_transaction_test.step.dependOn(&cleanup_transaction.step);
+
+    const transaction_step = b.step("test-transaction", "Run transaction atomicity tests (COMMIT/ROLLBACK persistence)");
+    transaction_step.dependOn(&run_transaction_test.step);
+
+    // Combined storage tests (both run in parallel since each has own cleanup)
+    const storage_step = b.step("test-storage", "Run all storage tests (file-backed + transaction atomicity)");
+    storage_step.dependOn(&run_file_backed_test.step);
+    storage_step.dependOn(&run_transaction_test.step);
 
     if (enable_ffi) {
         const c_api_tests = b.addTest(.{

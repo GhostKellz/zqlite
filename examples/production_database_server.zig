@@ -1,20 +1,17 @@
 const std = @import("std");
-const zqlite = @import("../src/zqlite.zig");
+const zqlite = @import("zqlite");
 
-/// 🏦 ZQLite Production Database Server - REFERENCE IMPLEMENTATION
-/// High-performance, secure database server for production workloads
-/// Features: Connection pooling, replication, backup, monitoring
+/// Database Server Example
+/// Demonstrates connection pooling, backup, and monitoring patterns.
 ///
-/// ⚠️  SECURITY NOTICE ⚠️
-/// This is a REFERENCE IMPLEMENTATION demonstrating security patterns.
-/// Before deploying to production, you MUST:
+/// ⚠️  WARNING ⚠️
+/// This is a DEMONSTRATION EXAMPLE showing design patterns.
+/// It is NOT production-ready code. Before any real use:
 ///   1. Set ZQLITE_MASTER_KEY environment variable with a secure 32+ char key
 ///   2. Implement real user authentication in verifyUserCredentials()
 ///   3. Configure TLS/SSL for network connections
 ///   4. Set up proper access control and audit logging
 ///   5. Review and customize all security-related code paths
-///
-/// DO NOT deploy this example as-is to production!
 const ServerError = error{
     ConnectionLimitReached,
     AuthenticationFailed,
@@ -64,8 +61,8 @@ pub const DatabaseConfig = struct {
     wal_mode: bool,
     cache_size: usize,
 
-    /// Create production-ready configuration
-    pub fn production(name: []const u8, file_path: []const u8) DatabaseConfig {
+    /// Create full-featured configuration
+    pub fn fullFeatured(name: []const u8, file_path: []const u8) DatabaseConfig {
         return DatabaseConfig{
             .name = name,
             .file_path = file_path,
@@ -79,7 +76,7 @@ pub const DatabaseConfig = struct {
     }
 };
 
-/// ZQLite Production Database Server
+/// ZQLite Database Server Example
 pub const ZQLiteServer = struct {
     allocator: std.mem.Allocator,
     config: DatabaseConfig,
@@ -91,10 +88,10 @@ pub const ZQLiteServer = struct {
 
     const Self = @This();
 
-    /// Initialize production database server
+    /// Initialize database server
     pub fn init(allocator: std.mem.Allocator, config: DatabaseConfig) !Self {
-        const version = @import("../src/version.zig");
-        std.debug.print("🚀 Initializing {s} - Production Server\n", .{version.FULL_VERSION_STRING});
+        const version = zqlite.version;
+        std.debug.print("🚀 Initializing {s} - Database Server Example\n", .{version.FULL_VERSION_STRING});
         std.debug.print("Database: {s}\n", .{config.name});
         std.debug.print("File: {s}\n", .{config.file_path});
 
@@ -395,11 +392,11 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("🏦 ZQLite Production Database Server Demo\n", .{});
-    std.debug.print("=========================================\n\n", .{});
+    std.debug.print("🏦 ZQLite Database Server Demo\n", .{});
+    std.debug.print("==============================\n\n", .{});
 
-    // Create production configuration
-    const config = DatabaseConfig.production("production_db", "/var/lib/zqlite/production.db");
+    // Create full-featured configuration
+    const config = DatabaseConfig.fullFeatured("demo_db", "/tmp/zqlite_demo.db");
 
     // Initialize server
     var server = try ZQLiteServer.init(allocator, config);
@@ -437,7 +434,6 @@ pub fn main() !void {
     try server.disconnectClient(client2);
     try server.disconnectClient(client3);
 
-    std.debug.print("\n✅ Production Database Server Demo completed!\n", .{});
-    const version = @import("../src/version.zig");
-    std.debug.print("{s} ready for enterprise production workloads\n", .{version.FULL_VERSION_STRING});
+    std.debug.print("\n✅ Database Server Demo completed!\n", .{});
+    std.debug.print("This example demonstrates connection pooling, backup, and monitoring patterns.\n", .{});
 }

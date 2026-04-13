@@ -168,11 +168,23 @@ pub const Planner = struct {
             // Add WindowStep BEFORE Project if there are window functions
             // Window step will project non-window columns and compute window functions
             if (window_functions.items.len > 0) {
+                var cloned_window_definitions: ?[]ast.WindowDefinition = null;
+                if (select.window_definitions) |window_definitions| {
+                    cloned_window_definitions = try self.allocator.alloc(ast.WindowDefinition, window_definitions.len);
+                    for (window_definitions, 0..) |definition, i| {
+                        cloned_window_definitions.?[i] = ast.WindowDefinition{
+                            .name = try self.allocator.dupe(u8, definition.name),
+                            .specification = try self.cloneWindowSpecification(definition.specification),
+                        };
+                    }
+                }
+
                 try steps.append(self.allocator, ExecutionStep{
                     .Window = WindowStep{
                         .window_functions = try window_functions.toOwnedSlice(self.allocator),
                         .column_names = try window_column_names.toOwnedSlice(self.allocator),
                         .projected_columns = try non_window_columns.toOwnedSlice(self.allocator),
+                        .window_definitions = cloned_window_definitions,
                     },
                 });
 
@@ -761,6 +773,25 @@ pub const Planner = struct {
             cloned_order_by = clauses;
         }
 
+        var cloned_window_definitions: ?[]ast.WindowDefinition = null;
+        if (stmt.window_definitions) |window_definitions| {
+            var definitions = try self.allocator.alloc(ast.WindowDefinition, window_definitions.len);
+            errdefer {
+                for (definitions[0..window_definitions.len]) |*definition| {
+                    definition.deinit(self.allocator);
+                }
+                self.allocator.free(definitions);
+            }
+
+            for (window_definitions, 0..) |definition, i| {
+                definitions[i] = ast.WindowDefinition{
+                    .name = try self.allocator.dupe(u8, definition.name),
+                    .specification = try self.cloneWindowSpecification(definition.specification),
+                };
+            }
+            cloned_window_definitions = definitions;
+        }
+
         return ast.SelectStatement{
             .columns = cloned_columns,
             .table = cloned_table,
@@ -771,7 +802,7 @@ pub const Planner = struct {
             .order_by = cloned_order_by,
             .limit = stmt.limit,
             .offset = stmt.offset,
-            .window_definitions = null, // TODO: Clone window definitions if needed
+            .window_definitions = cloned_window_definitions,
             .distinct = stmt.distinct,
         };
     }
@@ -1763,6 +1794,8 @@ pub const WindowStep = struct {
     column_names: [][]const u8,
     /// Projected column names (input columns that ORDER BY can reference)
     projected_columns: [][]const u8,
+    /// Named WINDOW clause definitions
+    window_definitions: ?[]ast.WindowDefinition,
 
     pub fn deinit(self: *WindowStep, allocator: std.mem.Allocator) void {
         for (self.window_functions) |*wf| {
@@ -1779,6 +1812,13 @@ pub const WindowStep = struct {
             allocator.free(col);
         }
         allocator.free(self.projected_columns);
+
+        if (self.window_definitions) |definitions| {
+            for (definitions) |*definition| {
+                definition.deinit(allocator);
+            }
+            allocator.free(definitions);
+        }
     }
 };
 

@@ -11,6 +11,7 @@ echo ""
 TESTDIR=/tmp/zqlite_critical_tests
 rm -rf "$TESTDIR"
 mkdir -p "$TESTDIR"
+rm -f /tmp/zqlite_*.db
 
 run_test() {
     name=$1

@@ -1,6 +1,6 @@
 const std = @import("std");
 
-/// Production-ready crypto engine for secure storage operations
+/// Crypto engine for secure storage operations
 pub const CryptoEngine = struct {
     allocator: std.mem.Allocator,
     key: [32]u8,

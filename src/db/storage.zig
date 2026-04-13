@@ -128,8 +128,8 @@ pub const StorageEngine = struct {
         }
     }
 
-    /// Atomically rewrite all table metadata to page 0
-    /// This ensures consistency after drops or schema changes
+    /// Atomically rewrite table and index metadata to the metadata page.
+    /// This ensures consistency after drops or schema changes.
     fn rewriteAllMetadata(self: *Self) !void {
         if (self.is_memory) return;
 
@@ -212,6 +212,152 @@ pub const StorageEngine = struct {
         // Write final table count
         std.mem.writeInt(u32, page.data[4..8], table_count, .little);
 
+        const ext_magic_offset = page.data.len - 4;
+
+        // Write index count and index definitions after table metadata.
+        if (offset + 4 <= ext_magic_offset) {
+            const index_count_offset = offset;
+            offset += 4;
+
+            var index_count: u32 = 0;
+            var index_iterator = self.indexes.iterator();
+            while (index_iterator.next()) |entry| {
+                const index = entry.value_ptr.*;
+
+                var required_space: usize = 2 + index.name.len + 2 + index.table_name.len + 1 + 2;
+                for (index.column_names) |column_name| {
+                    required_space += 2 + column_name.len;
+                }
+
+                if (offset + required_space > ext_magic_offset) {
+                    break;
+                }
+
+                std.mem.writeInt(u16, page.data[offset..][0..2], @intCast(index.name.len), .little);
+                offset += 2;
+                @memcpy(page.data[offset..][0..index.name.len], index.name);
+                offset += index.name.len;
+
+                std.mem.writeInt(u16, page.data[offset..][0..2], @intCast(index.table_name.len), .little);
+                offset += 2;
+                @memcpy(page.data[offset..][0..index.table_name.len], index.table_name);
+                offset += index.table_name.len;
+
+                page.data[offset] = if (index.is_unique) 0x01 else 0x00;
+                offset += 1;
+
+                std.mem.writeInt(u16, page.data[offset..][0..2], @intCast(index.column_names.len), .little);
+                offset += 2;
+
+                for (index.column_names) |column_name| {
+                    std.mem.writeInt(u16, page.data[offset..][0..2], @intCast(column_name.len), .little);
+                    offset += 2;
+                    @memcpy(page.data[offset..][0..column_name.len], column_name);
+                    offset += column_name.len;
+                }
+
+                index_count += 1;
+            }
+
+            std.mem.writeInt(u32, page.data[index_count_offset..][0..4], index_count, .little);
+        }
+
+        if (offset + 4 <= ext_magic_offset) {
+            var extension_offset = offset;
+
+            const table_extension_count_offset = extension_offset;
+            extension_offset += 4;
+            var table_extension_count: u32 = 0;
+
+            var table_extension_iter = self.tables.iterator();
+            while (table_extension_iter.next()) |entry| {
+                const table = entry.value_ptr.*;
+
+                var extension_size: usize = 2 + table.name.len + 2;
+                for (table.schema.columns) |column| {
+                    if (column.default_value) |default_value| {
+                        const default_size = serializedDefaultValueSize(default_value) orelse continue;
+                        extension_size += 2 + column.name.len + default_size;
+                    }
+                }
+
+                if (extension_size == 2 + table.name.len + 2) {
+                    continue;
+                }
+
+                if (extension_offset + extension_size > ext_magic_offset) {
+                    break;
+                }
+
+                std.mem.writeInt(u16, page.data[extension_offset..][0..2], @intCast(table.name.len), .little);
+                extension_offset += 2;
+                @memcpy(page.data[extension_offset..][0..table.name.len], table.name);
+                extension_offset += table.name.len;
+
+                const default_count_offset = extension_offset;
+                extension_offset += 2;
+                var default_count: u16 = 0;
+
+                for (table.schema.columns) |column| {
+                    const default_value = column.default_value orelse continue;
+                    const default_size = serializedDefaultValueSize(default_value) orelse continue;
+                    if (extension_offset + 2 + column.name.len + default_size > ext_magic_offset) {
+                        break;
+                    }
+
+                    std.mem.writeInt(u16, page.data[extension_offset..][0..2], @intCast(column.name.len), .little);
+                    extension_offset += 2;
+                    @memcpy(page.data[extension_offset..][0..column.name.len], column.name);
+                    extension_offset += column.name.len;
+                    writeDefaultValue(page.data, &extension_offset, default_value) catch break;
+                    default_count += 1;
+                }
+
+                std.mem.writeInt(u16, page.data[default_count_offset..][0..2], default_count, .little);
+                table_extension_count += 1;
+            }
+
+            if (extension_offset + 4 <= ext_magic_offset) {
+                std.mem.writeInt(u32, page.data[table_extension_count_offset..][0..4], table_extension_count, .little);
+
+                const fts_count_offset = extension_offset;
+                extension_offset += 4;
+                var fts_count: u32 = 0;
+
+                var fts_iter = self.fts_indexes.iterator();
+                while (fts_iter.next()) |entry| {
+                    const fts_index = entry.value_ptr.*;
+                    var required_space: usize = 2 + fts_index.table_name.len + 2;
+                    for (fts_index.column_names) |column_name| {
+                        required_space += 2 + column_name.len;
+                    }
+
+                    if (extension_offset + required_space > ext_magic_offset) {
+                        break;
+                    }
+
+                    std.mem.writeInt(u16, page.data[extension_offset..][0..2], @intCast(fts_index.table_name.len), .little);
+                    extension_offset += 2;
+                    @memcpy(page.data[extension_offset..][0..fts_index.table_name.len], fts_index.table_name);
+                    extension_offset += fts_index.table_name.len;
+
+                    std.mem.writeInt(u16, page.data[extension_offset..][0..2], @intCast(fts_index.column_names.len), .little);
+                    extension_offset += 2;
+                    for (fts_index.column_names) |column_name| {
+                        std.mem.writeInt(u16, page.data[extension_offset..][0..2], @intCast(column_name.len), .little);
+                        extension_offset += 2;
+                        @memcpy(page.data[extension_offset..][0..column_name.len], column_name);
+                        extension_offset += column_name.len;
+                    }
+
+                    fts_count += 1;
+                }
+
+                std.mem.writeInt(u32, page.data[fts_count_offset..][0..4], fts_count, .little);
+                std.mem.writeInt(u32, page.data[ext_magic_offset..][0..4], METADATA_EXT_MAGIC, .little);
+            }
+        }
+
         // Mark page as dirty to ensure it's written
         try self.pager.markDirty(METADATA_PAGE_ID);
     }
@@ -223,8 +369,30 @@ pub const StorageEngine = struct {
 
     /// Create an index
     pub fn createIndex(self: *Self, name: []const u8, table_name: []const u8, column_names: [][]const u8, is_unique: bool) !void {
+        const index = try self.registerIndex(name, table_name, column_names, is_unique);
+        errdefer {
+            if (self.indexes.fetchRemove(name)) |entry| {
+                entry.value.deinit(self.allocator);
+                self.allocator.free(entry.key);
+            }
+        }
+
+        try self.rebuildIndex(index);
+
+        if (!self.is_memory) {
+            try self.rewriteAllMetadata();
+        }
+    }
+
+    fn registerIndex(self: *Self, name: []const u8, table_name: []const u8, column_names: [][]const u8, is_unique: bool) !*Index {
         const index = try Index.create(self.allocator, self.pager, name, table_name, column_names, is_unique);
-        try self.indexes.put(try self.allocator.dupe(u8, name), index);
+        errdefer index.deinit(self.allocator);
+
+        const duped_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(duped_name);
+
+        try self.indexes.put(duped_name, index);
+        return index;
     }
 
     /// Get an index by name
@@ -237,6 +405,26 @@ pub const StorageEngine = struct {
         if (self.indexes.fetchRemove(name)) |entry| {
             entry.value.deinit(self.allocator);
             self.allocator.free(entry.key);
+
+            if (!self.is_memory) {
+                try self.rewriteAllMetadata();
+            }
+        }
+    }
+
+    pub fn refreshIndexesForTable(self: *Self, table_name: []const u8) !void {
+        var index_iter = self.indexes.iterator();
+        while (index_iter.next()) |entry| {
+            const index = entry.value_ptr.*;
+            if (!std.mem.eql(u8, index.table_name, table_name)) {
+                continue;
+            }
+
+            try self.rebuildIndex(index);
+        }
+
+        if (!self.is_memory) {
+            try self.rewriteAllMetadata();
         }
     }
 
@@ -256,9 +444,125 @@ pub const StorageEngine = struct {
         return self.fts_indexes.get(table_name);
     }
 
+    fn valueEquals(a: Value, b: Value) bool {
+        if (@as(std.meta.Tag(Value), a) != @as(std.meta.Tag(Value), b)) {
+            return false;
+        }
+
+        return switch (a) {
+            .Null => true,
+            .Integer => |i| i == b.Integer,
+            .Real => |r| r == b.Real,
+            .Text => |t| std.mem.eql(u8, t, b.Text),
+            .Blob => |blob| std.mem.eql(u8, blob, b.Blob),
+            .Boolean => |flag| flag == b.Boolean,
+            .SmallInt => |s| s == b.SmallInt,
+            .BigInt => |bi| bi == b.BigInt,
+            else => false,
+        };
+    }
+
+    fn rowMatchesUniqueIndex(table: *Table, index: *Index, existing_values: []const Value, candidate_values: []const Value) bool {
+        for (index.column_names) |column_name| {
+            const column_idx = table.getColumnIndex(column_name) orelse return false;
+            if (column_idx >= existing_values.len or column_idx >= candidate_values.len) return false;
+            if (!valueEquals(existing_values[column_idx], candidate_values[column_idx])) return false;
+        }
+        return true;
+    }
+
+    pub fn checkUniqueIndexes(self: *Self, table: *Table, candidate_values: []const Value) !void {
+        var index_iter = self.indexes.iterator();
+        while (index_iter.next()) |entry| {
+            const index = entry.value_ptr.*;
+            if (!index.is_unique or !std.mem.eql(u8, index.table_name, table.name)) {
+                continue;
+            }
+
+            const rows = try table.selectWithKeys(self.allocator);
+            defer {
+                for (rows) |item| {
+                    for (item.row.values) |value| {
+                        value.deinit(self.allocator);
+                    }
+                    self.allocator.free(item.row.values);
+                }
+                self.allocator.free(rows);
+            }
+
+            for (rows) |item| {
+                if (rowMatchesUniqueIndex(table, index, item.row.values, candidate_values)) {
+                    return error.UniqueConstraintViolation;
+                }
+            }
+        }
+    }
+
     /// Check if a table has an FTS index (is a virtual table)
     pub fn isFTSTable(self: *Self, table_name: []const u8) bool {
         return self.fts_indexes.contains(table_name);
+    }
+
+    fn rebuildIndex(self: *Self, index: *Index) !void {
+        const table = self.getTable(index.table_name) orelse return error.TableNotFound;
+
+        index.btree.deinit();
+        index.btree = try btree.BTree.init(self.allocator, self.pager);
+
+        const rows = try table.selectWithKeys(self.allocator);
+        defer {
+            for (rows) |item| {
+                for (item.row.values) |value| {
+                    value.deinit(self.allocator);
+                }
+                self.allocator.free(item.row.values);
+            }
+            self.allocator.free(rows);
+        }
+
+        for (rows) |item| {
+            const key = computeIndexKey(table, index, item.row.values) orelse continue;
+            try index.insert(key, @intCast(item.key));
+        }
+    }
+
+    fn computeIndexKey(table: *Table, index: *Index, values: []const Value) ?u64 {
+        if (index.column_names.len == 0) return null;
+
+        if (index.column_names.len == 1) {
+            const column_idx = table.getColumnIndex(index.column_names[0]) orelse return null;
+            if (column_idx >= values.len) return null;
+            return valueToIndexKey(values[column_idx]);
+        }
+
+        var combined: u64 = 0xcbf29ce484222325;
+        for (index.column_names) |column_name| {
+            const column_idx = table.getColumnIndex(column_name) orelse return null;
+            if (column_idx >= values.len) return null;
+
+            const component = valueToIndexKey(values[column_idx]);
+            combined = (combined ^ component) *% 0x100000001b3;
+        }
+
+        return combined;
+    }
+
+    fn valueToIndexKey(value: Value) u64 {
+        return switch (value) {
+            .Integer => |i| @bitCast(i),
+            .Text => |t| blk: {
+                var hash: u64 = 0;
+                for (t) |byte| {
+                    hash = hash *% 31 +% byte;
+                }
+                break :blk hash;
+            },
+            .Real => |r| @bitCast(r),
+            .Boolean => |flag| if (flag) 1 else 0,
+            .SmallInt => |s| @bitCast(@as(i64, s)),
+            .BigInt => |bi| @bitCast(bi),
+            else => 0,
+        };
     }
 
     /// Metadata page layout:
@@ -276,6 +580,343 @@ pub const StorageEngine = struct {
     ///   - 1 byte: flags (is_primary_key, is_nullable)
     const METADATA_MAGIC: u32 = 0x5A514C54; // "ZQLT"
     const METADATA_PAGE_ID: u32 = 1;
+    const METADATA_EXT_MAGIC: u32 = 0x5A514558; // "ZQEX"
+
+    const MetadataValueTag = enum(u8) {
+        Null = 0,
+        Integer = 1,
+        Text = 2,
+        Real = 3,
+        Boolean = 4,
+        SmallInt = 5,
+        BigInt = 6,
+        Blob = 7,
+    };
+
+    const MetadataDefaultTag = enum(u8) {
+        Literal = 0,
+        FunctionCall = 1,
+    };
+
+    const MetadataFunctionArgTag = enum(u8) {
+        Literal = 0,
+        Column = 1,
+        Parameter = 2,
+    };
+
+    fn serializedValueSize(value: Value) ?usize {
+        return switch (value) {
+            .Null => 1,
+            .Integer, .Real, .BigInt => 1 + 8,
+            .Boolean => 1 + 1,
+            .SmallInt => 1 + 2,
+            .Text => |text| 1 + 2 + text.len,
+            .Blob => |blob| 1 + 2 + blob.len,
+            else => null,
+        };
+    }
+
+    fn serializedFunctionArgumentSize(arg: Column.FunctionArgument) ?usize {
+        return switch (arg) {
+            .Literal => |literal| blk: {
+                const size = serializedValueSize(literal) orelse return null;
+                break :blk 1 + size;
+            },
+            .Column => |column| 1 + 2 + column.len,
+            .Parameter => 1 + 4,
+        };
+    }
+
+    fn serializedFunctionCallSize(function_call: Column.FunctionCall) ?usize {
+        var size: usize = 2 + function_call.name.len + 2;
+        for (function_call.arguments) |arg| {
+            size += serializedFunctionArgumentSize(arg) orelse return null;
+        }
+        return size;
+    }
+
+    fn serializedDefaultValueSize(default_value: Column.DefaultValue) ?usize {
+        return switch (default_value) {
+            .Literal => |literal| blk: {
+                const size = serializedValueSize(literal) orelse return null;
+                break :blk 1 + size;
+            },
+            .FunctionCall => |function_call| blk: {
+                const size = serializedFunctionCallSize(function_call) orelse return null;
+                break :blk 1 + size;
+            },
+        };
+    }
+
+    fn writeMetadataValue(buffer: []u8, offset: *usize, value: Value) !void {
+        switch (value) {
+            .Null => {
+                if (offset.* + 1 > buffer.len) return error.NoMetadataSpace;
+                buffer[offset.*] = @intFromEnum(MetadataValueTag.Null);
+                offset.* += 1;
+            },
+            .Integer => |int_value| {
+                if (offset.* + 9 > buffer.len) return error.NoMetadataSpace;
+                buffer[offset.*] = @intFromEnum(MetadataValueTag.Integer);
+                offset.* += 1;
+                std.mem.writeInt(i64, buffer[offset.*..][0..8], int_value, .little);
+                offset.* += 8;
+            },
+            .Text => |text| {
+                if (offset.* + 3 + text.len > buffer.len) return error.NoMetadataSpace;
+                buffer[offset.*] = @intFromEnum(MetadataValueTag.Text);
+                offset.* += 1;
+                std.mem.writeInt(u16, buffer[offset.*..][0..2], @intCast(text.len), .little);
+                offset.* += 2;
+                @memcpy(buffer[offset.*..][0..text.len], text);
+                offset.* += text.len;
+            },
+            .Real => |real_value| {
+                if (offset.* + 9 > buffer.len) return error.NoMetadataSpace;
+                buffer[offset.*] = @intFromEnum(MetadataValueTag.Real);
+                offset.* += 1;
+                std.mem.writeInt(u64, buffer[offset.*..][0..8], @bitCast(real_value), .little);
+                offset.* += 8;
+            },
+            .Boolean => |flag| {
+                if (offset.* + 2 > buffer.len) return error.NoMetadataSpace;
+                buffer[offset.*] = @intFromEnum(MetadataValueTag.Boolean);
+                offset.* += 1;
+                buffer[offset.*] = if (flag) 1 else 0;
+                offset.* += 1;
+            },
+            .SmallInt => |small| {
+                if (offset.* + 3 > buffer.len) return error.NoMetadataSpace;
+                buffer[offset.*] = @intFromEnum(MetadataValueTag.SmallInt);
+                offset.* += 1;
+                std.mem.writeInt(i16, buffer[offset.*..][0..2], small, .little);
+                offset.* += 2;
+            },
+            .BigInt => |big| {
+                if (offset.* + 9 > buffer.len) return error.NoMetadataSpace;
+                buffer[offset.*] = @intFromEnum(MetadataValueTag.BigInt);
+                offset.* += 1;
+                std.mem.writeInt(i64, buffer[offset.*..][0..8], big, .little);
+                offset.* += 8;
+            },
+            .Blob => |blob| {
+                if (offset.* + 3 + blob.len > buffer.len) return error.NoMetadataSpace;
+                buffer[offset.*] = @intFromEnum(MetadataValueTag.Blob);
+                offset.* += 1;
+                std.mem.writeInt(u16, buffer[offset.*..][0..2], @intCast(blob.len), .little);
+                offset.* += 2;
+                @memcpy(buffer[offset.*..][0..blob.len], blob);
+                offset.* += blob.len;
+            },
+            else => return error.UnsupportedMetadataValue,
+        }
+    }
+
+    fn readMetadataValue(self: *Self, buffer: []const u8, offset: *usize) !Value {
+        if (offset.* >= buffer.len) return error.InvalidMetadata;
+        const tag: MetadataValueTag = @enumFromInt(buffer[offset.*]);
+        offset.* += 1;
+
+        return switch (tag) {
+            .Null => Value.Null,
+            .Integer => blk: {
+                if (offset.* + 8 > buffer.len) return error.InvalidMetadata;
+                const value = std.mem.readInt(i64, buffer[offset.*..][0..8], .little);
+                offset.* += 8;
+                break :blk Value{ .Integer = value };
+            },
+            .Text => blk: {
+                if (offset.* + 2 > buffer.len) return error.InvalidMetadata;
+                const len = std.mem.readInt(u16, buffer[offset.*..][0..2], .little);
+                offset.* += 2;
+                if (offset.* + len > buffer.len) return error.InvalidMetadata;
+                const text = try self.allocator.dupe(u8, buffer[offset.*..][0..len]);
+                offset.* += len;
+                break :blk Value{ .Text = text };
+            },
+            .Real => blk: {
+                if (offset.* + 8 > buffer.len) return error.InvalidMetadata;
+                const bits = std.mem.readInt(u64, buffer[offset.*..][0..8], .little);
+                offset.* += 8;
+                break :blk Value{ .Real = @bitCast(bits) };
+            },
+            .Boolean => blk: {
+                if (offset.* >= buffer.len) return error.InvalidMetadata;
+                const flag = buffer[offset.*] != 0;
+                offset.* += 1;
+                break :blk Value{ .Boolean = flag };
+            },
+            .SmallInt => blk: {
+                if (offset.* + 2 > buffer.len) return error.InvalidMetadata;
+                const value = std.mem.readInt(i16, buffer[offset.*..][0..2], .little);
+                offset.* += 2;
+                break :blk Value{ .SmallInt = value };
+            },
+            .BigInt => blk: {
+                if (offset.* + 8 > buffer.len) return error.InvalidMetadata;
+                const value = std.mem.readInt(i64, buffer[offset.*..][0..8], .little);
+                offset.* += 8;
+                break :blk Value{ .BigInt = value };
+            },
+            .Blob => blk: {
+                if (offset.* + 2 > buffer.len) return error.InvalidMetadata;
+                const len = std.mem.readInt(u16, buffer[offset.*..][0..2], .little);
+                offset.* += 2;
+                if (offset.* + len > buffer.len) return error.InvalidMetadata;
+                const blob = try self.allocator.dupe(u8, buffer[offset.*..][0..len]);
+                offset.* += len;
+                break :blk Value{ .Blob = blob };
+            },
+        };
+    }
+
+    fn writeFunctionArgument(buffer: []u8, offset: *usize, arg: Column.FunctionArgument) !void {
+        switch (arg) {
+            .Literal => |literal| {
+                if (offset.* + 1 > buffer.len) return error.NoMetadataSpace;
+                buffer[offset.*] = @intFromEnum(MetadataFunctionArgTag.Literal);
+                offset.* += 1;
+                try writeMetadataValue(buffer, offset, literal);
+            },
+            .Column => |column| {
+                if (offset.* + 3 + column.len > buffer.len) return error.NoMetadataSpace;
+                buffer[offset.*] = @intFromEnum(MetadataFunctionArgTag.Column);
+                offset.* += 1;
+                std.mem.writeInt(u16, buffer[offset.*..][0..2], @intCast(column.len), .little);
+                offset.* += 2;
+                @memcpy(buffer[offset.*..][0..column.len], column);
+                offset.* += column.len;
+            },
+            .Parameter => |param| {
+                if (offset.* + 5 > buffer.len) return error.NoMetadataSpace;
+                buffer[offset.*] = @intFromEnum(MetadataFunctionArgTag.Parameter);
+                offset.* += 1;
+                std.mem.writeInt(u32, buffer[offset.*..][0..4], param, .little);
+                offset.* += 4;
+            },
+        }
+    }
+
+    fn readFunctionArgument(self: *Self, buffer: []const u8, offset: *usize) !Column.FunctionArgument {
+        if (offset.* >= buffer.len) return error.InvalidMetadata;
+        const tag: MetadataFunctionArgTag = @enumFromInt(buffer[offset.*]);
+        offset.* += 1;
+
+        return switch (tag) {
+            .Literal => Column.FunctionArgument{ .Literal = try self.readMetadataValue(buffer, offset) },
+            .Column => blk: {
+                if (offset.* + 2 > buffer.len) return error.InvalidMetadata;
+                const len = std.mem.readInt(u16, buffer[offset.*..][0..2], .little);
+                offset.* += 2;
+                if (offset.* + len > buffer.len) return error.InvalidMetadata;
+                const column = try self.allocator.dupe(u8, buffer[offset.*..][0..len]);
+                offset.* += len;
+                break :blk Column.FunctionArgument{ .Column = column };
+            },
+            .Parameter => blk: {
+                if (offset.* + 4 > buffer.len) return error.InvalidMetadata;
+                const param = std.mem.readInt(u32, buffer[offset.*..][0..4], .little);
+                offset.* += 4;
+                break :blk Column.FunctionArgument{ .Parameter = param };
+            },
+        };
+    }
+
+    fn writeDefaultValue(buffer: []u8, offset: *usize, default_value: Column.DefaultValue) !void {
+        switch (default_value) {
+            .Literal => |literal| {
+                if (offset.* + 1 > buffer.len) return error.NoMetadataSpace;
+                buffer[offset.*] = @intFromEnum(MetadataDefaultTag.Literal);
+                offset.* += 1;
+                try writeMetadataValue(buffer, offset, literal);
+            },
+            .FunctionCall => |function_call| {
+                if (offset.* + 5 + function_call.name.len > buffer.len) return error.NoMetadataSpace;
+                buffer[offset.*] = @intFromEnum(MetadataDefaultTag.FunctionCall);
+                offset.* += 1;
+                std.mem.writeInt(u16, buffer[offset.*..][0..2], @intCast(function_call.name.len), .little);
+                offset.* += 2;
+                @memcpy(buffer[offset.*..][0..function_call.name.len], function_call.name);
+                offset.* += function_call.name.len;
+                std.mem.writeInt(u16, buffer[offset.*..][0..2], @intCast(function_call.arguments.len), .little);
+                offset.* += 2;
+                for (function_call.arguments) |arg| {
+                    try writeFunctionArgument(buffer, offset, arg);
+                }
+            },
+        }
+    }
+
+    fn readDefaultValue(self: *Self, buffer: []const u8, offset: *usize) !Column.DefaultValue {
+        if (offset.* >= buffer.len) return error.InvalidMetadata;
+        const tag: MetadataDefaultTag = @enumFromInt(buffer[offset.*]);
+        offset.* += 1;
+
+        return switch (tag) {
+            .Literal => Column.DefaultValue{ .Literal = try self.readMetadataValue(buffer, offset) },
+            .FunctionCall => blk: {
+                if (offset.* + 2 > buffer.len) return error.InvalidMetadata;
+                const name_len = std.mem.readInt(u16, buffer[offset.*..][0..2], .little);
+                offset.* += 2;
+                if (offset.* + name_len + 2 > buffer.len) return error.InvalidMetadata;
+                const name = try self.allocator.dupe(u8, buffer[offset.*..][0..name_len]);
+                offset.* += name_len;
+                errdefer self.allocator.free(name);
+
+                const arg_count = std.mem.readInt(u16, buffer[offset.*..][0..2], .little);
+                offset.* += 2;
+                var args = try self.allocator.alloc(Column.FunctionArgument, arg_count);
+                errdefer self.allocator.free(args);
+
+                var args_loaded: usize = 0;
+                errdefer {
+                    for (args[0..args_loaded]) |arg| {
+                        arg.deinit(self.allocator);
+                    }
+                }
+
+                while (args_loaded < arg_count) : (args_loaded += 1) {
+                    args[args_loaded] = try self.readFunctionArgument(buffer, offset);
+                }
+
+                break :blk Column.DefaultValue{ .FunctionCall = Column.FunctionCall{
+                    .name = name,
+                    .arguments = args,
+                } };
+            },
+        };
+    }
+
+    fn clearFTSIndex(self: *Self, fts_index: *FTSIndex) void {
+        _ = self;
+        var iter = fts_index.inverted_index.iterator();
+        while (iter.next()) |entry| {
+            fts_index.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(fts_index.allocator);
+        }
+        fts_index.inverted_index.clearRetainingCapacity();
+    }
+
+    fn rebuildFTSIndex(self: *Self, fts_index: *FTSIndex) !void {
+        self.clearFTSIndex(fts_index);
+
+        const table = self.getTable(fts_index.table_name) orelse return error.TableNotFound;
+        const rows = try table.selectWithKeys(self.allocator);
+        defer {
+            for (rows) |item| {
+                for (item.row.values) |value| {
+                    value.deinit(self.allocator);
+                }
+                self.allocator.free(item.row.values);
+            }
+            self.allocator.free(rows);
+        }
+
+        for (rows) |item| {
+            const fts_values = if (item.row.values.len > 1) item.row.values[1..] else item.row.values;
+            try fts_index.indexDocument(@intCast(item.key), fts_values);
+        }
+    }
 
     /// Load existing tables from storage
     fn loadTables(self: *Self) !void {
@@ -380,6 +1021,166 @@ pub const StorageEngine = struct {
             self.allocator.free(columns);
 
             tables_loaded += 1;
+        }
+
+        if (offset + 4 > page.data.len) return;
+
+        const index_count = std.mem.readInt(u32, page.data[offset..][0..4], .little);
+        offset += 4;
+
+        var indexes_loaded: u32 = 0;
+        while (indexes_loaded < index_count and offset + 7 < page.data.len) {
+            const index_name_len = std.mem.readInt(u16, page.data[offset..][0..2], .little);
+            offset += 2;
+            if (offset + index_name_len > page.data.len) break;
+            const index_name = page.data[offset..][0..index_name_len];
+            offset += index_name_len;
+
+            const table_name_len = std.mem.readInt(u16, page.data[offset..][0..2], .little);
+            offset += 2;
+            if (offset + table_name_len > page.data.len) break;
+            const table_name = page.data[offset..][0..table_name_len];
+            offset += table_name_len;
+
+            if (offset + 3 > page.data.len) break;
+            const flags = page.data[offset];
+            offset += 1;
+            const is_unique = (flags & 0x01) != 0;
+
+            const column_count = std.mem.readInt(u16, page.data[offset..][0..2], .little);
+            offset += 2;
+
+            var column_names = try self.allocator.alloc([]const u8, column_count);
+            var loaded_columns: usize = 0;
+            errdefer {
+                for (column_names[0..loaded_columns]) |column_name| {
+                    self.allocator.free(column_name);
+                }
+                self.allocator.free(column_names);
+            }
+
+            while (loaded_columns < column_count and offset + 2 <= page.data.len) {
+                const column_name_len = std.mem.readInt(u16, page.data[offset..][0..2], .little);
+                offset += 2;
+                if (offset + column_name_len > page.data.len) break;
+
+                column_names[loaded_columns] = try self.allocator.dupe(u8, page.data[offset..][0..column_name_len]);
+                offset += column_name_len;
+                loaded_columns += 1;
+            }
+
+            const index = try self.registerIndex(index_name, table_name, column_names[0..loaded_columns], is_unique);
+            try self.rebuildIndex(index);
+
+            for (column_names[0..loaded_columns]) |column_name| {
+                self.allocator.free(column_name);
+            }
+            self.allocator.free(column_names);
+
+            indexes_loaded += 1;
+        }
+
+        if (page.data.len < 4) return;
+        const ext_magic_offset = page.data.len - 4;
+        if (offset > ext_magic_offset) return;
+        const ext_magic = std.mem.readInt(u32, page.data[ext_magic_offset..][0..4], .little);
+        if (ext_magic != METADATA_EXT_MAGIC) return;
+
+        if (offset + 4 > ext_magic_offset) return;
+        const table_extension_count = std.mem.readInt(u32, page.data[offset..][0..4], .little);
+        offset += 4;
+
+        var table_extensions_loaded: u32 = 0;
+        while (table_extensions_loaded < table_extension_count and offset + 4 <= ext_magic_offset) {
+            const table_name_len = std.mem.readInt(u16, page.data[offset..][0..2], .little);
+            offset += 2;
+            if (offset + table_name_len + 2 > ext_magic_offset) break;
+            const table_name = page.data[offset..][0..table_name_len];
+            offset += table_name_len;
+
+            const default_count = std.mem.readInt(u16, page.data[offset..][0..2], .little);
+            offset += 2;
+
+            if (self.getTable(table_name)) |table| {
+                var defaults_loaded: u16 = 0;
+                while (defaults_loaded < default_count and offset + 2 <= ext_magic_offset) : (defaults_loaded += 1) {
+                    const column_name_len = std.mem.readInt(u16, page.data[offset..][0..2], .little);
+                    offset += 2;
+                    if (offset + column_name_len > ext_magic_offset) break;
+                    const column_name = page.data[offset..][0..column_name_len];
+                    offset += column_name_len;
+
+                    const default_value = try self.readDefaultValue(page.data[0..ext_magic_offset], &offset);
+                    errdefer default_value.deinit(self.allocator);
+
+                    if (table.getColumnIndex(column_name)) |column_idx| {
+                        if (table.schema.columns[column_idx].default_value) |existing| {
+                            existing.deinit(self.allocator);
+                        }
+                        table.schema.columns[column_idx].default_value = default_value;
+                    } else {
+                        default_value.deinit(self.allocator);
+                    }
+                }
+            } else {
+                var defaults_skipped: u16 = 0;
+                while (defaults_skipped < default_count and offset + 2 <= ext_magic_offset) : (defaults_skipped += 1) {
+                    const column_name_len = std.mem.readInt(u16, page.data[offset..][0..2], .little);
+                    offset += 2;
+                    if (offset + column_name_len > ext_magic_offset) break;
+                    offset += column_name_len;
+                    var skipped_default = try self.readDefaultValue(page.data[0..ext_magic_offset], &offset);
+                    skipped_default.deinit(self.allocator);
+                }
+            }
+
+            table_extensions_loaded += 1;
+        }
+
+        if (offset + 4 > ext_magic_offset) return;
+        const fts_count = std.mem.readInt(u32, page.data[offset..][0..4], .little);
+        offset += 4;
+
+        var fts_loaded: u32 = 0;
+        while (fts_loaded < fts_count and offset + 4 <= ext_magic_offset) {
+            const table_name_len = std.mem.readInt(u16, page.data[offset..][0..2], .little);
+            offset += 2;
+            if (offset + table_name_len + 2 > ext_magic_offset) break;
+            const table_name = page.data[offset..][0..table_name_len];
+            offset += table_name_len;
+
+            const column_count = std.mem.readInt(u16, page.data[offset..][0..2], .little);
+            offset += 2;
+
+            var column_names = try self.allocator.alloc([]const u8, column_count);
+            var loaded_columns: usize = 0;
+            errdefer {
+                for (column_names[0..loaded_columns]) |column_name| {
+                    self.allocator.free(column_name);
+                }
+                self.allocator.free(column_names);
+            }
+
+            while (loaded_columns < column_count and offset + 2 <= ext_magic_offset) {
+                const column_name_len = std.mem.readInt(u16, page.data[offset..][0..2], .little);
+                offset += 2;
+                if (offset + column_name_len > ext_magic_offset) break;
+                column_names[loaded_columns] = try self.allocator.dupe(u8, page.data[offset..][0..column_name_len]);
+                offset += column_name_len;
+                loaded_columns += 1;
+            }
+
+            try self.createFTSIndex(table_name, column_names[0..loaded_columns]);
+            if (self.getFTSIndex(table_name)) |fts_index| {
+                try self.rebuildFTSIndex(fts_index);
+            }
+
+            for (column_names[0..loaded_columns]) |column_name| {
+                self.allocator.free(column_name);
+            }
+            self.allocator.free(column_names);
+
+            fts_loaded += 1;
         }
     }
 
@@ -1182,6 +1983,12 @@ pub const Index = struct {
     /// Search for a key in the index
     pub fn search(self: *Self, key: u64) !?u64 {
         if (try self.btree.search(key)) |row| {
+            defer {
+                for (row.values) |value| {
+                    value.deinit(self.btree.allocator);
+                }
+                self.btree.allocator.free(row.values);
+            }
             if (row.values.len > 0) {
                 switch (row.values[0]) {
                     .Integer => |row_id| return @intCast(row_id),

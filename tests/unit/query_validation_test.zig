@@ -102,6 +102,45 @@ test "Query Validation - Subqueries and Window Functions" {
     try testing.expect(result.rows.items.len >= 2);
 }
 
+test "Query Validation - Prepared named window definitions" {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const conn = try zqlite.open(allocator, ":memory:");
+    defer conn.close();
+
+    try conn.execute("CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, department TEXT, salary INTEGER)");
+    try conn.execute("INSERT INTO employees (name, department, salary) VALUES ('Alice', 'Engineering', 75000)");
+    try conn.execute("INSERT INTO employees (name, department, salary) VALUES ('Bob', 'Engineering', 80000)");
+    try conn.execute("INSERT INTO employees (name, department, salary) VALUES ('Eve', 'Sales', 72000)");
+
+    var stmt = try conn.prepare(
+        \\SELECT name, department, ROW_NUMBER() OVER dept_salary AS dept_rank
+        \\FROM employees
+        \\WINDOW dept_salary AS (PARTITION BY department ORDER BY salary DESC)
+    );
+    defer stmt.deinit();
+
+    var result = try stmt.execute();
+    defer result.deinit();
+
+    try testing.expect(result.rows.items.len == 3);
+
+    var found_bob = false;
+    for (result.rows.items) |row| {
+        if (row.values[0] == .Text and std.mem.eql(u8, row.values[0].Text, "Bob")) {
+            found_bob = true;
+            switch (row.values[2]) {
+                .Integer => |rank| try testing.expectEqual(@as(i64, 1), rank),
+                else => return error.UnexpectedValueType,
+            }
+        }
+    }
+
+    try testing.expect(found_bob);
+}
+
 test "Query Validation - Date and Time Functions" {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();

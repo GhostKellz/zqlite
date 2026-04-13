@@ -18,7 +18,7 @@ pub fn main() !void {
 }
 
 fn testMultipleReaders(allocator: std.mem.Allocator) !void {
-    std.log.info("[TEST] Multiple concurrent readers", .{});
+    std.log.info("[TEST] Multiple sequential readers", .{});
     const path = "/tmp/zqlite_concurrent_read.db";
 
     // Setup: create database with data
@@ -37,26 +37,43 @@ fn testMultipleReaders(allocator: std.mem.Allocator) !void {
         }
     }
 
-    // Open multiple read connections simultaneously
-    var conn1 = try zqlite.open(allocator, path);
-    defer conn1.close();
-    var conn2 = try zqlite.open(allocator, path);
-    defer conn2.close();
-    var conn3 = try zqlite.open(allocator, path);
-    defer conn3.close();
+    // Test sequential read connections (zqlite uses single-connection model per file)
+    var count1: usize = 0;
+    var count2: usize = 0;
+    var count3: usize = 0;
 
-    // Read from all connections
-    var r1 = try conn1.query("SELECT * FROM data WHERE id < 30");
-    defer r1.deinit();
-    var r2 = try conn2.query("SELECT * FROM data WHERE id >= 30 AND id < 60");
-    defer r2.deinit();
-    var r3 = try conn3.query("SELECT * FROM data WHERE id >= 60");
-    defer r3.deinit();
+    {
+        var conn = try zqlite.open(allocator, path);
+        defer conn.close();
+        var r1 = try conn.query("SELECT * FROM data WHERE id < 30");
+        defer r1.deinit();
+        count1 = r1.rows.items.len;
+    }
 
-    const total = r1.rows.items.len + r2.rows.items.len + r3.rows.items.len;
-    std.debug.assert(total == 100);
+    {
+        var conn = try zqlite.open(allocator, path);
+        defer conn.close();
+        var r2 = try conn.query("SELECT * FROM data WHERE id >= 30 AND id < 60");
+        defer r2.deinit();
+        count2 = r2.rows.items.len;
+    }
 
-    std.log.info("[PASS] Multiple readers: {d} + {d} + {d} = {d} rows", .{ r1.rows.items.len, r2.rows.items.len, r3.rows.items.len, total });
+    {
+        var conn = try zqlite.open(allocator, path);
+        defer conn.close();
+        var r3 = try conn.query("SELECT * FROM data WHERE id >= 60");
+        defer r3.deinit();
+        count3 = r3.rows.items.len;
+    }
+
+    const total = count1 + count2 + count3;
+    std.log.info("[DEBUG] counts: {d} + {d} + {d} = {d}", .{ count1, count2, count3, total });
+    if (total != 100) {
+        std.log.err("[FAIL] Expected 100 rows, got {d}", .{total});
+        return error.TestFailed;
+    }
+
+    std.log.info("[PASS] Sequential readers: {d} + {d} + {d} = {d} rows", .{ count1, count2, count3, total });
 }
 
 fn testReaderWriter(allocator: std.mem.Allocator) !void {

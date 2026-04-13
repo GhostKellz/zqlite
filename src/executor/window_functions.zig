@@ -496,6 +496,7 @@ pub const WindowExecutor = struct {
         rows: *std.ArrayList(storage.Row),
         window_functions: []ast.WindowFunction,
         column_names: []const []const u8,
+        window_definitions: ?[]const ast.WindowDefinition,
     ) !void {
         if (window_functions.len == 0) return;
 
@@ -509,11 +510,13 @@ pub const WindowExecutor = struct {
 
         // Process each window function
         for (window_functions) |window_func| {
+            const resolved_spec = resolveWindowSpecification(window_func.window_spec, window_definitions) orelse window_func.window_spec;
+
             // Create context with ORDER BY and column indices
             var context = try WindowContext.initWithOrderBy(
                 self.allocator,
                 rows.items,
-                window_func.window_spec.order_by,
+                resolved_spec.order_by,
                 column_indices,
             );
             defer context.deinit();
@@ -540,6 +543,23 @@ pub const WindowExecutor = struct {
                 row.values = new_values;
             }
         }
+    }
+
+    pub fn resolveWindowSpecification(spec: ast.WindowSpecification, definitions: ?[]const ast.WindowDefinition) ?ast.WindowSpecification {
+        const name = spec.window_name orelse return null;
+        const windows = definitions orelse return null;
+
+        for (windows) |window| {
+            if (!std.mem.eql(u8, window.name, name)) continue;
+
+            var merged = window.specification;
+            if (spec.partition_by != null) merged.partition_by = spec.partition_by;
+            if (spec.order_by != null) merged.order_by = spec.order_by;
+            if (spec.frame_clause != null) merged.frame_clause = spec.frame_clause;
+            return merged;
+        }
+
+        return null;
     }
 
     /// Execute PERCENT_RANK() window function

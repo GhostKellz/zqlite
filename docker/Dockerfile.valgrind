@@ -1,3 +1,15 @@
-FROM alpine:latest
-RUN apk add --no-cache valgrind libc6-compat
-WORKDIR /workspace
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    build-essential \
+    ca-certificates \
+    git \
+    valgrind \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace/zqlite
+
+COPY . /workspace/zqlite
+
+CMD ["sh", "/workspace/zqlite/docker/scripts/run-valgrind.sh"]

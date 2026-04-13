@@ -1,6 +1,14 @@
 const std = @import("std");
 const zqlite = @import("zqlite");
 
+fn textIndexKey(text: []const u8) u64 {
+    var hash: u64 = 0;
+    for (text) |byte| {
+        hash = hash *% 31 +% byte;
+    }
+    return hash;
+}
+
 /// Test index persistence across connections
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
@@ -38,6 +46,19 @@ fn testBasicIndexPersistence(allocator: std.mem.Allocator) !void {
     {
         var conn = try zqlite.open(allocator, path);
         defer conn.close();
+
+        const index = conn.storage_engine.getIndex("idx_users_email") orelse return error.IndexMissingAfterReopen;
+        const row_id = try index.search(textIndexKey("bob@test.com")) orelse return error.IndexLookupFailedAfterReopen;
+        const row = try conn.storage_engine.getTable("users").?.getRow(@intCast(row_id)) orelse return error.IndexRowMissingAfterReopen;
+        defer {
+            for (row.values) |value| {
+                value.deinit(allocator);
+            }
+            allocator.free(row.values);
+        }
+
+        std.debug.assert(row.values.len == 3);
+        std.debug.assert(std.mem.eql(u8, row.values[2].Text, "bob@test.com"));
 
         // Query using indexed column
         var result = try conn.query("SELECT * FROM users WHERE email = 'bob@test.com'");
@@ -80,6 +101,26 @@ fn testUniqueIndexPersistence(allocator: std.mem.Allocator) !void {
         }
 
         std.log.info("[PASS] Unique index persistence", .{});
+    }
+
+    // Third connection: verify post-reopen inserts refresh the index contents too
+    {
+        var conn = try zqlite.open(allocator, path);
+        defer conn.close();
+
+        try conn.execute("INSERT INTO products (id, sku) VALUES (4, 'SKU-004')");
+
+        const index = conn.storage_engine.getIndex("idx_products_sku") orelse return error.UniqueIndexMissingAfterInsert;
+        const row_id = try index.search(textIndexKey("SKU-004")) orelse return error.UniqueIndexNotUpdatedAfterInsert;
+        const row = try conn.storage_engine.getTable("products").?.getRow(@intCast(row_id)) orelse return error.UniqueIndexRowMissingAfterInsert;
+        defer {
+            for (row.values) |value| {
+                value.deinit(allocator);
+            }
+            allocator.free(row.values);
+        }
+
+        std.debug.assert(std.mem.eql(u8, row.values[1].Text, "SKU-004"));
     }
 }
 

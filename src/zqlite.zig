@@ -217,7 +217,7 @@ pub fn printPQStatus() void {
 
 // Tests
 test "zqlite version info" {
-    try std.testing.expect(std.mem.eql(u8, version.VERSION_STRING, "1.6.0"));
+    try std.testing.expect(std.mem.eql(u8, version.VERSION_STRING, "1.6.2"));
 }
 
 test "build info contains version" {

@@ -61,6 +61,5 @@ pub fn main() !void {
 
     std.debug.print("   ✅ Migration system initialized: {d} migrations available\n", .{status.total_migrations});
 
-    std.debug.print("\n✅ All core features working correctly!\n", .{});
-    std.debug.print("   Ready for integration with GhostMesh and ZNS\n", .{});
+    std.debug.print("\nCore features test complete.\n", .{});
 }

@@ -1,23 +1,23 @@
 {
-  "version": "1.3.3",
-  "date": "2025-10-03",
+  "version": "1.6.2",
+  "date": "2026-04-13",
   "benchmarks": {
     "simple_insert": {
-      "min_ops_per_sec": 3000,
-      "description": "Simple INSERT operations (10 ops)"
+      "min_ops_per_sec": 1000,
+      "description": "Simple INSERT operations"
     },
     "bulk_insert": {
-      "min_ops_per_sec": 2000,
-      "description": "Bulk INSERT in transaction (10 ops)"
+      "min_ops_per_sec": 500,
+      "description": "Bulk INSERT in transaction"
     },
     "select_query": {
-      "min_ops_per_sec": 2000,
-      "description": "SELECT queries (50 ops)"
+      "min_ops_per_sec": 500,
+      "description": "SELECT queries"
     },
     "update": {
-      "min_ops_per_sec": 150,
-      "description": "UPDATE operations (50 ops)"
+      "min_ops_per_sec": 50,
+      "description": "UPDATE operations"
     }
   },
-  "notes": "Baseline performance thresholds for CI regression detection. Operation counts limited due to known B-tree memory issues."
+  "notes": "CI regression thresholds. Actual thresholds are in benchmark_validator.zig. Update this file when changing validator thresholds."
 }

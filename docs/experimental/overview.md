@@ -8,8 +8,8 @@ This document describes features that are experimental, proof-of-concept, or not
 
 ## Quick Reference
 
-| Feature | Status | Production Ready |
-|---------|--------|------------------|
+| Feature | Status | Usable |
+|---------|--------|--------|
 | Post-Quantum QUIC Transport | Experimental | No |
 | ML-KEM-768 Key Encapsulation | Experimental | No |
 | ML-DSA-65 Digital Signatures | Experimental | No |
@@ -19,8 +19,8 @@ This document describes features that are experimental, proof-of-concept, or not
 | Two-Phase Commit (Phase1) | Experimental | No |
 | Window Functions | Partial | Limited |
 | Query Cache | Partial | Limited |
-| Full-Text Search (FTS5) | Stable | Yes (v1.5.3+) |
-| ATTACH DATABASE | Stable | Yes (v1.5.3+) |
+| Full-Text Search (FTS5) | Stable | Yes |
+| ATTACH DATABASE | Stable | Yes |
 
 ---
 
@@ -87,7 +87,7 @@ Manages multiple database nodes for horizontal scaling.
 - No actual inter-node network communication
 - `executeQueryOnNode()` returns mock results
 - `mergeResults()` has basic implementation only
-- Health checks are configured but not actively running
+- Health checks evaluate node staleness locally, but there is still no active inter-node heartbeat transport
 - Shard count fixed at 1024 (hardcoded)
 
 **What Works:**
@@ -168,9 +168,7 @@ Coordinator for distributed transaction prepare phase.
 
 ---
 
-## New Features (v1.5.3)
-
-The following features were added in v1.5.3.
+## Stable Feature Notes
 
 ### Full-Text Search (FTS5)
 
@@ -181,7 +179,7 @@ The following features were added in v1.5.3.
 try conn.execute("CREATE VIRTUAL TABLE docs USING fts5(title, body)");
 
 // Insert and search
-try conn.execute("INSERT INTO docs VALUES (1, 'ZQLite Guide', 'A comprehensive guide to ZQLite')");
+try conn.execute("INSERT INTO docs VALUES ('ZQLite Guide', 'A comprehensive guide to ZQLite')");
 var result = try conn.query("SELECT * FROM docs WHERE body MATCH 'comprehensive guide'");
 ```
 
@@ -191,10 +189,11 @@ var result = try conn.query("SELECT * FROM docs WHERE body MATCH 'comprehensive 
 - MATCH operator for full-text queries
 - Case-insensitive tokenization
 - Multi-term AND search semantics
+- Phrase search using quoted terms
+- Boolean `AND` / `OR` / `NOT` matching
+- FTS metadata persists across reopen for file-backed databases
 
 **Limitations:**
-- FTS index is not persisted across restarts
-- No phrase search or boolean operators yet
 - Large document indexing not optimized
 
 ### ATTACH DATABASE
@@ -222,9 +221,7 @@ try conn.execute("DETACH DATABASE archive");
 - Cross-database transactions not fully tested
 - No schema migration between attached databases
 
-### Additional SQL Features (v1.5.3)
-
-The following SQL features were also added:
+### Additional SQL Features
 
 - **HAVING clause** - Filter results after GROUP BY aggregation
 - **SELECT DISTINCT** - Remove duplicate rows with hash-based deduplication
@@ -242,7 +239,6 @@ The following SQL features were also added:
 SQL window functions (RANK, ROW_NUMBER, etc.).
 
 **Limitations:**
-- PARTITION BY clause support is incomplete
 - Complex window frame specifications not supported
 - Performance optimizations missing
 - Some edge cases in ranking may not be handled
@@ -250,6 +246,7 @@ SQL window functions (RANK, ROW_NUMBER, etc.).
 **What Works:**
 - Basic ROW_NUMBER, RANK, DENSE_RANK
 - Simple ORDER BY within windows
+- PARTITION BY for supported ranking/window paths
 - Aggregate functions over windows (SUM, AVG, etc.)
 
 ---
@@ -261,8 +258,7 @@ SQL window functions (RANK, ROW_NUMBER, etc.).
 Caches query results for repeated SELECT statements.
 
 **Limitations:**
-- Eviction policy is simple (removes oldest entry)
-- Cache invalidation on UPDATE/DELETE is basic
+- Cache invalidation is table-scoped and does not support distributed/shared caches
 - Memory estimation is approximate
 - No cache warming or preloading
 - No distributed cache invalidation
@@ -271,7 +267,7 @@ Caches query results for repeated SELECT statements.
 - LRU-style caching
 - Query hash-based lookup
 - Configurable cache size
-- Basic invalidation on writes
+- Invalidation on row writes and schema mutations for affected tables
 
 ---
 
@@ -279,31 +275,29 @@ Caches query results for repeated SELECT statements.
 
 ### Enabling Features
 
-Experimental features are typically enabled via build options:
+Experimental code is built through the normal project profiles and feature flags:
 
-```zig
-// build.zig
-const enable_pq_crypto = b.option(bool, "enable-pq-crypto", "Enable post-quantum crypto") orelse false;
-const enable_cluster = b.option(bool, "enable-cluster", "Enable cluster features") orelse false;
+```bash
+zig build -Dprofile=full
+zig build -Dcrypto=true -Dtransport=true -Dconcurrent=true
 ```
+
+Current boolean feature flags exposed by the build are:
+
+- `-Dcrypto`
+- `-Dtransport`
+- `-Djson`
+- `-Dperformance`
+- `-Dconcurrent`
+- `-Dffi`
 
 ### Checking Feature Availability
 
-```zig
-const features = @import("zqlite").features;
-
-if (features.pq_crypto) {
-    // Post-quantum crypto available
-}
-
-if (features.cluster) {
-    // Cluster features available
-}
-```
+There is no global `zqlite.features.pq_crypto` or `zqlite.features.cluster` runtime surface today. Check the specific API or module you intend to use instead.
 
 ### Graceful Degradation
 
-Experimental features are designed to fail gracefully:
+Some experimental areas degrade or fall back gracefully, but this is feature-specific and should not be assumed globally:
 
 ```zig
 // PQ crypto falls back to classical
@@ -319,7 +313,7 @@ const result = try cluster.routeQuery(query);
 
 ## Roadmap
 
-### Added in v1.5.3
+### Added Earlier
 - [x] Full-text search (FTS5) with MATCH operator
 - [x] ATTACH/DETACH DATABASE support
 - [x] HAVING clause for GROUP BY
@@ -329,10 +323,10 @@ const result = try cluster.routeQuery(query);
 - [x] Two-phase commit coordinator (Phase1Engine)
 
 ### Near-term (v1.6.x)
-- [ ] Complete window function PARTITION BY support
-- [ ] Improve query cache invalidation
-- [ ] Add cluster health check implementation
-- [ ] FTS phrase search and boolean operators
+- [x] Complete window function PARTITION BY support
+- [x] Improve query cache invalidation
+- [x] Add cluster health check implementation
+- [x] FTS phrase search and boolean operators
 
 ### Medium-term (v1.7.x)
 - [ ] Integrate real QUIC library for PQ transport
@@ -351,12 +345,12 @@ const result = try cluster.routeQuery(query);
 When reporting issues with experimental features:
 
 1. Note the feature is experimental in your report
-2. Include ZQLite version (`zig build -Dversion`)
+2. Include the released ZQLite version you are testing
 3. Include Zig compiler version (`zig version`)
 4. Describe expected vs actual behavior
 5. Provide minimal reproduction steps
 
-File issues at: https://github.com/anthropics/zqlite/issues
+File issues at: https://github.com/ghostkellz/zqlite/issues
 
 ---
 
@@ -369,4 +363,4 @@ Contributions to experimental features are welcome! Priority areas:
 3. **Hot Standby:** Persistent replication log
 4. **Tests:** Integration tests for distributed features
 
-See CONTRIBUTING.md for guidelines.
+See `docs/project/maintainer-workflow.md` for current workflow guidance.

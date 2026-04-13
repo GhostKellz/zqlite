@@ -38,16 +38,18 @@ while (result.next()) |row| {
 var stmt = try conn.prepare("INSERT INTO users VALUES (?, ?, ?)");
 defer stmt.deinit();
 
-try stmt.bind(1, .{ .Integer = 1 });
-try stmt.bind(2, .{ .Text = "Alice" });
-try stmt.bind(3, .{ .Text = "alice@example.com" });
-try stmt.execute();
+try stmt.bind(0, 1);
+try stmt.bind(1, "Alice");
+try stmt.bind(2, "alice@example.com");
+_ = try stmt.execute();
 
 // Reuse
-try stmt.reset();
-try stmt.bind(1, .{ .Integer = 2 });
+stmt.reset();
+try stmt.bind(0, 2);
 // ...
 ```
+
+`bind()` uses native Zig values with 0-based parameter indexes. Use `bindParameter()` if you need to pass an explicit `storage.Value`.
 
 ### Transactions
 
@@ -78,8 +80,11 @@ pub const Value = union(enum) {
     Blob: []const u8,
     Null,
     Boolean: bool,
+    SmallInt: i16,
+    BigInt: i64,
     UUID: [16]u8,
-    Json: []const u8,
+    JSON: []const u8,
+    JSONB: []const u8,
     Array: []Value,
 };
 ```
@@ -121,7 +126,7 @@ conn.execute("...") catch |err| switch (err) {
 - `VARIANCE` / `VAR_POP` - Population variance
 - `GROUP_CONCAT` - Concatenate values with separator
 
-### Subqueries (v1.5.3+)
+### Subqueries
 
 ```zig
 // IN subquery
@@ -131,20 +136,20 @@ try conn.query("SELECT * FROM users WHERE id IN (SELECT user_id FROM active_user
 try conn.query("SELECT name, (SELECT COUNT(*) FROM orders WHERE orders.user_id = users.id) FROM users");
 ```
 
-### Full-Text Search (v1.5.3+)
+### Full-Text Search
 
 ```zig
 // Create FTS table
 try conn.execute("CREATE VIRTUAL TABLE articles USING fts5(title, content)");
 
 // Insert documents
-try conn.execute("INSERT INTO articles VALUES (1, 'Database Design', 'Best practices for schema design')");
+try conn.execute("INSERT INTO articles VALUES ('Database Design', 'Best practices for schema design')");
 
 // Search with MATCH operator
 var result = try conn.query("SELECT * FROM articles WHERE content MATCH 'schema design'");
 ```
 
-### ATTACH DATABASE (v1.5.3+)
+### ATTACH DATABASE
 
 ```zig
 // Attach external database
@@ -157,7 +162,7 @@ var result = try conn.query("SELECT * FROM main.users JOIN archive.old_users ON 
 try conn.execute("DETACH DATABASE archive");
 ```
 
-### HAVING Clause (v1.5.3+)
+### HAVING Clause
 
 ```zig
 // Filter aggregated results
@@ -169,7 +174,7 @@ var result = try conn.query(
 );
 ```
 
-### SELECT DISTINCT (v1.5.3+)
+### SELECT DISTINCT
 
 ```zig
 // Remove duplicate rows
@@ -209,9 +214,9 @@ pub fn main() !void {
     var stmt = try conn.prepare("INSERT INTO users (name, email) VALUES (?, ?)");
     defer stmt.deinit();
 
-    try stmt.bind(1, .{ .Text = "Alice" });
-    try stmt.bind(2, .{ .Text = "alice@example.com" });
-    try stmt.execute();
+    try stmt.bind(0, "Alice");
+    try stmt.bind(1, "alice@example.com");
+    _ = try stmt.execute();
 
     var result = try conn.query("SELECT * FROM users");
     defer result.deinit();

@@ -1,6 +1,6 @@
 #!/bin/bash
-# ZQLite v1.6.0 Release Validation Script
-# Runs the full test coverage that CI doesn't yet include
+# ZQLite Release Validation Script
+# Runs full test coverage beyond CI defaults
 
 set -e
 
@@ -33,6 +33,10 @@ echo ""
 
 echo "--- Comprehensive Tests ---"
 zig build test-comprehensive
+echo ""
+
+echo "--- Storage Tests ---"
+zig build test-storage
 echo ""
 
 echo "--- Advanced Tests ---"

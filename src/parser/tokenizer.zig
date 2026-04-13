@@ -369,6 +369,7 @@ pub const Token = union(enum) {
     Plan,
     Pragma,
     // Window function tokens
+    Window,
     Over,
     Partition,
     Row_Number,
@@ -629,6 +630,8 @@ fn getKeyword(identifier: []const u8) ?Token {
         .{ "plan", .Plan },
         .{ "PRAGMA", .Pragma },
         .{ "pragma", .Pragma },
+        .{ "WINDOW", .Window },
+        .{ "window", .Window },
         .{ "ATTACH", .Attach },
         .{ "attach", .Attach },
         .{ "DETACH", .Detach },

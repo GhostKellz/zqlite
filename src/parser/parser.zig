@@ -270,6 +270,12 @@ pub const Parser = struct {
             having = try self.parseWhere();
         }
 
+        // Parse optional WINDOW clause definitions
+        var window_definitions: ?[]ast.WindowDefinition = null;
+        if (std.meta.activeTag(self.current_token) == .Window) {
+            window_definitions = try self.parseWindowDefinitions();
+        }
+
         // For simple selects in compound statements, don't parse ORDER BY/LIMIT/OFFSET
         // Those are handled at the compound level
         // But we still need to parse them for standalone selects
@@ -344,9 +350,42 @@ pub const Parser = struct {
             .order_by = order_by,
             .limit = limit,
             .offset = offset,
-            .window_definitions = null,
+            .window_definitions = window_definitions,
             .distinct = is_distinct,
         };
+    }
+
+    fn parseWindowDefinitions(self: *Self) ![]ast.WindowDefinition {
+        try self.expect(.Window);
+
+        var definitions: std.ArrayListUnmanaged(ast.WindowDefinition) = .empty;
+        errdefer {
+            for (definitions.items) |*definition| {
+                definition.deinit(self.allocator);
+            }
+            definitions.deinit(self.allocator);
+        }
+
+        while (true) {
+            const name = try self.expectIdentifier();
+            errdefer self.allocator.free(name);
+
+            try self.expect(.As);
+            const specification = try self.parseWindowSpecification();
+
+            try definitions.append(self.allocator, ast.WindowDefinition{
+                .name = name,
+                .specification = specification,
+            });
+
+            if (std.meta.activeTag(self.current_token) == .Comma) {
+                try self.advance();
+            } else {
+                break;
+            }
+        }
+
+        return try definitions.toOwnedSlice(self.allocator);
     }
 
     /// Check if current token is a set operation
@@ -473,7 +512,7 @@ pub const Parser = struct {
 
         try self.expect(.Into);
 
-        const table_name = try self.expectIdentifier();
+        const table_name = try self.expectIdentifierOrKeyword();
 
         // Parse optional column list
         var columns: ?[][]const u8 = null;
@@ -483,7 +522,7 @@ pub const Parser = struct {
             defer column_list.deinit(self.allocator);
 
             while (true) {
-                const col = try self.expectIdentifier();
+                const col = try self.expectIdentifierOrKeyword();
                 try column_list.append(self.allocator, col);
 
                 if (std.meta.activeTag(self.current_token) == .Comma) {
@@ -568,7 +607,7 @@ pub const Parser = struct {
             defer cols.deinit(self.allocator);
 
             while (true) {
-                const col = try self.expectIdentifier();
+                const col = try self.expectIdentifierOrKeyword();
                 try cols.append(self.allocator, col);
 
                 if (std.meta.activeTag(self.current_token) == .Comma) {
@@ -601,7 +640,7 @@ pub const Parser = struct {
             defer assignments.deinit(self.allocator);
 
             while (true) {
-                const column = try self.expectIdentifier();
+                const column = try self.expectIdentifierOrKeyword();
                 try self.expect(.Equal);
                 const expr = try self.parseExpression();
 
@@ -1104,7 +1143,7 @@ pub const Parser = struct {
         }
 
         while (true) {
-            const column = try self.expectIdentifier();
+            const column = try self.expectIdentifierOrKeyword();
             errdefer self.allocator.free(column);
 
             try self.expect(.Equal);
@@ -1182,16 +1221,25 @@ pub const Parser = struct {
     /// Parse a column in SELECT
     fn parseColumn(self: *Self) !ast.Column {
         // Check for aggregate functions like COUNT(*), SUM(col), AVG(col), MIN(col), MAX(col), STDDEV, VARIANCE, GROUP_CONCAT
-        const agg_type: ?ast.AggregateFunctionType = switch (std.meta.activeTag(self.current_token)) {
-            .Count => .Count,
-            .Sum => .Sum,
-            .Avg => .Avg,
-            .Min => .Min,
-            .Max => .Max,
-            .Stddev => .Stddev,
-            .Variance => .Variance,
-            .GroupConcat => .GroupConcat,
-            else => null,
+        const agg_type: ?ast.AggregateFunctionType = blk: {
+            const next_token = try self.peekNextToken();
+            defer if (next_token) |token| token.deinit(self.allocator);
+
+            if (next_token == null or std.meta.activeTag(next_token.?) != .LeftParen) {
+                break :blk null;
+            }
+
+            break :blk switch (std.meta.activeTag(self.current_token)) {
+                .Count => .Count,
+                .Sum => .Sum,
+                .Avg => .Avg,
+                .Min => .Min,
+                .Max => .Max,
+                .Stddev => .Stddev,
+                .Variance => .Variance,
+                .GroupConcat => .GroupConcat,
+                else => null,
+            };
         };
 
         if (agg_type) |func_type| {
@@ -1357,13 +1405,13 @@ pub const Parser = struct {
         }
 
         // Regular column parsing - handle qualified names (table.column)
-        const first_part = try self.expectIdentifier();
+        const first_part = try self.expectIdentifierOrKeyword();
         var name: []const u8 = first_part;
 
         // Check for qualified name (table.column)
         if (std.meta.activeTag(self.current_token) == .Dot) {
             try self.advance(); // consume '.'
-            const second_part = try self.expectIdentifier();
+            const second_part = try self.expectIdentifierOrKeyword();
             // Create qualified name "table.column"
             const qualified_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ first_part, second_part });
             self.allocator.free(first_part);
@@ -1376,13 +1424,18 @@ pub const Parser = struct {
         // Check for AS alias or implicit alias
         if (std.meta.activeTag(self.current_token) == .As) {
             try self.advance(); // consume AS
-            alias = try self.expectIdentifier();
-        } else if (std.meta.activeTag(self.current_token) == .Identifier) {
-            // Only treat as alias if it's not a keyword that could start a new clause
-            const id = self.current_token.Identifier;
-            if (!isClauseKeyword(id)) {
-                alias = try self.expectIdentifier();
-            }
+            alias = try self.expectIdentifierOrKeyword();
+        } else switch (self.current_token) {
+            .Identifier => {
+                const id = self.current_token.Identifier;
+                if (!isClauseKeyword(id)) {
+                    alias = try self.expectIdentifier();
+                }
+            },
+            .Count, .Sum, .Avg, .Min, .Max => {
+                alias = try self.expectIdentifierOrKeyword();
+            },
+            else => {},
         }
 
         return ast.Column{ .name = name, .expression = ast.ColumnExpression{ .Simple = try self.allocator.dupe(u8, name) }, .alias = alias };
@@ -1463,12 +1516,28 @@ pub const Parser = struct {
 
     /// Parse OVER clause window specification
     fn parseWindowSpecification(self: *Self) !ast.WindowSpecification {
+        if (std.meta.activeTag(self.current_token) != .LeftParen) {
+            return ast.WindowSpecification{
+                .window_name = try self.expectIdentifier(),
+                .partition_by = null,
+                .order_by = null,
+                .frame_clause = null,
+            };
+        }
+
         try self.expect(.LeftParen); // expect '('
 
-        const window_name: ?[]const u8 = null;
+        var window_name: ?[]const u8 = null;
         var partition_by: ?[][]const u8 = null;
         var order_by: ?[]ast.OrderByClause = null;
         var frame_clause: ?ast.FrameClause = null;
+
+        if (self.current_token == .Identifier) {
+            const name = self.current_token.Identifier;
+            if (!isWindowClauseKeyword(name)) {
+                window_name = try self.expectIdentifier();
+            }
+        }
 
         // Parse optional PARTITION BY
         if (std.meta.activeTag(self.current_token) == .Partition) {
@@ -1552,6 +1621,14 @@ pub const Parser = struct {
         };
     }
 
+    fn isWindowClauseKeyword(name: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(name, "PARTITION") or
+            std.ascii.eqlIgnoreCase(name, "ORDER") or
+            std.ascii.eqlIgnoreCase(name, "ROWS") or
+            std.ascii.eqlIgnoreCase(name, "RANGE") or
+            std.ascii.eqlIgnoreCase(name, "GROUPS");
+    }
+
     /// Parse frame clause (ROWS/RANGE BETWEEN ... AND ...)
     fn parseFrameClause(self: *Self) !ast.FrameClause {
         const frame_type: ast.FrameType = switch (std.meta.activeTag(self.current_token)) {
@@ -1620,7 +1697,7 @@ pub const Parser = struct {
 
     /// Parse a column definition in CREATE TABLE
     fn parseColumnDefinition(self: *Self) !ast.ColumnDefinition {
-        const name = try self.expectIdentifier();
+        const name = try self.expectIdentifierOrKeyword();
         const data_type = try self.parseDataType();
 
         var constraints: std.ArrayListUnmanaged(ast.ColumnConstraint) = .empty;
@@ -2131,19 +2208,25 @@ pub const Parser = struct {
     /// Parse a primary expression (column, literal, parameter, or subquery)
     fn parsePrimaryExpression(self: *Self) !ast.Expression {
         return switch (self.current_token) {
-            .Identifier => |id| {
-                var owned_id = try self.allocator.dupe(u8, id);
-                try self.advance();
+            .Identifier, .Count, .Sum, .Avg, .Min, .Max => {
+                var owned_id = try self.expectIdentifierOrKeyword();
+                errdefer self.allocator.free(owned_id);
 
                 // Check for qualified name (table.column)
                 if (std.meta.activeTag(self.current_token) == .Dot) {
                     try self.advance(); // consume '.'
-                    if (self.current_token == .Identifier) {
-                        const second_part = self.current_token.Identifier;
+                    if (self.current_token == .Identifier or
+                        self.current_token == .Count or
+                        self.current_token == .Sum or
+                        self.current_token == .Avg or
+                        self.current_token == .Min or
+                        self.current_token == .Max)
+                    {
+                        const second_part = try self.expectIdentifierOrKeyword();
+                        defer self.allocator.free(second_part);
                         const qualified_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ owned_id, second_part });
                         self.allocator.free(owned_id);
                         owned_id = qualified_name;
-                        try self.advance();
                     }
                 }
 
@@ -2665,6 +2748,50 @@ test "parse create table with default function call" {
     const second_col = create_stmt.columns[1];
     try std.testing.expectEqual(@as(usize, 1), second_col.constraints.len);
     try std.testing.expectEqual(std.meta.Tag(ast.ColumnConstraint).Default, std.meta.activeTag(second_col.constraints[0]));
+}
+
+test "parse create table with aggregate keyword column name" {
+    const allocator = std.testing.allocator;
+    const sql = "CREATE TABLE counter (id INTEGER, count INTEGER)";
+
+    var result = try parse(allocator, sql);
+    defer result.deinit();
+
+    try std.testing.expectEqual(std.meta.Tag(ast.Statement).CreateTable, std.meta.activeTag(result.statement));
+
+    const create_stmt = result.statement.CreateTable;
+    try std.testing.expectEqual(@as(usize, 2), create_stmt.columns.len);
+    try std.testing.expectEqualStrings("count", create_stmt.columns[1].name);
+}
+
+test "parse insert with aggregate keyword identifiers" {
+    const allocator = std.testing.allocator;
+    const sql = "INSERT INTO counter (id, count) VALUES (1, 0)";
+
+    var result = try parse(allocator, sql);
+    defer result.deinit();
+
+    try std.testing.expectEqual(std.meta.Tag(ast.Statement).Insert, std.meta.activeTag(result.statement));
+
+    const insert_stmt = result.statement.Insert;
+    try std.testing.expectEqualStrings("counter", insert_stmt.table_name);
+    try std.testing.expect(insert_stmt.columns != null);
+    try std.testing.expectEqual(@as(usize, 2), insert_stmt.columns.?.len);
+    try std.testing.expectEqualStrings("count", insert_stmt.columns.?[1]);
+}
+
+test "parse select bare aggregate keyword as column name" {
+    const allocator = std.testing.allocator;
+    const sql = "SELECT count FROM counter WHERE id = 1";
+
+    var result = try parse(allocator, sql);
+    defer result.deinit();
+
+    try std.testing.expectEqual(std.meta.Tag(ast.Statement).Select, std.meta.activeTag(result.statement));
+
+    const select_stmt = result.statement.Select;
+    try std.testing.expectEqual(@as(usize, 1), select_stmt.columns.len);
+    try std.testing.expectEqualStrings("count", select_stmt.columns[0].name);
 }
 
 test "parse insert with parameters" {

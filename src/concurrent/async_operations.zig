@@ -537,7 +537,7 @@ const ConnectionPool = struct {
     }
 };
 
-/// Production-ready query result type
+/// Query result type
 pub const QueryResult = struct {
     rows: []storage.Row,
     affected_rows: u64,

@@ -1,5 +1,5 @@
 const std = @import("std");
-const zqlite = @import("../src/zqlite.zig");
+const zqlite = @import("zqlite");
 
 /// ⛓️ ZQLite Blockchain Integration
 /// High-performance blockchain data storage and indexing
@@ -185,7 +185,7 @@ pub const BlockchainDB = struct {
 
     /// Initialize blockchain database
     pub fn init(allocator: std.mem.Allocator) !Self {
-        const version = @import("../src/version.zig");
+        const version = zqlite.version;
         std.debug.print("⛓️ Initializing {s} - Blockchain Database\n", .{version.FULL_VERSION_STRING});
 
         const crypto_engine = try allocator.create(zqlite.crypto.CryptoEngine);
@@ -557,6 +557,6 @@ pub fn main() !void {
     }
 
     std.debug.print("\n✅ Blockchain Integration Demo completed!\n", .{});
-    const version = @import("../src/version.zig");
+    const version = zqlite.version;
     std.debug.print("{s} provides secure, high-performance blockchain data storage\n", .{version.FULL_VERSION_STRING});
 }

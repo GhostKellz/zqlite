@@ -1,26 +1,25 @@
 const std = @import("std");
 const zqlite = @import("zqlite");
 
-/// Demo of all the new improved APIs for GhostMesh and ZNS use cases
+/// Demo of ZQLite API features
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("🚀 ZQLite v0.8.0 - Improved API Demo\n", .{});
-    std.debug.print("   Testing: DEFAULT clauses, simplified binding, transactions, migrations\n\n", .{});
+    std.debug.print("ZQLite API Demo\n", .{});
+    std.debug.print("Testing: DEFAULT clauses, binding, transactions, migrations\n\n", .{});
 
     // Open database connection
     var conn = try zqlite.openMemory(allocator);
-    defer conn.deinit();
+    defer conn.close();
 
     try demoMigrationSystem(allocator, conn);
     try demoImprovedCreateTable(conn);
     try demoSimplifiedParameterBinding(conn);
     try demoTransactionHelpers(conn);
 
-    std.debug.print("\n✅ All new features working correctly!\n", .{});
-    std.debug.print("   Ready for production use in GhostMesh and ZNS\n", .{});
+    std.debug.print("\nDemo complete.\n", .{});
 }
 
 /// Test the new migration system

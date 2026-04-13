@@ -761,8 +761,12 @@ pub const Connection = struct {
             w.deinit();
         }
 
-        // Flush pager to ensure all data is written to disk
+        // Persist table metadata on close so non-transaction file-backed writes
+        // keep the latest row counts and B-tree root pages after splits.
         if (self.owns_storage) {
+            if (!self.is_memory) {
+                self.storage_engine.saveAllMetadata() catch {};
+            }
             self.storage_engine.pager.flush() catch {};
             self.storage_engine.deinit();
         }

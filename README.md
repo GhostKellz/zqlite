@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Zero_Dependencies-22C55E?style=for-the-badge&logo=checkmarx&logoColor=white" alt="Zero Dependencies">
+  <img src="https://img.shields.io/badge/One_Dependency-22C55E?style=for-the-badge&logo=checkmarx&logoColor=white" alt="One Dependency">
   <img src="https://img.shields.io/badge/Memory_Safe-10B981?style=for-the-badge&logo=verified&logoColor=white" alt="Memory Safe">
   <img src="https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Linux">
@@ -28,12 +28,13 @@
 
 An embedded SQL database written in Zig. SQLite-style simplicity with some PostgreSQL conveniences.
 
+Current package dependency footprint: `zsync`.
+
 **Stable features:**
 - SQL parser (SELECT, INSERT, UPDATE, DELETE, JOINs, aggregates, subqueries)
 - B+ tree storage with write-ahead logging
 - In-memory and file-based databases
 - Prepared statements with parameter binding
-- Field-level encryption (ChaCha20-Poly1305)
 - C FFI bindings
 
 **Experimental features** (not stable):
@@ -46,9 +47,21 @@ See [Stable vs Experimental](docs/security/stable-vs-experimental.md) for detail
 
 Requires Zig 0.16.0-dev.2960 or later
 
+Quick source install via helper script:
+
+```bash
+curl -fsSL https://zqlite.cktech.sh | bash
+```
+
+Pinned release install:
+
+```bash
+curl -fsSL https://zqlite.cktech.sh | ZQLITE_REF=v1.6.2 bash
+```
+
 ```bash
 # Tagged release (recommended)
-zig fetch --save https://github.com/ghostkellz/zqlite/archive/refs/tags/v1.6.0.tar.gz
+zig fetch --save https://github.com/ghostkellz/zqlite/archive/refs/tags/v1.6.2.tar.gz
 
 # Or main branch
 zig fetch --save https://github.com/ghostkellz/zqlite/archive/main.tar.gz
@@ -126,7 +139,7 @@ docker-compose -f docker/docker-compose.yml run --rm zqlite-full
 
 ## Project Status
 
-**v1.6.0** - Beta
+**v1.6.2** - Beta
 
 Core database functionality is stable and tested. The project is under active development.
 
@@ -135,10 +148,10 @@ What works well:
 - JOINs, GROUP BY, ORDER BY, LIMIT
 - RETURNING clause, ON CONFLICT (upsert)
 - Prepared statements
-- Encryption at rest
 
 What's still experimental:
 - Post-quantum crypto (scaffolding only)
+- Internal encryption building blocks are present, but transparent database-at-rest encryption is not a stable public feature yet
 - Some edge cases in complex queries
 
 ## License

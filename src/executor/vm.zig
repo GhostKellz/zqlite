@@ -1177,6 +1177,8 @@ pub const VirtualMachine = struct {
                 }
             }
 
+            try self.connection.storage_engine.checkUniqueIndexes(table, final_values);
+
             // Handle ON CONFLICT - check for primary key conflict before insert
             if (insert.on_conflict != null) {
                 // Find primary key column index
@@ -1347,6 +1349,10 @@ pub const VirtualMachine = struct {
             }
         }
 
+        if (result.affected_rows > 0) {
+            try self.connection.storage_engine.refreshIndexesForTable(insert.table_name);
+        }
+
         // Invalidate query result cache for this table
         self.connection.invalidateResultCache(insert.table_name);
     }
@@ -1424,6 +1430,7 @@ pub const VirtualMachine = struct {
         defer schema.deinit(self.connection.allocator);
 
         try self.connection.storage_engine.createTable(create.table_name, schema);
+        self.connection.invalidateResultCache(create.table_name);
         result.affected_rows = 1;
     }
 
@@ -1547,6 +1554,10 @@ pub const VirtualMachine = struct {
 
         result.affected_rows = updated_count;
 
+        if (updated_count > 0) {
+            try self.connection.storage_engine.refreshIndexesForTable(update.table_name);
+        }
+
         // Invalidate query result cache for this table
         self.connection.invalidateResultCache(update.table_name);
     }
@@ -1606,6 +1617,10 @@ pub const VirtualMachine = struct {
         }
 
         result.affected_rows = deleted_count;
+
+        if (deleted_count > 0) {
+            try self.connection.storage_engine.refreshIndexesForTable(delete.table_name);
+        }
 
         // Invalidate query result cache for this table
         self.connection.invalidateResultCache(delete.table_name);
@@ -1679,7 +1694,7 @@ pub const VirtualMachine = struct {
             },
             .Like => self.evaluateLike(left_value, right_value, false),
             .NotLike => self.evaluateLike(left_value, right_value, true),
-            .Match => self.evaluateMatch(left_value, right_value), // FTS MATCH
+            .Match => self.evaluateMatch(left_value, right_value),
             .In, .NotIn => unreachable, // Already handled above
             .IsNull, .IsNotNull, .Between, .NotBetween => unreachable, // Already handled above
         };
@@ -1776,9 +1791,7 @@ pub const VirtualMachine = struct {
     }
 
     /// Evaluate FTS MATCH operator for full-text search
-    /// Checks if the text contains all words from the search query
     fn evaluateMatch(self: *Self, value: storage.Value, query: storage.Value) bool {
-        _ = self;
         const text = switch (value) {
             .Text => |t| t,
             else => return false,
@@ -1788,23 +1801,167 @@ pub const VirtualMachine = struct {
             else => return false,
         };
 
-        // Tokenize the search query and check if all terms exist in the text
-        var query_iter = std.mem.tokenizeAny(u8, search_query, " \t\n\r.,;:!?()[]{}\"'");
+        var normalized_query = std.ArrayListUnmanaged(u8).empty;
+        defer normalized_query.deinit(self.connection.allocator);
+        normalizeMatchQuery(self.connection.allocator, search_query, &normalized_query) catch return false;
 
-        while (query_iter.next()) |term| {
-            // Case-insensitive search: check if term exists in text
-            var found = false;
-            var text_iter = std.mem.tokenizeAny(u8, text, " \t\n\r.,;:!?()[]{}\"'");
-            while (text_iter.next()) |word| {
-                if (std.ascii.eqlIgnoreCase(word, term)) {
-                    found = true;
-                    break;
+        return evaluateMatchExpression(text, normalized_query.items) catch false;
+    }
+
+    fn normalizeMatchQuery(allocator: std.mem.Allocator, query: []const u8, normalized: *std.ArrayListUnmanaged(u8)) !void {
+        var i: usize = 0;
+        var pending_space = false;
+        while (i < query.len) {
+            const c = query[i];
+            if (std.ascii.isWhitespace(c)) {
+                pending_space = normalized.items.len > 0;
+                i += 1;
+                continue;
+            }
+
+            if (c == '"') {
+                if (pending_space and normalized.items.len > 0) {
+                    try normalized.append(allocator, ' ');
+                    pending_space = false;
+                }
+                try normalized.append(allocator, '"');
+                i += 1;
+                while (i < query.len and query[i] != '"') : (i += 1) {
+                    try normalized.append(allocator, std.ascii.toLower(query[i]));
+                }
+                if (i < query.len and query[i] == '"') {
+                    try normalized.append(allocator, '"');
+                    i += 1;
+                }
+                continue;
+            }
+
+            var token_end = i;
+            while (token_end < query.len and !std.ascii.isWhitespace(query[token_end])) : (token_end += 1) {}
+            const token = query[i..token_end];
+            if (pending_space and normalized.items.len > 0) {
+                try normalized.append(allocator, ' ');
+            }
+            pending_space = false;
+
+            if (std.ascii.eqlIgnoreCase(token, "and")) {
+                try normalized.appendSlice(allocator, "AND");
+            } else if (std.ascii.eqlIgnoreCase(token, "or")) {
+                try normalized.appendSlice(allocator, "OR");
+            } else if (std.ascii.eqlIgnoreCase(token, "not")) {
+                try normalized.appendSlice(allocator, "NOT");
+            } else {
+                for (token) |ch| {
+                    try normalized.append(allocator, std.ascii.toLower(ch));
                 }
             }
-            if (!found) return false;
+            i = token_end;
+        }
+    }
+
+    fn evaluateMatchExpression(text: []const u8, query: []const u8) !bool {
+        var tokens = std.ArrayListUnmanaged([]const u8).empty;
+        defer tokens.deinit(std.heap.page_allocator);
+        try tokenizeMatchExpression(std.heap.page_allocator, query, &tokens);
+        if (tokens.items.len == 0) return true;
+
+        var parser = MatchExpressionParser{ .tokens = tokens.items, .index = 0 };
+        return parser.parseExpression(text);
+    }
+
+    fn tokenizeMatchExpression(allocator: std.mem.Allocator, query: []const u8, tokens: *std.ArrayListUnmanaged([]const u8)) !void {
+        var i: usize = 0;
+        while (i < query.len) {
+            if (std.ascii.isWhitespace(query[i])) {
+                i += 1;
+                continue;
+            }
+            if (query[i] == '"') {
+                const start = i;
+                i += 1;
+                while (i < query.len and query[i] != '"') : (i += 1) {}
+                if (i < query.len) i += 1;
+                try tokens.append(allocator, query[start..i]);
+                continue;
+            }
+            const start = i;
+            while (i < query.len and !std.ascii.isWhitespace(query[i])) : (i += 1) {}
+            try tokens.append(allocator, query[start..i]);
+        }
+    }
+
+    const MatchExpressionParser = struct {
+        tokens: []const []const u8,
+        index: usize,
+
+        fn parseExpression(self: *MatchExpressionParser, text: []const u8) bool {
+            var value = self.parseTerm(text);
+            while (self.peek()) |token| {
+                if (!std.mem.eql(u8, token, "OR")) break;
+                self.index += 1;
+                const rhs = self.parseTerm(text);
+                value = value or rhs;
+            }
+            return value;
         }
 
-        return true;
+        fn parseTerm(self: *MatchExpressionParser, text: []const u8) bool {
+            var value = self.parseFactor(text);
+            while (self.peek()) |token| {
+                if (std.mem.eql(u8, token, "OR")) break;
+                if (std.mem.eql(u8, token, "AND")) {
+                    self.index += 1;
+                }
+                const rhs = self.parseFactor(text);
+                value = value and rhs;
+            }
+            return value;
+        }
+
+        fn parseFactor(self: *MatchExpressionParser, text: []const u8) bool {
+            if (self.peek()) |token| {
+                if (std.mem.eql(u8, token, "NOT")) {
+                    self.index += 1;
+                    return !self.parseFactor(text);
+                }
+                self.index += 1;
+                return matchToken(text, token);
+            }
+            return true;
+        }
+
+        fn peek(self: *MatchExpressionParser) ?[]const u8 {
+            if (self.index >= self.tokens.len) return null;
+            return self.tokens[self.index];
+        }
+    };
+
+    fn matchToken(text: []const u8, token: []const u8) bool {
+        if (token.len >= 2 and token[0] == '"' and token[token.len - 1] == '"') {
+            const phrase = token[1 .. token.len - 1];
+            return containsCaseInsensitive(text, phrase);
+        }
+
+        var text_iter = std.mem.tokenizeAny(u8, text, " \t\n\r.,;:!?()[]{}\"'");
+        while (text_iter.next()) |word| {
+            if (std.ascii.eqlIgnoreCase(word, token)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn containsCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
+        if (needle.len == 0) return true;
+        if (needle.len > haystack.len) return false;
+
+        var start: usize = 0;
+        while (start + needle.len <= haystack.len) : (start += 1) {
+            if (std.ascii.eqlIgnoreCase(haystack[start .. start + needle.len], needle)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Evaluate CASE WHEN ... THEN ... ELSE ... END expression
@@ -3432,6 +3589,7 @@ pub const VirtualMachine = struct {
             create_idx.columns,
             create_idx.unique,
         );
+        self.connection.invalidateResultCache(create_idx.table_name);
     }
 
     /// Execute DROP INDEX
@@ -3445,6 +3603,9 @@ pub const VirtualMachine = struct {
             }
             return error.IndexNotFound;
         }
+
+        const index = self.connection.storage_engine.getIndex(drop_idx.index_name).?;
+        self.connection.invalidateResultCache(index.table_name);
 
         // Drop the index
         try self.connection.storage_engine.dropIndex(drop_idx.index_name);
@@ -3464,6 +3625,7 @@ pub const VirtualMachine = struct {
 
         // Drop the table
         try self.connection.storage_engine.dropTable(drop_tbl.table_name);
+        self.connection.invalidateResultCache(drop_tbl.table_name);
     }
 
     /// Execute PRAGMA statement
@@ -3712,6 +3874,7 @@ pub const VirtualMachine = struct {
             self.connection.storage_engine.dropTable(create_vt.table_name) catch {};
             return err;
         };
+        self.connection.invalidateResultCache(create_vt.table_name);
     }
 
     /// Execute a basic query step (no CTEs or nested set operations - breaks recursion)
@@ -4013,60 +4176,172 @@ pub const VirtualMachine = struct {
         // Process each window function
         for (window_step.window_functions, 0..) |window_func, wf_idx| {
             const window_slot = window_step.projected_columns.len + wf_idx;
+            const resolved_spec = window_functions.WindowExecutor.resolveWindowSpecification(window_func.window_spec, window_step.window_definitions) orelse window_func.window_spec;
+            var partition_indices: std.ArrayListUnmanaged(usize) = .empty;
+            defer partition_indices.deinit(allocator);
 
-            // Check if this window function has PARTITION BY
-            if (window_func.window_spec.partition_by) |partition_cols| {
-                // Get partition column indices
-                var partition_indices: std.ArrayListUnmanaged(usize) = .empty;
-                defer partition_indices.deinit(allocator);
-
+            if (resolved_spec.partition_by) |partition_cols| {
                 for (partition_cols) |col_name| {
                     if (column_indices.get(col_name)) |idx| {
                         try partition_indices.append(allocator, idx);
                     }
                 }
+            }
 
-                // Find partition boundaries
-                const partitions = try self.findPartitionBoundaries(result.rows.items, partition_indices.items);
-                defer allocator.free(partitions);
+            try self.executeWindowFunctionOverGroups(
+                &executor,
+                window_func,
+                resolved_spec,
+                window_slot,
+                &column_indices,
+                partition_indices.items,
+                result,
+            );
+        }
+    }
 
-                // Process each partition
-                for (partitions) |partition| {
-                    var context = try window_functions.WindowContext.initWithOrderByAndPartition(
-                        allocator,
-                        result.rows.items,
-                        window_func.window_spec.order_by,
-                        column_indices,
-                        partition.start,
-                        partition.end,
-                    );
-                    defer context.deinit();
+    fn executeWindowFunctionOverGroups(
+        self: *Self,
+        executor: *window_functions.WindowExecutor,
+        window_func: ast.WindowFunction,
+        resolved_spec: ast.WindowSpecification,
+        window_slot: usize,
+        column_indices: *std.StringHashMap(usize),
+        partition_indices: []const usize,
+        result: *ExecutionResult,
+    ) !void {
+        const allocator = self.connection.allocator;
+        const row_count = result.rows.items.len;
 
-                    // Execute window function for each row in this partition
-                    var i = partition.start;
-                    while (i < partition.end) : (i += 1) {
-                        context.current_row = i;
-                        const window_value = try executor.executeWindowFunction(window_func, &context);
-                        result.rows.items[i].values[window_slot].deinit(allocator);
-                        result.rows.items[i].values[window_slot] = window_value;
-                    }
+        if (row_count == 0) return;
+
+        var assigned = try allocator.alloc(bool, row_count);
+        defer allocator.free(assigned);
+        @memset(assigned, false);
+
+        for (0..row_count) |row_idx| {
+            if (assigned[row_idx]) continue;
+
+            var group = std.ArrayListUnmanaged(usize).empty;
+            defer group.deinit(allocator);
+
+            if (partition_indices.len == 0) {
+                for (0..row_count) |idx| {
+                    assigned[idx] = true;
+                    try group.append(allocator, idx);
                 }
             } else {
-                // No PARTITION BY - treat all rows as one partition
-                var context = try window_functions.WindowContext.initWithOrderBy(
-                    allocator,
-                    result.rows.items,
-                    window_func.window_spec.order_by,
-                    column_indices,
-                );
-                defer context.deinit();
+                assigned[row_idx] = true;
+                try group.append(allocator, row_idx);
 
-                // Execute window function for each row
-                for (result.rows.items, 0..) |*row, i| {
-                    context.current_row = i;
-                    const window_value = try executor.executeWindowFunction(window_func, &context);
-                    row.values[window_slot].deinit(allocator);
-                    row.values[window_slot] = window_value;
+                for (row_idx + 1..row_count) |candidate_idx| {
+                    if (assigned[candidate_idx]) continue;
+                    if (self.rowsMatchOnColumns(result.rows.items[row_idx], result.rows.items[candidate_idx], partition_indices)) {
+                        assigned[candidate_idx] = true;
+                        try group.append(allocator, candidate_idx);
+                    }
+                }
+            }
+
+            try self.applyWindowFunctionToGroup(
+                executor,
+                window_func,
+                resolved_spec,
+                window_slot,
+                column_indices,
+                group.items,
+                result,
+            );
+        }
+    }
+
+    fn applyWindowFunctionToGroup(
+        self: *Self,
+        executor: *window_functions.WindowExecutor,
+        window_func: ast.WindowFunction,
+        resolved_spec: ast.WindowSpecification,
+        window_slot: usize,
+        column_indices: *std.StringHashMap(usize),
+        group_indices: []const usize,
+        result: *ExecutionResult,
+    ) !void {
+        const allocator = self.connection.allocator;
+
+        const ordered_indices = try allocator.alloc(usize, group_indices.len);
+        defer allocator.free(ordered_indices);
+        @memcpy(ordered_indices, group_indices);
+
+        if (resolved_spec.order_by) |order_by| {
+            self.sortProjectedRowIndices(result.rows.items, ordered_indices, order_by, column_indices);
+        }
+
+        const ordered_rows = try allocator.alloc(storage.Row, ordered_indices.len);
+        defer allocator.free(ordered_rows);
+        for (ordered_indices, 0..) |row_idx, i| {
+            ordered_rows[i] = result.rows.items[row_idx];
+        }
+
+        var context = try window_functions.WindowContext.initWithOrderBy(
+            allocator,
+            ordered_rows,
+            resolved_spec.order_by,
+            column_indices.*,
+        );
+        defer context.deinit();
+
+        for (ordered_indices, 0..) |original_row_idx, local_idx| {
+            context.current_row = local_idx;
+            const window_value = try executor.executeWindowFunction(window_func, &context);
+            result.rows.items[original_row_idx].values[window_slot].deinit(allocator);
+            result.rows.items[original_row_idx].values[window_slot] = window_value;
+        }
+    }
+
+    fn rowsMatchOnColumns(self: *Self, a: storage.Row, b: storage.Row, column_indices: []const usize) bool {
+        for (column_indices) |col_idx| {
+            if (col_idx >= a.values.len or col_idx >= b.values.len) {
+                return false;
+            }
+            if (!self.valuesEqual(a.values[col_idx], b.values[col_idx])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn sortProjectedRowIndices(
+        self: *Self,
+        rows: []storage.Row,
+        indices: []usize,
+        order_by: []ast.OrderByClause,
+        column_indices: *std.StringHashMap(usize),
+    ) void {
+        if (indices.len <= 1) return;
+
+        var i: usize = 0;
+        while (i < indices.len - 1) : (i += 1) {
+            var j: usize = 0;
+            while (j < indices.len - 1 - i) : (j += 1) {
+                var should_swap = false;
+
+                for (order_by) |clause| {
+                    const col_idx = column_indices.get(clause.column) orelse continue;
+                    const left = rows[indices[j]].values[col_idx];
+                    const right = rows[indices[j + 1]].values[col_idx];
+                    const cmp = self.compareValues(left, right);
+
+                    const swap_this = if (clause.direction == .Desc)
+                        cmp == .lt
+                    else
+                        cmp == .gt;
+                    if (swap_this) should_swap = true;
+                    if (cmp != .eq) break;
+                }
+
+                if (should_swap) {
+                    const tmp = indices[j];
+                    indices[j] = indices[j + 1];
+                    indices[j + 1] = tmp;
                 }
             }
         }

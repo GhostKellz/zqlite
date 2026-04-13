@@ -86,3 +86,27 @@ jobs:
 
       - name: Validate benchmark performance
         run: zig build bench-validate
+
+  extended-tests:
+    name: "Extended Test Suite"
+    runs-on: self-hosted
+    timeout-minutes: 15
+    needs: build-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clean workspace
+        run: rm -rf zig-out /tmp/zqlite_*.db
+
+      - name: Zig version
+        run: zig version
+
+      - name: Security tests
+        run: zig build test-security
+
+      - name: Comprehensive tests
+        run: zig build test-comprehensive
+
+      - name: Storage tests
+        run: zig build test-storage

@@ -42,7 +42,7 @@ try stmt.bind(2, @as(f64, 3.14));
 try stmt.bindNull(3);
 
 // Blob
-try stmt.bind(4, &[_]u8{0x01, 0x02, 0x03});
+try stmt.bindParameter(4, .{ .Blob = &[_]u8{ 0x01, 0x02, 0x03 } });
 ```
 
 ## Reusing Statements

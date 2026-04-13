@@ -1,5 +1,5 @@
 const std = @import("std");
-const zqlite = @import("../src/zqlite.zig");
+const zqlite = @import("zqlite");
 
 /// 🔒 GhostMesh VPN Coordination Server using ZQLite
 /// Manages peer connections, routing tables, and secure tunnels for mesh VPN
@@ -392,6 +392,6 @@ pub fn main() !void {
     status.printStatus();
 
     std.debug.print("\n✅ GhostMesh VPN Demo completed!\n", .{});
-    const version = @import("../src/version.zig");
+    const version = zqlite.version;
     std.debug.print("{s} + ZCrypto powering secure mesh VPN coordination\n", .{version.FULL_VERSION_STRING});
 }
