@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo/zqlite-logo.png" alt="ZQLite Logo" width="400">
+</p>
+
 <h1 align="center">ZQLite</h1>
 
 <p align="center">
