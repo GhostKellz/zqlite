@@ -1,15 +1,17 @@
 #!/bin/bash
-# ZQLite Zig 0.16.0-dev Compatibility Check
-# Validates code against Zig 0.16 API requirements
+# ZQLite Zig 0.17.0-dev Compatibility Check
+# Validates code against the current Zig API baseline
 
 set -e
+
+ZIG="${ZIG:-zig}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
-echo "=== ZQLite Zig 0.16.0-dev Compatibility Check ==="
-echo "Zig version: $(zig version)"
+echo "=== ZQLite Zig 0.17.0-dev Compatibility Check ==="
+echo "Zig version: $($ZIG version)"
 echo ""
 
 ERRORS=0
@@ -48,13 +50,6 @@ if [ "$NET_COUNT" -gt 0 ]; then
     ERRORS=$((ERRORS + 1))
 fi
 
-# Check for ArrayListUnmanaged (deprecated alias)
-UNMANAGED_COUNT=$(grep -r "ArrayListUnmanaged" src/ 2>/dev/null | wc -l || echo 0)
-if [ "$UNMANAGED_COUNT" -gt 0 ]; then
-    echo "⚠ Found $UNMANAGED_COUNT uses of deprecated ArrayListUnmanaged alias"
-    echo "  Use std.ArrayList(T) instead (it's now unmanaged by default)"
-fi
-
 echo ""
 
 if [ "$ERRORS" -gt 0 ]; then
@@ -62,7 +57,7 @@ if [ "$ERRORS" -gt 0 ]; then
     exit 1
 else
     echo "✓ Compatibility check PASSED"
-    if [ "$MANAGED_COUNT" -gt 0 ] || [ "$UNMANAGED_COUNT" -gt 0 ]; then
+    if [ "$MANAGED_COUNT" -gt 0 ]; then
         echo "  (Some deprecated aliases still in use - consider updating)"
     fi
 fi

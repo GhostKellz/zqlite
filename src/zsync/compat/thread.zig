@@ -1,9 +1,9 @@
-//! Compatibility layer for Zig 0.16 API removals (blocking mutex/condition and time helpers)
+//! Compatibility layer for blocking mutex/condition primitives and time helpers.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// Compatibility shim for std.time.Instant which was removed in Zig 0.16
+/// Local Instant helper used where the stdlib no longer provides the older API surface.
 pub const Instant = struct {
     timestamp: i128,
 
@@ -50,7 +50,7 @@ pub fn instantDiff(a: Instant, b: Instant) u64 {
     return a.since(b);
 }
 
-/// Compatibility shim for std.posix.CLOCK which was removed in Zig 0.16
+/// Minimal clock enum shim used by shared helper code.
 pub const CLOCK = struct {
     pub const REALTIME = std.os.linux.CLOCK.REALTIME;
     pub const MONOTONIC = std.os.linux.CLOCK.MONOTONIC;
@@ -59,7 +59,7 @@ pub const CLOCK = struct {
 /// Compatibility shim for timespec
 pub const timespec = std.os.linux.timespec;
 
-/// Compatibility shim for std.posix.clock_gettime which was removed in Zig 0.16
+/// Local clock_gettime wrapper used by shared helper code.
 pub fn clock_gettime(clock_id: std.os.linux.CLOCK) error{}!timespec {
     var ts: timespec = undefined;
     switch (builtin.os.tag) {
@@ -73,7 +73,7 @@ pub fn clock_gettime(clock_id: std.os.linux.CLOCK) error{}!timespec {
     return ts;
 }
 
-/// A blocking mutex compatible with the old std.Thread.Mutex API
+/// A blocking mutex with the legacy lock/unlock surface used in this repo.
 pub const Mutex = struct {
     state: std.atomic.Value(State) = .init(.unlocked),
 
@@ -119,7 +119,7 @@ pub const Mutex = struct {
     }
 };
 
-/// A blocking condition variable compatible with the old std.Thread.Condition API
+/// A blocking condition variable matching the repo's existing wait/signal usage.
 pub const Condition = struct {
     state: std.atomic.Value(u32) = .init(0),
 

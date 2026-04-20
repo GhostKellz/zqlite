@@ -2,7 +2,7 @@
 # Performance baseline - capture metrics
 set -e
 
-ZIG=/opt/zig/zig
+ZIG=/opt/zig-dev/zig
 cd /workspace/zqlite
 
 echo "=== ZQLite Performance Baseline ==="

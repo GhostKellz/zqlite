@@ -2,6 +2,18 @@
 
 ## Local Development
 
+Local compiler baseline:
+
+```bash
+/opt/zig-dev/zig version
+```
+
+Expected result:
+
+```text
+0.17.0-dev.27+0dd99c37c
+```
+
 ### Quick Validation
 
 ```bash
@@ -54,6 +66,7 @@ lint → build-test → [memory-tests, benchmarks, extended-tests]
 | extended-tests | `test-security`, `test-comprehensive`, `test-storage` |
 
 All jobs run on self-hosted runner.
+Runner Zig configuration should resolve to the same `0.17.0-dev.27+0dd99c37c` baseline used for local validation.
 
 ## Build Profiles
 

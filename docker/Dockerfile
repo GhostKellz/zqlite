@@ -15,4 +15,4 @@ WORKDIR /workspace/zqlite
 
 COPY . /workspace/zqlite
 
-CMD ["/opt/zig/zig", "build", "test"]
+CMD ["/opt/zig-dev/zig", "build", "test"]

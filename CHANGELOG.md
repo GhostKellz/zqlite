@@ -155,6 +155,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Example version references** - Updated examples from v0.5.0/v0.6.0 to v1.6.0
 
 ### Changed
+- **Zig 0.17.0-dev baseline** - Updated package, install, Docker, and maintainer requirements to `0.17.0-dev.27+0dd99c37c`
+- **Local tooling scripts** - Added `ZIG` environment override support so local runs, CI, and `/opt/zig-dev/zig` validation can share one baseline
 - **Zig 0.16 compatibility** - Migrated all test files from `GeneralPurposeAllocator` to `DebugAllocator`
 - **build.zig** - Fixed `test-quick` target path reference
 - **Standalone test imports** - Updated to use module imports instead of relative paths

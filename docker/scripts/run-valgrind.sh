@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-ZIG=/opt/zig/zig
+ZIG=/opt/zig-dev/zig
 ROOT=/workspace/zqlite
 BIN_DIR=/tmp/zqlite-valgrind
 VALGRIND_LOG_DIR=/tmp/zqlite-valgrind-logs

@@ -2,7 +2,7 @@
 # Critical path testing - file storage, persistence, concurrency, transactions
 set -e
 
-ZIG=/opt/zig/zig
+ZIG=/opt/zig-dev/zig
 cd /workspace/zqlite
 
 echo "=== ZQLite Critical Path Tests ==="

@@ -4,51 +4,53 @@
 
 set -e
 
+ZIG="${ZIG:-zig}"
+
 echo "=== ZQLite Release Validation ==="
 echo ""
 
 echo "--- Format Check ---"
-zig fmt --check src/
-zig fmt --check examples/
-zig fmt --check tests/
+$ZIG fmt --check src/
+$ZIG fmt --check examples/
+$ZIG fmt --check tests/
 echo "OK"
 echo ""
 
 echo "--- Build ---"
-zig build
+$ZIG build
 echo "OK"
 echo ""
 
 echo "--- Core Tests ---"
-zig build test --summary all
+$ZIG build test --summary all
 echo ""
 
 echo "--- Quick Tests ---"
-zig build test-quick
+$ZIG build test-quick
 echo ""
 
 echo "--- Security Tests ---"
-zig build test-security
+$ZIG build test-security
 echo ""
 
 echo "--- Comprehensive Tests ---"
-zig build test-comprehensive
+$ZIG build test-comprehensive
 echo ""
 
 echo "--- Storage Tests ---"
-zig build test-storage
+$ZIG build test-storage
 echo ""
 
 echo "--- Advanced Tests ---"
-zig build test-advanced
+$ZIG build test-advanced
 echo ""
 
 echo "--- C API Tests ---"
-zig build test-c-api
+$ZIG build test-c-api
 echo ""
 
 echo "--- Benchmark Validation ---"
-zig build bench-validate
+$ZIG build bench-validate
 echo ""
 
 echo "=== All release validation checks passed ==="

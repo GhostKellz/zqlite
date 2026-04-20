@@ -2,7 +2,7 @@
 # Chaos test - run tests repeatedly to catch flaky issues
 set -e
 
-ZIG=/opt/zig/zig
+ZIG=/opt/zig-dev/zig
 cd /workspace/zqlite
 
 ITERATIONS=${1:-5}

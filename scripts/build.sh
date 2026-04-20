@@ -1,8 +1,10 @@
 #!/bin/bash
-# ZQLite Build Script - Zig 0.16.0-dev
+# ZQLite Build Script - Zig 0.17.0-dev
 # Builds library with specified profile and options
 
 set -e
+
+ZIG="${ZIG:-zig}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
@@ -14,10 +16,10 @@ OPTIMIZE="${2:-Debug}"
 echo "=== ZQLite Build ==="
 echo "Profile: $PROFILE"
 echo "Optimize: $OPTIMIZE"
-echo "Zig version: $(zig version)"
+echo "Zig version: $($ZIG version)"
 echo ""
 
-zig build -Dprofile="$PROFILE" -Doptimize="$OPTIMIZE"
+$ZIG build -Dprofile="$PROFILE" -Doptimize="$OPTIMIZE"
 
 echo ""
 echo "Build complete. Output in zig-out/"

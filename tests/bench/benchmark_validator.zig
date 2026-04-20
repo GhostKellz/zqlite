@@ -10,7 +10,7 @@ const BenchResult = struct {
     passed: bool,
 };
 
-/// Get current time in nanoseconds using Zig 0.16 API
+/// Get current time in nanoseconds for CI benchmark validation.
 fn getNanoTime() i128 {
     var ts: std.posix.timespec = undefined;
     const result = std.posix.system.clock_gettime(.REALTIME, &ts);

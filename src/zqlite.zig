@@ -104,7 +104,7 @@ pub const database_errors = @import("error_handling/database_errors.zig");
 // Time utilities (safe timestamp functions)
 pub const time_utils = @import("time_utils.zig");
 
-// Compatibility shims for Zig 0.16 (mutex/condition/clock_gettime/Instant)
+// Compatibility shims for blocking primitives and time helpers used across targets
 pub const compat = @import("zsync/compat/thread.zig");
 
 // PQ-QUIC transport (profile: full, or -Dtransport=true)

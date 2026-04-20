@@ -2,7 +2,7 @@
 # Stress test - rapid connection cycling and heavy queries
 set -e
 
-ZIG=/opt/zig/zig
+ZIG=/opt/zig-dev/zig
 cd /workspace/zqlite
 
 echo "=== ZQLite Stress Test ==="

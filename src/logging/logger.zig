@@ -26,7 +26,7 @@ const compat = if (builtin.is_test) struct {
     }
 } else @import("root").compat;
 
-/// Production-grade structured logging system for Zig 0.16
+/// Production-grade structured logging system
 /// Features: JSON/text formats, log levels, thread-safe, scoped loggers
 pub const LogLevel = enum(u8) {
     debug = 0,

@@ -54,14 +54,14 @@ pub fn sanitizeIdentifier(identifier: []const u8) ![]const u8 {
 /// Rate limiter for database operations
 pub const RateLimiter = struct {
     allocator: std.mem.Allocator,
-    window_size_ns: i128,
+    window_size_ns: u64,
     max_requests: u32,
     requests: std.AutoHashMap(u64, RequestWindow),
     mutex: std.Io.Mutex = .init,
 
     const RequestWindow = struct {
         count: u32,
-        window_start: i128,
+        window_start: std.time.Instant,
     };
 
     const Self = @This();
@@ -70,7 +70,7 @@ pub const RateLimiter = struct {
     pub fn init(allocator: std.mem.Allocator, window_size_seconds: u32, max_requests: u32) Self {
         return Self{
             .allocator = allocator,
-            .window_size_ns = @as(i128, window_size_seconds) * std.time.ns_per_s,
+            .window_size_ns = @as(u64, window_size_seconds) * std.time.ns_per_s,
             .max_requests = max_requests,
             .requests = std.AutoHashMap(u64, RequestWindow).init(allocator),
             .mutex = .{},
@@ -82,11 +82,11 @@ pub const RateLimiter = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const now = std.time.nanoTimestamp();
+        const now = std.time.Instant.now() catch return false;
 
         if (self.requests.getPtr(client_id)) |window| {
             // Check if we're still in the same window
-            if (now - window.window_start < self.window_size_ns) {
+            if (now.since(window.window_start) < self.window_size_ns) {
                 if (window.count >= self.max_requests) {
                     return false; // Rate limited
                 }
@@ -120,13 +120,13 @@ pub const RateLimiter = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const now = std.time.nanoTimestamp();
+        const now = std.time.Instant.now() catch return;
         var to_remove: std.ArrayList(u64) = .empty;
         defer to_remove.deinit(self.allocator);
 
         var iterator = self.requests.iterator();
         while (iterator.next()) |entry| {
-            if (now - entry.value_ptr.window_start > self.window_size_ns * 2) {
+            if (now.since(entry.value_ptr.window_start) > self.window_size_ns * 2) {
                 to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }

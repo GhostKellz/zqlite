@@ -3,7 +3,7 @@
 # Tests disk I/O, persistence, and metadata serialization
 set -e
 
-ZIG=/opt/zig/zig
+ZIG=/opt/zig-dev/zig
 cd /workspace/zqlite
 
 echo "=== File-Backed Storage Tests ==="

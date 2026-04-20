@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- Zig 0.16.0-dev or later
+- Zig `0.17.0-dev.27+0dd99c37c` or later
 - Linux (primary), macOS, or Windows (limited)
 
 ## Zig Package Manager
@@ -51,6 +51,8 @@ After building, the CLI is available at:
 ```
 
 The CLI supports direct startup plus flags such as `--help`, `--version`, `--db`, and `--sql`.
+
+Validated locally with `/opt/zig-dev/zig` (`0.17.0-dev.27+0dd99c37c`).
 
 ## Installation Script
 

@@ -4,7 +4,7 @@ Linux is the primary development and test platform.
 
 ## Requirements
 
-- Zig 0.16.0-dev or later
+- Zig `0.17.0-dev.27+0dd99c37c` or later
 - POSIX-compliant filesystem
 
 ## Build
@@ -54,5 +54,7 @@ Database files require read/write access. WAL requires same directory write acce
 Verified regularly on:
 - Arch Linux (primary host)
 - Debian-based Docker environments for validation and Valgrind
+
+Current local Zig baseline: `/opt/zig-dev/zig` (`0.17.0-dev.27+0dd99c37c`).
 
 Other Linux distributions may work, but should be treated as less verified unless explicitly tested.

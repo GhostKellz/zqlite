@@ -45,7 +45,7 @@ See [Stable vs Experimental](docs/security/stable-vs-experimental.md) for detail
 
 ## Install
 
-Requires Zig 0.16.0-dev.2960 or later
+Requires Zig `0.17.0-dev.27+0dd99c37c` or later
 
 Quick source install via helper script:
 
@@ -79,7 +79,7 @@ exe.root_module.addImport("zqlite", zqlite.module("zqlite"));
 const zqlite = @import("zqlite");
 
 pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

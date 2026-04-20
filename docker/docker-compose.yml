@@ -6,8 +6,8 @@ services:
       network: host
     network_mode: host
     volumes:
-      - /opt/zig-0.16.0-dev:/opt/zig:ro
-    command: /opt/zig/zig build test --summary all
+      - /opt/zig-dev:/opt/zig-dev:ro
+    command: /opt/zig-dev/zig build test --summary all
 
   zqlite-memory:
     build:
@@ -16,8 +16,8 @@ services:
       network: host
     network_mode: host
     volumes:
-      - /opt/zig-0.16.0-dev:/opt/zig:ro
-    command: sh -c "/opt/zig/zig build test-memory-leaks && /opt/zig/zig build test-comprehensive-memory"
+      - /opt/zig-dev:/opt/zig-dev:ro
+    command: sh -c "/opt/zig-dev/zig build test-memory-leaks && /opt/zig-dev/zig build test-comprehensive-memory"
 
   zqlite-valgrind:
     build:
@@ -26,7 +26,7 @@ services:
       network: host
     network_mode: host
     volumes:
-      - /opt/zig-0.16.0-dev:/opt/zig:ro
+      - /opt/zig-dev:/opt/zig-dev:ro
     command: sh /workspace/zqlite/docker/scripts/run-valgrind.sh
 
   zqlite-audit:
@@ -36,7 +36,7 @@ services:
       network: host
     network_mode: host
     volumes:
-      - /opt/zig-0.16.0-dev:/opt/zig:ro
+      - /opt/zig-dev:/opt/zig-dev:ro
     command: sh /workspace/zqlite/docker/scripts/run-audit.sh
 
   zqlite-full:
@@ -46,7 +46,7 @@ services:
       network: host
     network_mode: host
     volumes:
-      - /opt/zig-0.16.0-dev:/opt/zig:ro
+      - /opt/zig-dev:/opt/zig-dev:ro
     command: /workspace/zqlite/docker/scripts/full-validation.sh
 
   zqlite-stress:
@@ -56,7 +56,7 @@ services:
       network: host
     network_mode: host
     volumes:
-      - /opt/zig-0.16.0-dev:/opt/zig:ro
+      - /opt/zig-dev:/opt/zig-dev:ro
     command: /workspace/zqlite/docker/scripts/stress-test.sh
 
   zqlite-chaos:
@@ -66,7 +66,7 @@ services:
       network: host
     network_mode: host
     volumes:
-      - /opt/zig-0.16.0-dev:/opt/zig:ro
+      - /opt/zig-dev:/opt/zig-dev:ro
     command: /workspace/zqlite/docker/scripts/chaos-test.sh 10
 
   zqlite-perf:
@@ -76,7 +76,7 @@ services:
       network: host
     network_mode: host
     volumes:
-      - /opt/zig-0.16.0-dev:/opt/zig:ro
+      - /opt/zig-dev:/opt/zig-dev:ro
     command: /workspace/zqlite/docker/scripts/perf-baseline.sh
 
   zqlite-file-storage:
@@ -86,7 +86,7 @@ services:
       network: host
     network_mode: host
     volumes:
-      - /opt/zig-0.16.0-dev:/opt/zig:ro
+      - /opt/zig-dev:/opt/zig-dev:ro
     command: /workspace/zqlite/docker/scripts/test-file-storage.sh
 
   zqlite-critical:
@@ -96,5 +96,5 @@ services:
       network: host
     network_mode: host
     volumes:
-      - /opt/zig-0.16.0-dev:/opt/zig:ro
+      - /opt/zig-dev:/opt/zig-dev:ro
     command: /workspace/zqlite/docker/scripts/test-critical.sh

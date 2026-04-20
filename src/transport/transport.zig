@@ -153,7 +153,7 @@ test "transport basic functionality" {
     var transport = Transport.init(allocator, false);
     defer transport.deinit();
 
-    // Parse IP address using Zig 0.16 API
+    // Parse a loopback address for the transport smoke test.
     const server_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 8080);
     const conn_id = try transport.connect(server_addr);
 
