@@ -56,7 +56,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Test UUID NIL value
-    const nil_uuid = [_]u8{0} ** 16;
+    const nil_uuid = std.mem.zeroes([16]u8);
     const nil_str = try zqlite.uuidToString(nil_uuid, allocator);
     defer allocator.free(nil_str);
     std.debug.print("NIL UUID: {s}\n", .{nil_str});

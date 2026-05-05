@@ -234,7 +234,7 @@ test "encryption with random salt" {
 }
 
 test "encryption with provided salt" {
-    const test_salt = [_]u8{1} ** 32;
+    const test_salt = [_]u8{1} ++ std.mem.zeroes([31]u8);
 
     var enc1 = try Encryption.init("password123", &test_salt);
     defer enc1.deinit();

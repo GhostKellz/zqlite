@@ -17,7 +17,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     std.debug.print("🧠 ZQLite Intensive Memory Leak Detection Test\n", .{});
-    std.debug.print("=" ** 60 ++ "\n", .{});
+    std.debug.print("============================================================\n", .{});
 
     // Test 1: DEFAULT CURRENT_TIMESTAMP Memory Management
     std.debug.print("1. Testing DEFAULT CURRENT_TIMESTAMP operations... ", .{});

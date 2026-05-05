@@ -15,7 +15,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     std.debug.print("🔐 ZQLite Security Test Suite\n", .{});
-    std.debug.print("=" ** 60 ++ "\n\n", .{});
+    std.debug.print("============================================================\n\n", .{});
 
     var passed: u32 = 0;
     var failed: u32 = 0;
@@ -82,7 +82,7 @@ pub fn main() !void {
     }
 
     // Summary
-    std.debug.print("\n" ++ "=" ** 60 ++ "\n", .{});
+    std.debug.print("\n============================================================\n", .{});
     std.debug.print("📊 Security Test Results: {} passed, {} failed\n", .{ passed, failed });
 
     if (failed > 0) {

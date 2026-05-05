@@ -3,7 +3,6 @@ const storage = @import("../db/storage.zig");
 const mvcc = @import("../concurrent/mvcc_transactions.zig");
 const hot_standby = @import("../concurrent/hot_standby.zig");
 const transport = @import("../transport/transport.zig");
-const zsync = @import("zsync");
 const time_utils = @import("../time_utils.zig");
 
 /// Cluster Manager for Horizontal Scaling

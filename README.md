@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/One_Dependency-22C55E?style=for-the-badge&logo=checkmarx&logoColor=white" alt="One Dependency">
+  <img src="https://img.shields.io/badge/Zero_Runtime_Dependencies-22C55E?style=for-the-badge&logo=checkmarx&logoColor=white" alt="Zero Runtime Dependencies">
   <img src="https://img.shields.io/badge/Memory_Safe-10B981?style=for-the-badge&logo=verified&logoColor=white" alt="Memory Safe">
   <img src="https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Linux">
@@ -28,7 +28,7 @@
 
 An embedded SQL database written in Zig. SQLite-style simplicity with some PostgreSQL conveniences.
 
-Current package dependency footprint: `zsync`.
+Current package dependency footprint: no external Zig package dependencies.
 
 **Stable features:**
 - SQL parser (SELECT, INSERT, UPDATE, DELETE, JOINs, aggregates, subqueries)
@@ -45,27 +45,28 @@ See [Stable vs Experimental](docs/security/stable-vs-experimental.md) for detail
 
 ## Install
 
-Requires Zig `0.17.0-dev.27+0dd99c37c` or later
+Requires Zig `0.17.0-dev.242+5d55999d2` or later
 
-Quick source install via helper script:
-
-```bash
-curl -fsSL https://zqlite.cktech.sh | bash
-```
-
-Pinned release install:
+Tagged release fetch:
 
 ```bash
-curl -fsSL https://zqlite.cktech.sh | ZQLITE_REF=v1.6.2 bash
+zig fetch --save https://github.com/ghostkellz/zqlite/archive/refs/tags/v1.6.4.tar.gz
 ```
 
 ```bash
-# Tagged release (recommended)
-zig fetch --save https://github.com/ghostkellz/zqlite/archive/refs/tags/v1.6.2.tar.gz
-
 # Or main branch
 zig fetch --save https://github.com/ghostkellz/zqlite/archive/main.tar.gz
 ```
+
+Optional helper-script install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ghostkellz/zqlite/refs/heads/main/install.sh -o install.sh
+chmod +x install.sh
+ZQLITE_REF=v1.6.4 ./install.sh
+```
+
+Review `install.sh` before using it in automation.
 
 ```zig
 // build.zig
@@ -139,7 +140,7 @@ docker-compose -f docker/docker-compose.yml run --rm zqlite-full
 
 ## Project Status
 
-**v1.6.2** - Beta
+**v1.6.4** - Beta
 
 Core database functionality is stable and tested. The project is under active development.
 

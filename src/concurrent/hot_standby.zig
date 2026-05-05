@@ -2,7 +2,6 @@ const std = @import("std");
 const storage = @import("../db/storage.zig");
 const mvcc = @import("mvcc_transactions.zig");
 const transport = @import("../transport/transport.zig");
-const zsync = @import("zsync");
 const time_utils = @import("../time_utils.zig");
 const zqlite = @import("../zqlite.zig");
 

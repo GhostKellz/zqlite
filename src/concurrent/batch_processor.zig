@@ -1,7 +1,7 @@
 const std = @import("std");
 const storage = @import("../db/storage.zig");
 const mvcc = @import("mvcc_transactions.zig");
-const zsync = @import("zsync");
+const runtime = @import("../runtime/root.zig");
 const time_utils = @import("../time_utils.zig");
 
 /// Ultra-High Performance Batch Processor - TigerBeetle Inspired
@@ -90,21 +90,16 @@ pub const BatchProcessor = struct {
 
     /// Process multiple batches concurrently
     pub fn processConcurrentBatches(self: *Self, batches: []const []const BatchOperation) ![]BatchResult {
-        var results = try self.allocator.alloc(BatchResult, batches.len);
-        var futures = try self.allocator.alloc(zsync.Future(BatchResult), batches.len);
+        var futures = try self.allocator.alloc(*runtime.Future(BatchResult), batches.len);
         defer self.allocator.free(futures);
 
         // Start all batches concurrently
         for (batches, 0..) |batch, i| {
-            futures[i] = zsync.async(self.processBatch, .{batch});
+            futures[i] = try runtime.spawn(self.allocator, BatchProcessor.processBatch, .{ self, batch });
         }
+        defer for (futures) |future| future.deinit();
 
-        // Wait for all batches to complete
-        for (futures, 0..) |future, i| {
-            results[i] = try future.await();
-        }
-
-        return results;
+        return try runtime.all(BatchResult, self.allocator, futures);
     }
 
     /// Process insert operations with vectorized optimizations

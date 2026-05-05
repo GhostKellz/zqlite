@@ -9,7 +9,7 @@ pub fn main() !void {
 
     std.debug.print("🧪 ZQLite Quick Validation Test\n", .{});
     std.debug.print("Version: {s}\n", .{version.FULL_VERSION_WITH_BUILD});
-    std.debug.print("=" ** 50 ++ "\n", .{});
+    std.debug.print("==================================================\n", .{});
 
     // Test 1: Basic Connection
     std.debug.print("1. Testing basic connection... ", .{});

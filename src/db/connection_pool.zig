@@ -1,6 +1,6 @@
 const std = @import("std");
 const time_utils = @import("../time_utils.zig");
-const compat = @import("../zsync/compat/thread.zig");
+const compat = @import("../runtime/compat/thread.zig");
 const connection = @import("connection.zig");
 const storage = @import("storage.zig");
 

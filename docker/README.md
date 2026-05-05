@@ -36,7 +36,7 @@ docker compose -f docker/docker-compose.yml run --rm zqlite-audit
 ## Requirements
 
 - Docker with compose
-- Zig at `/opt/zig-dev` (`0.17.0-dev.27+0dd99c37c`) or an equivalent bind path in `docker-compose.yml`
+- Zig at `/opt/zig-dev` (`0.17.0-dev.242+5d55999d2`) or an equivalent bind path in `docker-compose.yml`
 - Host networking enabled for local test services
 
 ## Design

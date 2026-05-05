@@ -19,7 +19,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     std.debug.print("🔍 ZQLite Comprehensive Memory Leak Detection\n", .{});
-    std.debug.print("=" ** 50 ++ "\n\n", .{});
+    std.debug.print("==================================================\n\n", .{});
 
     var tests_passed: u32 = 0;
     var tests_failed: u32 = 0;
@@ -67,7 +67,7 @@ pub fn main() !void {
         }
     }
 
-    std.debug.print("\n" ++ "=" ** 50 ++ "\n", .{});
+    std.debug.print("\n==================================================\n", .{});
     std.debug.print("Results: {d} passed, {d} failed\n", .{ tests_passed, tests_failed });
 
     if (tests_failed > 0) {

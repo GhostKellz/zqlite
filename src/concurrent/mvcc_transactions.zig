@@ -1,7 +1,7 @@
 const std = @import("std");
 const storage = @import("../db/storage.zig");
 const crypto = @import("../crypto/secure_storage.zig");
-const zsync = @import("zsync");
+const runtime = @import("../runtime/root.zig");
 const time_utils = @import("../time_utils.zig");
 const Wyhash = std.hash.Wyhash;
 
@@ -376,9 +376,7 @@ pub const MVCCTransactionManager = struct {
     }
 
     /// Check if a row has been modified since a version
-    fn hasBeenModifiedSince(self: *Self, row_key: RowKey, version: u64, transaction_start: u64) !bool {
-        _ = transaction_start;
-
+    fn hasBeenModifiedSince(self: *Self, row_key: RowKey, version: u64, _: u64) !bool {
         // Look up version chain for this row
         const table_chains = self.version_chains.get(row_key.table) orelse return false;
         const chain = table_chains.get(row_key.row_id) orelse return false;
@@ -388,9 +386,7 @@ pub const MVCCTransactionManager = struct {
     }
 
     /// Check for conflicting writes
-    fn hasConflictingWrite(self: *Self, row_key: RowKey, transaction_id: TransactionId, start_version: u64) !bool {
-        _ = transaction_id;
-
+    fn hasConflictingWrite(self: *Self, row_key: RowKey, _: TransactionId, start_version: u64) !bool {
         // Look up version chain for this row
         const table_chains = self.version_chains.get(row_key.table) orelse return false;
         const chain = table_chains.get(row_key.row_id) orelse return false;
@@ -740,14 +736,13 @@ pub const DeadlockDetector = struct {
     }
 };
 
-/// High-performance async transaction pool using zsync
+/// High-performance async transaction pool using zqlite runtime
 pub const AsyncTransactionPool = struct {
     allocator: std.mem.Allocator,
     mvcc_manager: *MVCCTransactionManager,
-    io: zsync.ThreadPoolIo,
     max_concurrent_transactions: u32,
     active_transactions: std.atomic.Value(u32),
-    semaphore: std.Thread.Semaphore,
+    semaphore: runtime.Semaphore,
 
     const Self = @This();
 
@@ -755,50 +750,58 @@ pub const AsyncTransactionPool = struct {
         return Self{
             .allocator = allocator,
             .mvcc_manager = mvcc_manager,
-            .io = zsync.ThreadPoolIo{},
             .max_concurrent_transactions = max_concurrent,
             .active_transactions = std.atomic.Value(u32).init(0),
-            .semaphore = std.Thread.Semaphore{ .permits = max_concurrent },
+            .semaphore = runtime.Semaphore.init(allocator, max_concurrent),
         };
     }
 
-    /// Execute async transaction with zsync
+    /// Execute async transaction with zqlite runtime
     pub fn executeTransactionAsync(self: *Self, comptime Context: type, context: Context, transaction_fn: fn (Context, TransactionId) anyerror!void, isolation_level: IsolationLevel, max_retries: u32) !void {
-        var future = self.io.async(executeTransactionWorker, .{ self, Context, context, transaction_fn, isolation_level, max_retries });
-        defer future.cancel(self.io) catch {};
+        const future = try runtime.spawnWithTaskContext(self.allocator, executeTransactionWorker, .{ self, Context, context, transaction_fn, isolation_level, max_retries });
+        defer future.deinit();
 
-        return try future.await(self.io);
+        return try future.await();
     }
 
     /// Execute multiple transactions concurrently
     pub fn executeTransactionBatch(self: *Self, comptime Context: type, contexts: []Context, transaction_fn: fn (Context, TransactionId) anyerror!void, isolation_level: IsolationLevel) !void {
-        for (contexts) |context| {
-            _ = try zsync.spawn(executeTransactionTask, .{ self, Context, context, transaction_fn, isolation_level, 3 });
+        var futures = try self.allocator.alloc(*runtime.Future(void), contexts.len);
+        defer self.allocator.free(futures);
+
+        for (contexts, 0..) |context, i| {
+            futures[i] = try runtime.spawnWithTaskContext(self.allocator, executeTransactionTask, .{ self, Context, context, transaction_fn, isolation_level, 3 });
         }
+        defer for (futures) |future| future.deinit();
 
-        // Allow spawned tasks to complete
-        try zsync.sleep(10);
+        const results = try runtime.all(void, self.allocator, futures);
+        self.allocator.free(results);
     }
 
-    fn executeTransactionTask(self: *AsyncTransactionPool, comptime Context: type, context: Context, transaction_fn: fn (Context, TransactionId) anyerror!void, isolation_level: IsolationLevel, max_retries: u32) !void {
-        try self.executeTransactionSync(Context, context, transaction_fn, isolation_level, max_retries);
+    fn executeTransactionTask(self: *AsyncTransactionPool, comptime Context: type, context: Context, transaction_fn: fn (Context, TransactionId) anyerror!void, isolation_level: IsolationLevel, max_retries: u32, task_ctx: runtime.TaskContext) !void {
+        try self.executeTransactionSync(Context, context, transaction_fn, isolation_level, max_retries, task_ctx);
     }
 
-    fn executeTransactionWorker(self: *AsyncTransactionPool, comptime Context: type, context: Context, transaction_fn: fn (Context, TransactionId) anyerror!void, isolation_level: IsolationLevel, max_retries: u32) !void {
-        try self.executeTransactionSync(Context, context, transaction_fn, isolation_level, max_retries);
+    fn executeTransactionWorker(self: *AsyncTransactionPool, comptime Context: type, context: Context, transaction_fn: fn (Context, TransactionId) anyerror!void, isolation_level: IsolationLevel, max_retries: u32, task_ctx: runtime.TaskContext) !void {
+        try self.executeTransactionSync(Context, context, transaction_fn, isolation_level, max_retries, task_ctx);
     }
 
     /// Execute a transaction function with automatic retry on conflicts (sync version)
-    fn executeTransactionSync(self: *Self, comptime Context: type, context: Context, transaction_fn: fn (Context, TransactionId) anyerror!void, isolation_level: IsolationLevel, max_retries: u32) !void {
+    fn executeTransactionSync(self: *Self, comptime Context: type, context: Context, transaction_fn: fn (Context, TransactionId) anyerror!void, isolation_level: IsolationLevel, max_retries: u32, task_ctx: runtime.TaskContext) !void {
         var retry_count: u32 = 0;
 
         while (retry_count < max_retries) {
+            try task_ctx.checkpoint();
             // Wait for semaphore (rate limiting)
-            self.semaphore.wait();
+            try self.semaphore.waitWithToken(task_ctx.cancel_token);
             defer self.semaphore.post();
 
-            _ = self.active_transactions.fetchAdd(1, .acq_rel);
-            defer _ = self.active_transactions.fetchSub(1, .acq_rel);
+            const previous_active = self.active_transactions.fetchAdd(1, .acq_rel);
+            std.debug.assert(previous_active < std.math.maxInt(u32));
+            defer {
+                const previous = self.active_transactions.fetchSub(1, .acq_rel);
+                std.debug.assert(previous > 0);
+            }
 
             const transaction_id = try self.mvcc_manager.beginTransaction(isolation_level);
 
@@ -813,9 +816,10 @@ pub const AsyncTransactionPool = struct {
                         try self.mvcc_manager.abortTransaction(transaction_id);
                         retry_count += 1;
 
-                        // Exponential backoff using zsync sleep
+                        // Exponential backoff between retries
                         const backoff_time = (@as(u64, 1) << @min(retry_count, 10));
-                        try zsync.sleep(backoff_time);
+                        try task_ctx.checkpoint();
+                        runtime.sleep(backoff_time);
                         continue;
                     },
                     else => return err, // Other errors are not retryable
@@ -835,22 +839,16 @@ pub const AsyncTransactionPool = struct {
         return AsyncTransactionPoolStats{
             .active_transactions = self.active_transactions.load(.acquire),
             .max_concurrent = self.max_concurrent_transactions,
-            .task_queue_capacity = 0, // Not applicable with zsync
+            .task_queue_capacity = 0,
             .pending_tasks = 0,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        // AsyncTransactionPool owns minimal heap resources:
-        // - mvcc_manager: Reference only (not owned, passed in from caller)
-        // - io: zsync.ThreadPoolIo is stack-allocated, zsync handles internal cleanup
-        // - semaphore: std.Thread.Semaphore is stack-allocated
-        // - active_transactions: atomic counter, no cleanup needed
-        //
-        // zsync automatically manages thread pool lifecycle and pending tasks.
-        // If future implementations add owned resources (e.g., task queues,
-        // allocated contexts), cleanup should be added here.
-        _ = self;
+        if (self.active_transactions.load(.acquire) != 0) {
+            std.debug.assert(false);
+        }
+        self.semaphore.deinit();
     }
 };
 
@@ -925,7 +923,7 @@ test "transaction isolation levels" {
     try testing.expect(stats.aborted_transactions == 4);
 }
 
-test "async transaction pool with zsync" {
+test "async transaction pool with runtime executor" {
     const testing = std.testing;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();

@@ -16,7 +16,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     std.debug.print("🧠 ZQLite Simple Memory Test (Avoiding BTree Bug)\n", .{});
-    std.debug.print("=" ** 60 ++ "\n", .{});
+    std.debug.print("============================================================\n", .{});
 
     // Test 1: DEFAULT CURRENT_TIMESTAMP Operations
     std.debug.print("1. Testing DEFAULT CURRENT_TIMESTAMP operations... ", .{});

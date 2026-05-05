@@ -23,7 +23,7 @@ Do not position it as:
 - a full PostgreSQL operational replacement,
 - or a drop-in backend for applications expecting full PostgreSQL semantics.
 
-## Near-Term Priorities After v1.6.2
+## Near-Term Priorities After v1.6.4
 
 - broader `RETURNING` coverage and edge cases
 - richer date/time behavior

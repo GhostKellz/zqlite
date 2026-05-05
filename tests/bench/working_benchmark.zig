@@ -1,6 +1,15 @@
 const std = @import("std");
 const zqlite = @import("zqlite");
 
+fn getNanoTime() i128 {
+    var ts: std.posix.timespec = undefined;
+    const result = std.posix.system.clock_gettime(.REALTIME, &ts);
+    if (std.posix.errno(result) == .SUCCESS) {
+        return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+    }
+    return 0;
+}
+
 /// Simplified benchmarking suite that avoids B-tree OrderMismatch bug
 /// Focuses on practical performance metrics without triggering known issues
 const BenchmarkResult = struct {
@@ -29,7 +38,7 @@ pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
     std.debug.print("\n🚀 ZQLite Performance Benchmark Suite (v1.3.3)\n", .{});
-    std.debug.print("=" ** 100 ++ "\n", .{});
+    std.debug.print("====================================================================================================\n", .{});
     std.debug.print("  {s:<40} | {s:>10} | {s:>10} | {s:>10} | {s:>15}\n", .{
         "Benchmark",
         "Operations",
@@ -37,7 +46,7 @@ pub fn main() !void {
         "Memory",
         "Throughput",
     });
-    std.debug.print("-" ** 100 ++ "\n", .{});
+    std.debug.print("----------------------------------------------------------------------------------------------------\n", .{});
 
     // Use single connection to avoid B-tree deserialization issues
     var conn = try zqlite.open(allocator, ":memory:");
@@ -67,7 +76,7 @@ pub fn main() !void {
     const bench6 = try benchmarkMixedWorkload(conn);
     bench6.print();
 
-    std.debug.print("=" ** 100 ++ "\n", .{});
+    std.debug.print("====================================================================================================\n", .{});
 
     // Print summary statistics
     const total_ops = bench1.operations + bench2.operations + bench3.operations +
@@ -89,16 +98,14 @@ fn benchmarkSimpleInserts(conn: *zqlite.Connection) !BenchmarkResult {
 
     try conn.execute("CREATE TABLE bench_test (id INTEGER, value TEXT)");
 
-    const ts_start = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-    const start = @as(i128, ts_start.sec) * std.time.ns_per_s + ts_start.nsec;
+    const start = getNanoTime();
 
     var i: usize = 0;
     while (i < num_ops) : (i += 1) {
         try conn.execute("INSERT INTO bench_test (id, value) VALUES (1, 'test')");
     }
 
-    const ts_end = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-    const end_time = @as(i128, ts_end.sec) * std.time.ns_per_s + ts_end.nsec;
+    const end_time = getNanoTime();
     const duration = @as(u64, @intCast(end_time - start));
     const mem_used = 1024 * 1024; // Placeholder
     const ops_per_sec = @as(f64, @floatFromInt(num_ops)) / (@as(f64, @floatFromInt(duration)) / 1_000_000_000.0);
@@ -118,8 +125,7 @@ fn benchmarkBulkInserts(conn: *zqlite.Connection) !BenchmarkResult {
 
     // Reuse bench_test table
 
-    const ts_start = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-    const start = @as(i128, ts_start.sec) * std.time.ns_per_s + ts_start.nsec;
+    const start = getNanoTime();
 
     try conn.execute("BEGIN TRANSACTION");
     var i: usize = 0;
@@ -128,8 +134,7 @@ fn benchmarkBulkInserts(conn: *zqlite.Connection) !BenchmarkResult {
     }
     try conn.execute("COMMIT");
 
-    const ts_end = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-    const end_time = @as(i128, ts_end.sec) * std.time.ns_per_s + ts_end.nsec;
+    const end_time = getNanoTime();
     const duration = @as(u64, @intCast(end_time - start));
     const mem_used = 1024 * 1024;
     const ops_per_sec = @as(f64, @floatFromInt(num_ops)) / (@as(f64, @floatFromInt(duration)) / 1_000_000_000.0);
@@ -154,8 +159,7 @@ fn benchmarkSelects(conn: *zqlite.Connection) !BenchmarkResult {
         try conn.execute("INSERT INTO bench_select VALUES (1, 'data')");
     }
 
-    const ts_start = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-    const start = @as(i128, ts_start.sec) * std.time.ns_per_s + ts_start.nsec;
+    const start = getNanoTime();
 
     i = 0;
     while (i < num_queries) : (i += 1) {
@@ -163,8 +167,7 @@ fn benchmarkSelects(conn: *zqlite.Connection) !BenchmarkResult {
         result.deinit();
     }
 
-    const ts_end = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-    const end_time = @as(i128, ts_end.sec) * std.time.ns_per_s + ts_end.nsec;
+    const end_time = getNanoTime();
     const duration = @as(u64, @intCast(end_time - start));
     const mem_used = 1024 * 1024;
     const ops_per_sec = @as(f64, @floatFromInt(num_queries)) / (@as(f64, @floatFromInt(duration)) / 1_000_000_000.0);
@@ -184,16 +187,14 @@ fn benchmarkUpdates(conn: *zqlite.Connection) !BenchmarkResult {
     try conn.execute("CREATE TABLE bench_update (id INTEGER, value TEXT)");
     try conn.execute("INSERT INTO bench_update VALUES (1, 'initial')");
 
-    const ts_start = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-    const start = @as(i128, ts_start.sec) * std.time.ns_per_s + ts_start.nsec;
+    const start = getNanoTime();
 
     var i: usize = 0;
     while (i < num_ops) : (i += 1) {
         try conn.execute("UPDATE bench_update SET value = 'updated'");
     }
 
-    const ts_end = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-    const end_time = @as(i128, ts_end.sec) * std.time.ns_per_s + ts_end.nsec;
+    const end_time = getNanoTime();
     const duration = @as(u64, @intCast(end_time - start));
     const mem_used = 1024 * 1024;
     const ops_per_sec = @as(f64, @floatFromInt(num_ops)) / (@as(f64, @floatFromInt(duration)) / 1_000_000_000.0);
@@ -218,16 +219,14 @@ fn benchmarkDeletes(conn: *zqlite.Connection) !BenchmarkResult {
         try conn.execute("INSERT INTO bench_delete VALUES (1, 'data')");
     }
 
-    const ts_start = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-    const start = @as(i128, ts_start.sec) * std.time.ns_per_s + ts_start.nsec;
+    const start = getNanoTime();
 
     i = 0;
     while (i < num_ops) : (i += 1) {
         try conn.execute("DELETE FROM bench_delete WHERE id = 1");
     }
 
-    const ts_end = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-    const end_time = @as(i128, ts_end.sec) * std.time.ns_per_s + ts_end.nsec;
+    const end_time = getNanoTime();
     const duration = @as(u64, @intCast(end_time - start));
     const mem_used = 1024 * 1024;
     const ops_per_sec = @as(f64, @floatFromInt(num_ops)) / (@as(f64, @floatFromInt(duration)) / 1_000_000_000.0);
@@ -246,8 +245,7 @@ fn benchmarkMixedWorkload(conn: *zqlite.Connection) !BenchmarkResult {
 
     try conn.execute("CREATE TABLE bench_mixed (id INTEGER, value TEXT)");
 
-    const ts_start = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-    const start = @as(i128, ts_start.sec) * std.time.ns_per_s + ts_start.nsec;
+    const start = getNanoTime();
 
     var i: usize = 0;
     while (i < num_ops) : (i += 1) {
@@ -264,8 +262,7 @@ fn benchmarkMixedWorkload(conn: *zqlite.Connection) !BenchmarkResult {
         }
     }
 
-    const ts_end = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-    const end_time = @as(i128, ts_end.sec) * std.time.ns_per_s + ts_end.nsec;
+    const end_time = getNanoTime();
     const duration = @as(u64, @intCast(end_time - start));
     const mem_used = 1024 * 1024;
     const ops_per_sec = @as(f64, @floatFromInt(num_ops)) / (@as(f64, @floatFromInt(duration)) / 1_000_000_000.0);

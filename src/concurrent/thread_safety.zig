@@ -1,6 +1,6 @@
 const std = @import("std");
 const zqlite = @import("../zqlite.zig");
-const compat = @import("../zsync/compat/thread.zig");
+const compat = @import("../runtime/compat/thread.zig");
 
 /// Thread-safe connection pool for concurrent database access
 pub const ConnectionPool = struct {

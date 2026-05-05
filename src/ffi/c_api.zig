@@ -37,7 +37,7 @@ const ErrorInfo = struct {
     fn init() ErrorInfo {
         return ErrorInfo{
             .code = ZQLITE_OK,
-            .message = [_]u8{0} ** 256,
+            .message = std.mem.zeroes([256]u8),
             .message_len = 0,
             .sql = null,
         };
@@ -511,7 +511,7 @@ export fn zqlite_errsql(conn: ?*zqlite_connection_t) ?[*:0]const u8 {
 
 /// Get the version string
 export fn zqlite_version() [*:0]const u8 {
-    return zqlite.version.VERSION_STRING.ptr;
+    return zqlite.version.VERSION_STRING_Z.ptr;
 }
 
 /// Returns 1 when real post-quantum crypto is enabled, 0 otherwise.

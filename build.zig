@@ -41,7 +41,7 @@ pub fn build(b: *std.Build) void {
     // Build metadata - static values for reproducible builds from source archives
     // These are intentionally not dynamic to ensure tarball builds work without git/shell
     const git_commit = "release";
-    const build_date = "2026-04-13";
+    const build_date = "2026-05-05";
 
     // Build mode string
     const build_mode = switch (optimize) {
@@ -54,14 +54,10 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "git_commit", git_commit);
     build_options.addOption([]const u8, "build_date", build_date);
     build_options.addOption([]const u8, "build_mode", build_mode);
+    const build_zon = @import("build.zig.zon");
+    build_options.addOption([]const u8, "version", build_zon.version);
 
-    // Add zsync dependency for async operations
-    const zsync = b.dependency("zsync", .{
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // Create the zqlite library - now with only zsync dependency!
+    // Create the zqlite library
     const lib = b.addLibrary(.{
         .name = "zqlite",
         .root_module = b.createModule(.{
@@ -71,8 +67,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Add zsync dependency to library
-    lib.root_module.addImport("zsync", zsync.module("zsync"));
     lib.root_module.addOptions("build_options", build_options);
 
     // Install the library
@@ -91,7 +85,6 @@ pub fn build(b: *std.Build) void {
 
         // Link the main library to the C FFI
         c_lib.root_module.addImport("zqlite", lib.root_module);
-        c_lib.root_module.addImport("zsync", zsync.module("zsync"));
 
         // Install the C library
         b.installArtifact(c_lib);
@@ -104,8 +97,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Add dependencies to exported module
-    zqlite_module.addImport("zsync", zsync.module("zsync"));
     zqlite_module.addOptions("build_options", build_options);
 
     // Create the zqlite executable
@@ -120,7 +111,6 @@ pub fn build(b: *std.Build) void {
 
     // Link the library to the executable
     exe.root_module.addImport("zqlite", lib.root_module);
-    exe.root_module.addImport("zsync", zsync.module("zsync"));
     exe.root_module.addOptions("build_options", build_options);
 
     // Install the executable
@@ -146,7 +136,6 @@ pub fn build(b: *std.Build) void {
     });
 
     // Add dependencies to tests
-    lib_unit_tests.root_module.addImport("zsync", zsync.module("zsync"));
     lib_unit_tests.root_module.addOptions("build_options", build_options);
 
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
@@ -160,7 +149,6 @@ pub fn build(b: *std.Build) void {
     });
 
     exe_unit_tests.root_module.addImport("zqlite", lib.root_module);
-    exe_unit_tests.root_module.addImport("zsync", zsync.module("zsync"));
     exe_unit_tests.root_module.addOptions("build_options", build_options);
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
@@ -176,7 +164,6 @@ pub fn build(b: *std.Build) void {
     });
 
     test_runner.root_module.addImport("zqlite", lib.root_module);
-    test_runner.root_module.addImport("zsync", zsync.module("zsync"));
     test_runner.root_module.addOptions("build_options", build_options);
 
     const run_test_runner = b.addRunArtifact(test_runner);
@@ -199,7 +186,6 @@ pub fn build(b: *std.Build) void {
     });
 
     validation_test.root_module.addImport("zqlite", lib.root_module);
-    validation_test.root_module.addImport("zsync", zsync.module("zsync"));
     validation_test.root_module.addOptions("build_options", build_options);
 
     const run_validation_test = b.addRunArtifact(validation_test);
@@ -220,7 +206,6 @@ pub fn build(b: *std.Build) void {
     });
 
     advanced_tests.root_module.addImport("zqlite", lib.root_module);
-    advanced_tests.root_module.addImport("zsync", zsync.module("zsync"));
     advanced_tests.root_module.addOptions("build_options", build_options);
 
     const run_advanced_tests = b.addRunArtifact(advanced_tests);
@@ -243,7 +228,6 @@ pub fn build(b: *std.Build) void {
     });
 
     create_table_leak_test.root_module.addImport("zqlite", lib.root_module);
-    create_table_leak_test.root_module.addImport("zsync", zsync.module("zsync"));
     create_table_leak_test.root_module.addOptions("build_options", build_options);
 
     const run_create_table_leak_test = b.addRunArtifact(create_table_leak_test);
@@ -262,7 +246,6 @@ pub fn build(b: *std.Build) void {
     });
 
     memory_leak_test.root_module.addImport("zqlite", lib.root_module);
-    memory_leak_test.root_module.addImport("zsync", zsync.module("zsync"));
     memory_leak_test.root_module.addOptions("build_options", build_options);
 
     const run_memory_leak_test = b.addRunArtifact(memory_leak_test);
@@ -283,7 +266,6 @@ pub fn build(b: *std.Build) void {
     });
 
     window_test.root_module.addImport("zqlite", lib.root_module);
-    window_test.root_module.addImport("zsync", zsync.module("zsync"));
     window_test.root_module.addOptions("build_options", build_options);
 
     const run_window_test = b.addRunArtifact(window_test);
@@ -307,7 +289,6 @@ pub fn build(b: *std.Build) void {
     });
 
     sql_parser_fuzzer.root_module.addImport("zqlite", lib.root_module);
-    sql_parser_fuzzer.root_module.addImport("zsync", zsync.module("zsync"));
     sql_parser_fuzzer.root_module.addOptions("build_options", build_options);
 
     const run_sql_parser_fuzzer = b.addRunArtifact(sql_parser_fuzzer);
@@ -341,7 +322,6 @@ pub fn build(b: *std.Build) void {
     });
 
     logger_test.root_module.addImport("zqlite", lib.root_module);
-    logger_test.root_module.addImport("zsync", zsync.module("zsync"));
 
     const run_logger_test = b.addRunArtifact(logger_test);
 
@@ -359,7 +339,6 @@ pub fn build(b: *std.Build) void {
     });
 
     security_test.root_module.addImport("zqlite", lib.root_module);
-    security_test.root_module.addImport("zsync", zsync.module("zsync"));
     security_test.root_module.addOptions("build_options", build_options);
 
     const run_security_test = b.addRunArtifact(security_test);
@@ -378,7 +357,6 @@ pub fn build(b: *std.Build) void {
     });
 
     file_backed_test.root_module.addImport("zqlite", lib.root_module);
-    file_backed_test.root_module.addImport("zsync", zsync.module("zsync"));
     file_backed_test.root_module.addOptions("build_options", build_options);
 
     const run_file_backed_test = b.addRunArtifact(file_backed_test);
@@ -409,7 +387,6 @@ pub fn build(b: *std.Build) void {
     });
 
     transaction_test.root_module.addImport("zqlite", lib.root_module);
-    transaction_test.root_module.addImport("zsync", zsync.module("zsync"));
     transaction_test.root_module.addOptions("build_options", build_options);
 
     const run_transaction_test = b.addRunArtifact(transaction_test);
@@ -442,7 +419,6 @@ pub fn build(b: *std.Build) void {
         });
 
         c_api_tests.root_module.addImport("zqlite", lib.root_module);
-        c_api_tests.root_module.addImport("zsync", zsync.module("zsync"));
         c_api_tests.root_module.addOptions("build_options", build_options);
 
         const run_c_api_tests = b.addRunArtifact(c_api_tests);
@@ -462,7 +438,6 @@ pub fn build(b: *std.Build) void {
     });
 
     benchmark_suite.root_module.addImport("zqlite", lib.root_module);
-    benchmark_suite.root_module.addImport("zsync", zsync.module("zsync"));
 
     const run_benchmark_suite = b.addRunArtifact(benchmark_suite);
 
@@ -480,7 +455,6 @@ pub fn build(b: *std.Build) void {
     });
 
     benchmark_validator.root_module.addImport("zqlite", lib.root_module);
-    benchmark_validator.root_module.addImport("zsync", zsync.module("zsync"));
 
     const run_benchmark_validator = b.addRunArtifact(benchmark_validator);
 
@@ -498,7 +472,6 @@ pub fn build(b: *std.Build) void {
     });
 
     minimal_bench.root_module.addImport("zqlite", lib.root_module);
-    minimal_bench.root_module.addImport("zsync", zsync.module("zsync"));
 
     const run_minimal_bench = b.addRunArtifact(minimal_bench);
 
@@ -506,23 +479,23 @@ pub fn build(b: *std.Build) void {
     minimal_bench_step.dependOn(&run_minimal_bench.step);
 
     // Basic examples that work without external dependencies
-    createBasicExample(b, "powerdns_example", lib, target, optimize, zsync, build_options);
-    createBasicExample(b, "cipher_dns", lib, target, optimize, zsync, build_options);
+    createBasicExample(b, "powerdns_example", lib, target, optimize, build_options);
+    createBasicExample(b, "cipher_dns", lib, target, optimize, build_options);
 
     // v1.2.2 Universal API examples
-    createBasicExample(b, "universal_api_demo", lib, target, optimize, zsync, build_options);
-    createBasicExample(b, "web_backend_demo", lib, target, optimize, zsync, build_options);
+    createBasicExample(b, "universal_api_demo", lib, target, optimize, build_options);
+    createBasicExample(b, "web_backend_demo", lib, target, optimize, build_options);
 
     // v1.3.0 PostgreSQL compatibility demos
-    createDemo(b, "uuid_demo", lib, target, optimize, zsync, build_options);
-    createDemo(b, "json_demo", lib, target, optimize, zsync, build_options);
-    createDemo(b, "connection_pool_demo", lib, target, optimize, zsync, build_options);
-    createDemo(b, "window_functions_demo", lib, target, optimize, zsync, build_options);
-    createDemo(b, "query_cache_demo", lib, target, optimize, zsync, build_options);
-    createDemo(b, "array_operations_demo", lib, target, optimize, zsync, build_options);
+    createDemo(b, "uuid_demo", lib, target, optimize, build_options);
+    createDemo(b, "json_demo", lib, target, optimize, build_options);
+    createDemo(b, "connection_pool_demo", lib, target, optimize, build_options);
+    createDemo(b, "window_functions_demo", lib, target, optimize, build_options);
+    createDemo(b, "query_cache_demo", lib, target, optimize, build_options);
+    createDemo(b, "array_operations_demo", lib, target, optimize, build_options);
 }
 
-fn createBasicExample(b: *std.Build, name: []const u8, lib: *std.Build.Step.Compile, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, zsync: *std.Build.Dependency, build_options: *std.Build.Step.Options) void {
+fn createBasicExample(b: *std.Build, name: []const u8, lib: *std.Build.Step.Compile, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options) void {
     const example = b.addExecutable(.{
         .name = name,
         .root_module = b.createModule(.{
@@ -533,12 +506,11 @@ fn createBasicExample(b: *std.Build, name: []const u8, lib: *std.Build.Step.Comp
     });
 
     example.root_module.addImport("zqlite", lib.root_module);
-    example.root_module.addImport("zsync", zsync.module("zsync"));
     example.root_module.addOptions("build_options", build_options);
     b.installArtifact(example);
 }
 
-fn createDemo(b: *std.Build, name: []const u8, lib: *std.Build.Step.Compile, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, zsync: *std.Build.Dependency, build_options: *std.Build.Step.Options) void {
+fn createDemo(b: *std.Build, name: []const u8, lib: *std.Build.Step.Compile, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options) void {
     const demo = b.addExecutable(.{
         .name = name,
         .root_module = b.createModule(.{
@@ -549,7 +521,6 @@ fn createDemo(b: *std.Build, name: []const u8, lib: *std.Build.Step.Compile, tar
     });
 
     demo.root_module.addImport("zqlite", lib.root_module);
-    demo.root_module.addImport("zsync", zsync.module("zsync"));
     demo.root_module.addOptions("build_options", build_options);
     b.installArtifact(demo);
 }

@@ -1,10 +1,10 @@
 # ZQLite Docker Testing Results
 
-Date: 2026-04-13
+Date: 2026-05-05
 Host: Arch Linux
 Primary Docker test images: Alpine
 Valgrind image: Debian bookworm-slim
-Zig: `/opt/zig-dev` (`0.17.0-dev.27+0dd99c37c`)
+Zig: `/opt/zig-dev` (`0.17.0-dev.242+5d55999d2`)
 
 ## Current Status
 

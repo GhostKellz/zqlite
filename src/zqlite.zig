@@ -105,7 +105,8 @@ pub const database_errors = @import("error_handling/database_errors.zig");
 pub const time_utils = @import("time_utils.zig");
 
 // Compatibility shims for blocking primitives and time helpers used across targets
-pub const compat = @import("zsync/compat/thread.zig");
+pub const compat = @import("runtime/compat/thread.zig");
+pub const runtime = @import("runtime/root.zig");
 
 // PQ-QUIC transport (profile: full, or -Dtransport=true)
 pub const transport = if (build_options.enable_transport)
@@ -217,7 +218,13 @@ pub fn printPQStatus() void {
 
 // Tests
 test "zqlite version info" {
-    try std.testing.expect(std.mem.eql(u8, version.VERSION_STRING, "1.6.2"));
+    try std.testing.expect(std.mem.eql(u8, version.VERSION_STRING, "1.6.4"));
+}
+
+test {
+    _ = @import("runtime/root.zig");
+    _ = @import("runtime/semaphore_test.zig");
+    _ = @import("runtime/channel_test.zig");
 }
 
 test "build info contains version" {

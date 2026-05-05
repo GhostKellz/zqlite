@@ -9,7 +9,7 @@ REPO="ghostkellz/zqlite"
 DEFAULT_REF="main"
 INSTALL_DIR="${HOME}/.local/bin"
 BINARY_NAME="zqlite"
-MIN_ZIG_VERSION="0.17.0-dev.27+0dd99c37c"
+MIN_ZIG_VERSION="0.17.0-dev.242+5d55999d2"
 RELEASE_API="https://api.github.com/repos/${REPO}/releases/tags"
 
 RED='\033[0;31m'

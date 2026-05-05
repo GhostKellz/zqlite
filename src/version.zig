@@ -1,21 +1,24 @@
 const std = @import("std");
 
-/// ZQLite version information - automatically generated from build.zig.zon
-pub const MAJOR = 1;
-pub const MINOR = 6;
-pub const PATCH = 2;
-
-/// Version string in format "1.3.0"
-pub const VERSION_STRING = std.fmt.comptimePrint("{}.{}.{}", .{ MAJOR, MINOR, PATCH });
-
-/// Version string with 'v' prefix: "v1.3.0"
-pub const VERSION_STRING_PREFIXED = "v" ++ VERSION_STRING;
-
-/// Full version display name
-pub const FULL_VERSION_STRING = "ZQLite v" ++ VERSION_STRING;
-
 /// Build metadata (injected by build system)
 pub const BUILD_OPTIONS = @import("build_options");
+pub const VERSION_STRING = BUILD_OPTIONS.version;
+pub const VERSION_STRING_Z = VERSION_STRING ++ "\x00";
+pub const VERSION_STRING_PREFIXED = "v" ++ VERSION_STRING;
+pub const FULL_VERSION_STRING = "ZQLite v" ++ VERSION_STRING;
+
+fn parseVersionPart(comptime part_index: usize) u32 {
+    var iter = std.mem.splitScalar(u8, VERSION_STRING, '.');
+    var index: usize = 0;
+    while (iter.next()) |part| : (index += 1) {
+        if (index == part_index) return std.fmt.parseInt(u32, part, 10) catch 0;
+    }
+    return 0;
+}
+
+pub const MAJOR = parseVersionPart(0);
+pub const MINOR = parseVersionPart(1);
+pub const PATCH = parseVersionPart(2);
 pub const BUILD_COMMIT = BUILD_OPTIONS.git_commit;
 pub const BUILD_DATE = BUILD_OPTIONS.build_date;
 pub const BUILD_MODE = BUILD_OPTIONS.build_mode;
@@ -41,13 +44,13 @@ pub fn isAtLeast(major: u32, minor: u32, patch: u32) bool {
 test "version functions" {
     const testing = std.testing;
 
-    try testing.expectEqualStrings("1.6.2", VERSION_STRING);
-    try testing.expectEqualStrings("v1.6.2", VERSION_STRING_PREFIXED);
-    try testing.expectEqualStrings("ZQLite v1.6.2", FULL_VERSION_STRING);
+    try testing.expectEqualStrings("1.6.4", VERSION_STRING);
+    try testing.expectEqualStrings("v1.6.4", VERSION_STRING_PREFIXED);
+    try testing.expectEqualStrings("ZQLite v1.6.4", FULL_VERSION_STRING);
 
-    try testing.expect(getVersionNumber() == 1006002);
+    try testing.expect(getVersionNumber() == 1006004);
     try testing.expect(isAtLeast(1, 2, 0));
     try testing.expect(isAtLeast(1, 6, 0));
-    try testing.expect(isAtLeast(1, 6, 2));
+    try testing.expect(isAtLeast(1, 6, 4));
     try testing.expect(!isAtLeast(2, 0, 0));
 }

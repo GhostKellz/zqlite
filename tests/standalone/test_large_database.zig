@@ -30,7 +30,7 @@ fn testCacheOverflow(allocator: std.mem.Allocator) !void {
 
     // Insert enough data to exceed 1000 page cache
     // Use moderate text size to avoid page overflow
-    const text = "ABCDEFGHIJ" ** 5; // 50 bytes per row
+    const text = "ABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJ"; // 50 bytes per row
     var i: usize = 0;
     while (i < 5000) : (i += 1) {
         var buf: [256]u8 = undefined;

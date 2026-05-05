@@ -13,7 +13,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     std.debug.print("🧪 {s} - Test Suite Runner\n", .{version.FULL_VERSION_WITH_BUILD});
-    std.debug.print("=" ** 60 ++ "\n", .{});
+    std.debug.print("============================================================\n", .{});
 
     var total_tests: u32 = 0;
     var passed_tests: u32 = 0;
@@ -28,7 +28,7 @@ pub fn main() !void {
 
     for (test_categories) |category| {
         std.debug.print("\n📋 Running {s} Tests...\n", .{category.name});
-        std.debug.print("-" ** 40 ++ "\n", .{});
+        std.debug.print("----------------------------------------\n", .{});
 
         const result = category.test_fn(allocator) catch |err| {
             std.debug.print("❌ Category {s} failed with error: {}\n", .{ category.name, err });
@@ -48,7 +48,7 @@ pub fn main() !void {
     }
 
     // Print summary
-    std.debug.print("\n" ++ "=" ** 60 ++ "\n", .{});
+    std.debug.print("\n============================================================\n", .{});
     std.debug.print("📊 Test Summary:\n", .{});
     std.debug.print("   Total Tests: {}\n", .{total_tests});
     std.debug.print("   Passed: {} ✅\n", .{passed_tests});

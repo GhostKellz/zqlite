@@ -1,7 +1,6 @@
 const std = @import("std");
 const storage = @import("../db/storage.zig");
 const mvcc = @import("mvcc_transactions.zig");
-const zsync = @import("zsync");
 
 /// Deterministic Execution Engine - TigerBeetle Inspired
 /// Ensures reproducible results across runs for financial auditing

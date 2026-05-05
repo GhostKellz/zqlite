@@ -11,7 +11,7 @@ Local compiler baseline:
 Expected result:
 
 ```text
-0.17.0-dev.27+0dd99c37c
+0.17.0-dev.242+5d55999d2
 ```
 
 ### Quick Validation
@@ -66,7 +66,7 @@ lint → build-test → [memory-tests, benchmarks, extended-tests]
 | extended-tests | `test-security`, `test-comprehensive`, `test-storage` |
 
 All jobs run on self-hosted runner.
-Runner Zig configuration should resolve to the same `0.17.0-dev.27+0dd99c37c` baseline used for local validation.
+Runner Zig configuration should resolve to the same `0.17.0-dev.242+5d55999d2` baseline used for local validation.
 
 ## Build Profiles
 

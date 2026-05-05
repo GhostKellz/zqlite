@@ -5,6 +5,29 @@ All notable changes to ZQLite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.4] - 2026-05-04
+
+### Fixed
+- **Zig dev parser/build compatibility** - Removed remaining repeat-expression and stale syntax hazards across active source, examples, and test targets
+  - Fixes current `/opt/zig-dev/zig build` failures triggered by array/string repeat-expression parsing in touched files
+- **C API version export** - `zqlite_version()` now returns a sentinel-terminated string as required by the exported C ABI
+
+### Changed
+- **Runtime ownership** - Removed the external `zsync` dependency and replaced it with an internal `zqlite` runtime layer
+  - Added owned compatibility/time primitives in `src/runtime/compat/thread.zig`
+  - Added owned typed futures, channels, task spawning, timeout, and yield/sleep helpers under `src/runtime/`
+  - Rewired concurrency/distributed code paths to the internal runtime surface
+- **Version source of truth** - Runtime version strings now come from `build.zig.zon` via `build_options`
+  - Fixes the previous hardcoded `src/version.zig` drift from package metadata
+
+### Verified
+- `zig build`
+- `zig build test`
+- `zig build test-security`
+- `zig build test-storage`
+- `zig build test-comprehensive`
+- `zig build test-advanced`
+
 ## [1.6.2] - 2026-04-13
 
 ### Fixed

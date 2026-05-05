@@ -355,9 +355,9 @@ pub fn main() !void {
     defer server.deinit();
 
     // Demo peer keys
-    const alice_key = [_]u8{1} ** 32;
-    const bob_key = [_]u8{2} ** 32;
-    const relay_key = [_]u8{3} ** 32;
+    const alice_key = [_]u8{1} ++ std.mem.zeroes([31]u8);
+    const bob_key = [_]u8{2} ++ std.mem.zeroes([31]u8);
+    const relay_key = [_]u8{3} ++ std.mem.zeroes([31]u8);
 
     // Register VPN peers
     const alice_ips = [_][]const u8{"10.8.0.2/32"};
@@ -369,7 +369,7 @@ pub fn main() !void {
     try server.registerPeer(relay_key, "203.0.113.100:51820", relay_ips[0..], .relay);
 
     // Authenticate peers
-    const dummy_signature = [_]u8{0} ** 64;
+    const dummy_signature = std.mem.zeroes([64]u8);
     _ = try server.authenticatePeer(alice_key, dummy_signature);
     _ = try server.authenticatePeer(bob_key, dummy_signature);
     _ = try server.authenticatePeer(relay_key, dummy_signature);

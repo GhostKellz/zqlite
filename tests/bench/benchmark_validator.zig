@@ -24,7 +24,7 @@ pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
     std.debug.print("\n🔍 ZQLite Benchmark Validation\n", .{});
-    std.debug.print("=" ** 80 ++ "\n\n", .{});
+    std.debug.print("================================================================================\n\n", .{});
 
     var conn = try zqlite.open(allocator, ":memory:");
     defer conn.close();
@@ -131,7 +131,7 @@ pub fn main() !void {
 
     // Print results
     std.debug.print("Benchmark Results:\n", .{});
-    std.debug.print("-" ** 80 ++ "\n", .{});
+    std.debug.print("--------------------------------------------------------------------------------\n", .{});
 
     var all_passed = true;
     for (results.items) |result| {
@@ -145,7 +145,7 @@ pub fn main() !void {
         if (!result.passed) all_passed = false;
     }
 
-    std.debug.print("=" ** 80 ++ "\n", .{});
+    std.debug.print("================================================================================\n", .{});
 
     if (all_passed) {
         std.debug.print("✅ All benchmarks passed regression thresholds!\n\n", .{});

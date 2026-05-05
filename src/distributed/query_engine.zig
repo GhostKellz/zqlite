@@ -5,7 +5,7 @@ const cluster = @import("../cluster/manager.zig");
 const parser = @import("../parser/parser.zig");
 const executor = @import("../executor/vm.zig");
 const transport = @import("../transport/transport.zig");
-const zsync = @import("zsync");
+const runtime = @import("../runtime/root.zig");
 const time_utils = @import("../time_utils.zig");
 
 /// Distributed Query Engine for Query Distribution and Execution
@@ -101,20 +101,16 @@ pub const DistributedQueryEngine = struct {
 
     /// Execute batch of queries
     pub fn executeBatch(self: *Self, queries: []const []const u8) ![]DistributedQueryResult {
-        var results = try self.allocator.alloc(DistributedQueryResult, queries.len);
-
         // Execute queries in parallel
-        var futures = try self.allocator.alloc(zsync.Future(DistributedQueryResult), queries.len);
+        var futures = try self.allocator.alloc(*runtime.Future(DistributedQueryResult), queries.len);
         defer self.allocator.free(futures);
 
         for (queries, 0..) |query, i| {
-            futures[i] = zsync.async(self.executeQuery, .{query});
+            futures[i] = try runtime.spawn(self.allocator, DistributedQueryEngine.executeQuery, .{ self, query });
         }
+        defer for (futures) |future| future.deinit();
 
-        // Wait for all to complete
-        for (futures, 0..) |future, i| {
-            results[i] = try future.await();
-        }
+        const results = try runtime.all(DistributedQueryResult, self.allocator, futures);
 
         self.metrics.batch_queries_executed += 1;
 

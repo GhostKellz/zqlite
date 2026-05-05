@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const compat = @import("./zsync/compat/thread.zig");
+const compat = @import("runtime/compat/thread.zig");
 
 /// Get current timestamp in nanoseconds since epoch
 /// Returns 0 on error (fallback for systems where clock_gettime fails)
