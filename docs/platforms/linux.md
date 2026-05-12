@@ -4,7 +4,7 @@ Linux is the primary development and test platform.
 
 ## Requirements
 
-- Zig `0.17.0-dev.242+5d55999d2` or later
+- Zig version satisfying `build.zig.zon`
 - POSIX-compliant filesystem
 
 ## Build
@@ -55,6 +55,6 @@ Verified regularly on:
 - Arch Linux (primary host)
 - Debian-based Docker environments for validation and Valgrind
 
-Current local Zig baseline: `/opt/zig-dev/zig` (`0.17.0-dev.242+5d55999d2`).
+Current local Zig baseline is tracked through `build.zig.zon` and the active `/opt/zig-dev/zig` toolchain.
 
 Other Linux distributions may work, but should be treated as less verified unless explicitly tested.

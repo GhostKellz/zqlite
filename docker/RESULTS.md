@@ -4,7 +4,7 @@ Date: 2026-05-05
 Host: Arch Linux
 Primary Docker test images: Alpine
 Valgrind image: Debian bookworm-slim
-Zig: `/opt/zig-dev` (`0.17.0-dev.242+5d55999d2`)
+Zig: `/opt/zig-dev` on the then-current project baseline
 
 ## Current Status
 

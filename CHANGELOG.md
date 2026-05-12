@@ -5,6 +5,32 @@ All notable changes to ZQLite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.5] - 2026-05-12
+
+### Fixed
+- **Zig latest compatibility** - Replaced removed Zig stdlib sentinel-allocation helpers in active file-backed and FFI code paths
+  - `src/db/pager.zig` now uses `dupeSentinel(..., 0)`
+  - `src/db/wal.zig` now uses `dupeSentinel(..., 0)`
+  - `src/ffi/c_api.zig` now uses `dupeSentinel(..., 0)`
+- **Current toolchain buildability** - Restored `zig build` and `zig build test` compatibility on newer Zig `0.17.0-dev` toolchains
+
+### Changed
+- **Minimum Zig version** - Updated package metadata to require `0.17.0-dev.292+fc1c83a36`
+- **GitHub Actions runtime** - Updated workflow action pins to Node 24-capable versions
+  - `actions/checkout@v6`
+  - `actions/upload-artifact@v7`
+  - `actions/download-artifact@v8`
+  - `softprops/action-gh-release@v3`
+- **Nightly validation** - Added a host-runner nightly workflow aligned with the native validation model used in adjacent repos
+
+### Verified
+- `zig build`
+- `zig build test`
+- `zig build test-security`
+- `zig build test-storage`
+- `zig build test-comprehensive`
+- `./scripts/test-release.sh`
+
 ## [1.6.4] - 2026-05-04
 
 ### Fixed

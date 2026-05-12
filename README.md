@@ -45,12 +45,12 @@ See [Stable vs Experimental](docs/security/stable-vs-experimental.md) for detail
 
 ## Install
 
-Requires Zig `0.17.0-dev.242+5d55999d2` or later
+Requires the minimum Zig version declared in `build.zig.zon`
 
 Tagged release fetch:
 
 ```bash
-zig fetch --save https://github.com/ghostkellz/zqlite/archive/refs/tags/v1.6.4.tar.gz
+zig fetch --save https://github.com/ghostkellz/zqlite/archive/refs/tags/<tag>.tar.gz
 ```
 
 ```bash
@@ -63,7 +63,7 @@ Optional helper-script install:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ghostkellz/zqlite/refs/heads/main/install.sh -o install.sh
 chmod +x install.sh
-ZQLITE_REF=v1.6.4 ./install.sh
+ZQLITE_REF=<tag> ./install.sh
 ```
 
 Review `install.sh` before using it in automation.
@@ -140,7 +140,7 @@ docker-compose -f docker/docker-compose.yml run --rm zqlite-full
 
 ## Project Status
 
-**v1.6.4** - Beta
+**Beta**
 
 Core database functionality is stable and tested. The project is under active development.
 

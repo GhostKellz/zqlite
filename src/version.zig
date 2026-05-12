@@ -44,13 +44,14 @@ pub fn isAtLeast(major: u32, minor: u32, patch: u32) bool {
 test "version functions" {
     const testing = std.testing;
 
-    try testing.expectEqualStrings("1.6.4", VERSION_STRING);
-    try testing.expectEqualStrings("v1.6.4", VERSION_STRING_PREFIXED);
-    try testing.expectEqualStrings("ZQLite v1.6.4", FULL_VERSION_STRING);
+    try testing.expectEqualStrings(BUILD_OPTIONS.version, VERSION_STRING);
+    try testing.expectEqualStrings("v" ++ BUILD_OPTIONS.version, VERSION_STRING_PREFIXED);
+    try testing.expectEqualStrings("ZQLite v" ++ BUILD_OPTIONS.version, FULL_VERSION_STRING);
 
-    try testing.expect(getVersionNumber() == 1006004);
+    const expected_version_number = (MAJOR * 1000000) + (MINOR * 1000) + PATCH;
+    try testing.expect(getVersionNumber() == expected_version_number);
     try testing.expect(isAtLeast(1, 2, 0));
     try testing.expect(isAtLeast(1, 6, 0));
-    try testing.expect(isAtLeast(1, 6, 4));
+    try testing.expect(isAtLeast(MAJOR, MINOR, PATCH));
     try testing.expect(!isAtLeast(2, 0, 0));
 }

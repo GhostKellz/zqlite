@@ -1,0 +1,60 @@
+name: Nightly Sanity Sweep
+
+on:
+  schedule:
+    - cron: '45 7 * * *'
+  workflow_dispatch:
+
+jobs:
+  nightly:
+    name: "Nightly validation"
+    runs-on: self-hosted
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Cache Zig build artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            .zig-cache
+            .zig-global-cache
+          key: zqlite-nightly-${{ runner.os }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            zqlite-nightly-${{ runner.os }}-
+
+      - name: Clean workspace
+        run: |
+          set -euo pipefail
+          rm -rf .zig-cache .zig-global-cache zig-out /tmp/zqlite_*.db /tmp/zqlite_critical_tests
+          mkdir -p .zig-cache .zig-global-cache
+          echo "ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache" >> "$GITHUB_ENV"
+
+      - name: Show Zig version
+        run: zig version
+
+      - name: Full test sweep
+        run: |
+          set -euo pipefail
+          ./scripts/test-release.sh
+
+      - name: Memory regression tests
+        run: |
+          set -euo pipefail
+          zig build test-memory-leaks
+          zig build test-comprehensive-memory
+
+      - name: File-backed storage sanity
+        run: |
+          set -euo pipefail
+          zig build test-storage
+
+      - name: Valgrind audit
+        run: |
+          set -euo pipefail
+          if command -v valgrind >/dev/null 2>&1; then
+            ZIG=zig ROOT=$PWD docker/scripts/run-valgrind.sh
+          else
+            echo "valgrind not installed on runner; skipping valgrind audit"
+          fi

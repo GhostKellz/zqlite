@@ -44,7 +44,7 @@ pub const WriteAheadLog = struct {
             return error.Unsupported;
         }
 
-        const wal_path_z = try allocator.dupeZ(u8, wal_path);
+        const wal_path_z = try allocator.dupeSentinel(u8, wal_path, 0);
         defer allocator.free(wal_path_z);
 
         // Open or create the WAL file (POSIX path)

@@ -8,10 +8,10 @@ Local compiler baseline:
 /opt/zig-dev/zig version
 ```
 
-Expected result:
+Example result:
 
 ```text
-0.17.0-dev.242+5d55999d2
+0.17.0-dev.292+fc1c83a36
 ```
 
 ### Quick Validation
@@ -66,7 +66,7 @@ lint → build-test → [memory-tests, benchmarks, extended-tests]
 | extended-tests | `test-security`, `test-comprehensive`, `test-storage` |
 
 All jobs run on self-hosted runner.
-Runner Zig configuration should resolve to the same `0.17.0-dev.242+5d55999d2` baseline used for local validation.
+Runner Zig configuration should satisfy the minimum Zig version declared in `build.zig.zon`.
 
 ## Build Profiles
 

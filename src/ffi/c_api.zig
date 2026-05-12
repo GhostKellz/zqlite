@@ -318,7 +318,7 @@ export fn zqlite_result_get_text(result: ?*zqlite_result_t, row: c_int, column: 
 
     if (cell_data) |data| {
         // Convert to null-terminated string
-        const c_str = c_allocator.dupeZ(u8, data) catch return null;
+        const c_str = c_allocator.dupeSentinel(u8, data, 0) catch return null;
         return c_str.ptr;
     }
 

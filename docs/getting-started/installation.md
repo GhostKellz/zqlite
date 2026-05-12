@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- Zig `0.17.0-dev.242+5d55999d2` or later
+- Zig version satisfying `build.zig.zon`
 - Linux (primary), macOS, or Windows (limited)
 
 ## Zig Package Manager
@@ -10,7 +10,7 @@
 Add ZQLite as a dependency:
 
 ```bash
-zig fetch --save https://github.com/ghostkellz/zqlite/archive/refs/tags/v1.6.4.tar.gz
+zig fetch --save https://github.com/ghostkellz/zqlite/archive/refs/tags/<tag>.tar.gz
 ```
 
 In your `build.zig`:
@@ -52,14 +52,14 @@ After building, the CLI is available at:
 
 The CLI supports direct startup plus flags such as `--help`, `--version`, `--db`, and `--sql`.
 
-Validated locally with `/opt/zig-dev/zig` (`0.17.0-dev.242+5d55999d2`).
+Validated locally with `/opt/zig-dev/zig` on the current project Zig baseline.
 
 ## Installation Script
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/ghostkellz/zqlite/refs/heads/main/install.sh -o install.sh
 chmod +x install.sh
-ZQLITE_REF=v1.6.4 ./install.sh
+ZQLITE_REF=<tag> ./install.sh
 ```
 
 Note: review `install.sh` before relying on it in automation. The canonical verified paths are `zig fetch` for tagged consumption and `zig build` from source.

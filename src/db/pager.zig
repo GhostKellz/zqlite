@@ -217,7 +217,7 @@ pub const Pager = struct {
         }
 
         // Convert path to null-terminated string for posix
-        const path_z = try allocator.dupeZ(u8, path);
+        const path_z = try allocator.dupeSentinel(u8, path, 0);
         defer allocator.free(path_z);
 
         // Open or create the database file using POSIX
