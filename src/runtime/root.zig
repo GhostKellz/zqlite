@@ -61,6 +61,8 @@ fn scheduleFuture(allocator: std.mem.Allocator, comptime task_fn: anytype, args:
     const return_type = @typeInfo(@TypeOf(task_fn)).@"fn".return_type.?;
     const FutureType = @TypeOf(future.*);
 
+    future.markScheduled();
+
     const Wrapper = struct {
         future: *FutureType,
         allocator: std.mem.Allocator,
@@ -76,7 +78,7 @@ fn scheduleFuture(allocator: std.mem.Allocator, comptime task_fn: anytype, args:
                 .error_union => {
                     const result = @call(.auto, task_fn, self.args) catch |err| {
                         if (err == error.Cancelled) {
-                            self.future.cancel();
+                            self.future.completeCancelled();
                             return;
                         }
                         self.future.reject(err);
@@ -93,7 +95,7 @@ fn scheduleFuture(allocator: std.mem.Allocator, comptime task_fn: anytype, args:
         fn run(payload: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(payload));
             if (self.future.getCancelToken().isCancelled()) {
-                self.future.cancel();
+                self.future.completeCancelled();
                 return;
             }
             self.invoke();

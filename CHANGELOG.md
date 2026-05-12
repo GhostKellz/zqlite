@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `src/db/wal.zig` now uses `dupeSentinel(..., 0)`
   - `src/ffi/c_api.zig` now uses `dupeSentinel(..., 0)`
 - **Current toolchain buildability** - Restored `zig build` and `zig build test` compatibility on newer Zig `0.17.0-dev` toolchains
+- **Runtime cancellation lifetime** - Prevented executor-backed futures from completing cancellation before worker teardown finishes
+  - Fixes the `runtime semaphore waitWithToken cancels blocked waiter` crash seen during release validation
+  - Worker-owned cancellation cleanup now finishes before the future can be torn down
 
 ### Changed
 - **Minimum Zig version** - Updated package metadata to require `0.17.0-dev.292+fc1c83a36`
@@ -26,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Verified
 - `zig build`
 - `zig build test`
+- `zig test src/runtime/semaphore_test.zig`
 - `zig build test-security`
 - `zig build test-storage`
 - `zig build test-comprehensive`

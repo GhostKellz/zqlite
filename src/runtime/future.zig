@@ -12,6 +12,7 @@ pub fn Future(comptime T: type) type {
         notifier: notifier_mod.Notifier,
         waiters: std.ArrayListUnmanaged(*notifier_mod.Notifier),
         cancel_token: *cancellation.CancelToken,
+        scheduled: bool,
         allocator: std.mem.Allocator,
 
         const Self = @This();
@@ -41,9 +42,16 @@ pub fn Future(comptime T: type) type {
                 .notifier = .{},
                 .waiters = .empty,
                 .cancel_token = token,
+                .scheduled = false,
                 .allocator = allocator,
             };
             return self;
+        }
+
+        pub fn markScheduled(self: *Self) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.scheduled = true;
         }
 
         pub fn await(self: *Self) !T {
@@ -118,6 +126,21 @@ pub fn Future(comptime T: type) type {
 
             if (self.state.load(.acquire) != .pending) return;
 
+            if (self.scheduled) return;
+
+            self.completeCancelledLocked();
+        }
+
+        pub fn completeCancelled(self: *Self) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            if (self.state.load(.acquire) != .pending) return;
+
+            self.completeCancelledLocked();
+        }
+
+        fn completeCancelledLocked(self: *Self) void {
             self.state.store(.cancelled, .release);
             self.condition.broadcast();
             self.notifier.notify();
