@@ -27,10 +27,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const config = FuzzConfig{
-        .seed = @intCast(blk: {
-            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch unreachable;
-            break :blk ts.sec;
-        }),
+        .seed = @bitCast(zqlite.time_utils.getTimestampMillis()),
         .iterations = 10000,
         .max_sql_length = 1000,
         .verbose = false,

@@ -509,7 +509,6 @@ pub fn executeCommand(allocator: std.mem.Allocator, args: []const []const u8) !v
     }
 
     if (show_version) {
-        try writeAll("ZQLite ");
         try writeAll(version.FULL_VERSION_STRING);
         try writeAll("\n");
         return;

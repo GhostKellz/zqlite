@@ -1,30 +1,5 @@
 const std = @import("std");
-const builtin = @import("builtin");
-
-const compat = if (builtin.is_test) struct {
-    pub const Mutex = struct {
-        state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
-
-        pub fn lock(self: *Mutex) void {
-            while (true) {
-                if (self.state.compareExchangeWeak(0, 1, .acq_rel, .acquire) == .success) return;
-                std.atomic.spinLoopHint();
-            }
-        }
-
-        pub fn unlock(self: *Mutex) void {
-            self.state.store(0, .release);
-        }
-    };
-
-    pub const timespec = std.posix.timespec;
-    pub const CLOCK = enum { REALTIME };
-    pub fn clock_gettime(_: CLOCK) error{}!timespec {
-        var ts: timespec = undefined;
-        if (std.os.linux.clock_gettime(.REALTIME, &ts) != 0) return error{};
-        return ts;
-    }
-} else @import("root").compat;
+const compat = @import("../runtime/compat/thread.zig");
 
 /// Production-grade structured logging system
 /// Features: JSON/text formats, log levels, thread-safe, scoped loggers
@@ -172,9 +147,9 @@ pub const Logger = struct {
             year_day.year,
             month_day.month.numeric(),
             month_day.day_index + 1,
-            @mod(@divFloor(epoch_seconds, 3600), 24),
-            @mod(@divFloor(epoch_seconds, 60), 60),
-            @mod(epoch_seconds, 60),
+            @as(u64, @intCast(@mod(@divFloor(epoch_seconds, 3600), 24))),
+            @as(u64, @intCast(@mod(@divFloor(epoch_seconds, 60), 60))),
+            @as(u64, @intCast(@mod(epoch_seconds, 60))),
             @abs(milliseconds),
         }) catch "UNKNOWN";
 

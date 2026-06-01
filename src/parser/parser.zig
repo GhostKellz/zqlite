@@ -83,32 +83,46 @@ pub const Parser = struct {
     /// Parse SELECT statement (may include UNION/INTERSECT/EXCEPT)
     fn parseSelect(self: *Self) !ast.Statement {
         // Parse the first SELECT
-        const left_select = try self.parseSimpleSelect();
+        var left_select = try self.parseSimpleSelect();
+        // Freed here only while ownership has not been transferred into left_ptr.
+        var left_owned = true;
+        errdefer if (left_owned) left_select.deinit(self.allocator);
 
         // Check for UNION/INTERSECT/EXCEPT
         const set_op = self.parseSetOperation() catch {
             // No set operation, return the simple SELECT
+            left_owned = false;
             return ast.Statement{ .Select = left_select };
         };
 
         // We have a set operation, parse the right side
         const left_ptr = try self.allocator.create(ast.SelectStatement);
+        errdefer self.allocator.destroy(left_ptr);
         left_ptr.* = left_select;
+        left_owned = false;
+        errdefer left_ptr.deinit(self.allocator);
 
         // Parse right side (could be another SELECT or compound)
         // Note: parseSelect will call expect(.Select) internally
-        const right_stmt = try self.parseSelect();
+        var right_stmt = try self.parseSelect();
+        errdefer right_stmt.deinit(self.allocator);
         const right_ptr = try self.allocator.create(ast.Statement);
+        errdefer self.allocator.destroy(right_ptr);
         right_ptr.* = right_stmt;
 
         // Parse optional ORDER BY for the compound (applies to whole result)
         var order_by: ?[]ast.OrderByClause = null;
+        errdefer if (order_by) |ob| {
+            for (ob) |clause| self.allocator.free(clause.column);
+            self.allocator.free(ob);
+        };
         if (std.meta.activeTag(self.current_token) == .Order) {
             try self.advance();
             try self.expect(.By);
 
             var order_clauses: std.ArrayListUnmanaged(ast.OrderByClause) = .empty;
             defer order_clauses.deinit(self.allocator);
+            errdefer for (order_clauses.items) |clause| self.allocator.free(clause.column);
 
             while (true) {
                 const col = try self.expectIdentifier();
@@ -186,6 +200,11 @@ pub const Parser = struct {
         // Parse columns
         var columns: std.ArrayListUnmanaged(ast.Column) = .empty;
         defer columns.deinit(self.allocator);
+        errdefer for (columns.items) |*column| {
+            self.allocator.free(column.name);
+            column.expression.deinit(self.allocator);
+            if (column.alias) |alias| self.allocator.free(alias);
+        };
 
         if (std.meta.activeTag(self.current_token) == .Asterisk) {
             try self.advance();
@@ -210,6 +229,7 @@ pub const Parser = struct {
         // Parse FROM clause
         try self.expect(.From);
         var table_name = try self.expectIdentifier();
+        errdefer self.allocator.free(table_name);
 
         // Check for optional table alias
         if (self.current_token == .Identifier) {
@@ -226,6 +246,10 @@ pub const Parser = struct {
         // Parse optional JOIN clauses
         var joins: std.ArrayListUnmanaged(ast.JoinClause) = .empty;
         defer joins.deinit(self.allocator);
+        errdefer for (joins.items) |*join| {
+            self.allocator.free(join.table);
+            join.condition.deinit(self.allocator);
+        };
 
         while (true) {
             const join_type = self.parseJoinType() catch break;
@@ -235,6 +259,7 @@ pub const Parser = struct {
 
         // Parse optional WHERE clause
         var where_clause: ?ast.WhereClause = null;
+        errdefer if (where_clause) |*w| w.deinit(self.allocator);
         if (std.meta.activeTag(self.current_token) == .Where) {
             try self.advance();
             where_clause = try self.parseWhere();
@@ -242,12 +267,17 @@ pub const Parser = struct {
 
         // Parse optional GROUP BY clause
         var group_by: ?[][]const u8 = null;
+        errdefer if (group_by) |gb| {
+            for (gb) |col| self.allocator.free(col);
+            self.allocator.free(gb);
+        };
         if (std.meta.activeTag(self.current_token) == .Group) {
             try self.advance();
             try self.expect(.By);
 
             var group_columns: std.ArrayListUnmanaged([]const u8) = .empty;
             defer group_columns.deinit(self.allocator);
+            errdefer for (group_columns.items) |col| self.allocator.free(col);
 
             while (true) {
                 const col = try self.expectIdentifier();
@@ -265,6 +295,7 @@ pub const Parser = struct {
 
         // Parse optional HAVING clause
         var having: ?ast.WhereClause = null;
+        errdefer if (having) |*h| h.deinit(self.allocator);
         if (std.meta.activeTag(self.current_token) == .Having) {
             try self.advance();
             having = try self.parseWhere();
@@ -272,6 +303,10 @@ pub const Parser = struct {
 
         // Parse optional WINDOW clause definitions
         var window_definitions: ?[]ast.WindowDefinition = null;
+        errdefer if (window_definitions) |wd| {
+            for (wd) |*w| w.deinit(self.allocator);
+            self.allocator.free(wd);
+        };
         if (std.meta.activeTag(self.current_token) == .Window) {
             window_definitions = try self.parseWindowDefinitions();
         }
@@ -280,6 +315,10 @@ pub const Parser = struct {
         // Those are handled at the compound level
         // But we still need to parse them for standalone selects
         var order_by: ?[]ast.OrderByClause = null;
+        errdefer if (order_by) |ob| {
+            for (ob) |clause| self.allocator.free(clause.column);
+            self.allocator.free(ob);
+        };
         var limit: ?u32 = null;
         var offset: ?u32 = null;
 
@@ -291,6 +330,7 @@ pub const Parser = struct {
 
                 var order_clauses: std.ArrayListUnmanaged(ast.OrderByClause) = .empty;
                 defer order_clauses.deinit(self.allocator);
+                errdefer for (order_clauses.items) |clause| self.allocator.free(clause.column);
 
                 while (true) {
                     const col = try self.expectIdentifier();

@@ -5,6 +5,36 @@ All notable changes to ZQLite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.6] - 2026-06-01
+
+### Fixed
+- **Parser error-path memory leaks** - `parseSimpleSelect` and `parseSelect` now release partially-built AST allocations on every failure path
+  - Previously `defer list.deinit()` freed only the `ArrayList` backing buffer, leaking dup'd column names/expressions, table names, and join/where/group-by/having/order-by/window contents when a parse failed partway
+  - Added `errdefer` cleanup matching the existing `parseWindowDefinitions` pattern, including ownership-transfer-aware handling for compound `UNION`/`INTERSECT`/`EXCEPT` selects so `left_select` and the `left`/`right` boxes are freed exactly once
+  - Surfaced by the SQL parser fuzzer: 50,000 random parses (~20% malformed) now report zero leaks
+- **Zig nightly compatibility** - Restored `zig build` and all test/bench/fuzz targets on Zig `0.17.0-dev.639+284ab0ad8`
+  - `build.zig` run step uses `addPassthruArgs()` (replaces removed `b.args`)
+  - `src/logging/logger.zig` imports the owned `runtime/compat/thread.zig` directly instead of the fragile `@import("root").compat` fallback
+  - `tests/fuzz/fuzz_example.zig` updated for the new `std.testing.fuzz` `Smith` API
+  - `tests/fuzz/sql_parser_fuzzer.zig` seeds from `zqlite.time_utils` instead of the removed `std.posix.clock_gettime`
+- **Logger timestamp formatting** - ISO-8601 time fields no longer render a spurious `+` sign (e.g. `T+22:+28:+23`); signed components are cast to unsigned for the new `{d:0>2}` formatting behavior
+- **`--version` output** - Removed duplicated prefix that printed `ZQLite ZQLite v1.6.6`; now prints `ZQLite v1.6.6`
+
+### Changed
+- **Minimum Zig version** - Updated package metadata to require `0.17.0-dev.639+284ab0ad8`
+
+### Verified
+- `zig build`
+- `zig build test`
+- `zig build test-memory`
+- `zig build test-comprehensive`
+- `zig build test-advanced`
+- `zig build test-security`
+- `zig build test-storage`
+- `zig build test-window`
+- `zig build test-logging`
+- `zig build fuzz-parser` (zero leaks across repeated runs)
+
 ## [1.6.5] - 2026-05-12
 
 ### Fixed
