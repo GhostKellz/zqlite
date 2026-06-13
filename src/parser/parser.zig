@@ -660,6 +660,13 @@ pub const Parser = struct {
             target_columns = try cols.toOwnedSlice(self.allocator);
         }
 
+        // Once the target columns are owned here, any later parse error must free
+        // them (and the per-column strings) rather than leak.
+        errdefer if (target_columns) |tc| {
+            for (tc) |c| self.allocator.free(c);
+            self.allocator.free(tc);
+        };
+
         try self.expect(.Do);
 
         // Parse action: NOTHING or UPDATE
@@ -675,19 +682,32 @@ pub const Parser = struct {
             try self.advance();
             try self.expect(.Set);
 
-            // Parse assignments
+            // Parse assignments. On error, free every assignment already collected;
+            // toOwnedSlice() empties the list on the success path so this no-ops then.
             var assignments: std.ArrayListUnmanaged(ast.Assignment) = .empty;
-            defer assignments.deinit(self.allocator);
+            errdefer {
+                for (assignments.items) |*a| a.deinit(self.allocator);
+                assignments.deinit(self.allocator);
+            }
 
             while (true) {
                 const column = try self.expectIdentifierOrKeyword();
-                try self.expect(.Equal);
-                const expr = try self.parseExpression();
-
-                try assignments.append(self.allocator, ast.Assignment{
+                self.expect(.Equal) catch |err| {
+                    self.allocator.free(column);
+                    return err;
+                };
+                var expr = self.parseExpression() catch |err| {
+                    self.allocator.free(column);
+                    return err;
+                };
+                assignments.append(self.allocator, ast.Assignment{
                     .column = column,
                     .expr = expr,
-                });
+                }) catch |err| {
+                    self.allocator.free(column);
+                    expr.deinit(self.allocator);
+                    return err;
+                };
 
                 if (std.meta.activeTag(self.current_token) == .Comma) {
                     try self.advance();
@@ -2248,7 +2268,9 @@ pub const Parser = struct {
     /// Parse a primary expression (column, literal, parameter, or subquery)
     fn parsePrimaryExpression(self: *Self) !ast.Expression {
         return switch (self.current_token) {
-            .Identifier, .Count, .Sum, .Avg, .Min, .Max => {
+            // .Excluded lets `EXCLUDED.<column>` references inside
+            // ON CONFLICT DO UPDATE parse as a qualified column ("excluded.col").
+            .Identifier, .Excluded, .Count, .Sum, .Avg, .Min, .Max => {
                 var owned_id = try self.expectIdentifierOrKeyword();
                 errdefer self.allocator.free(owned_id);
 
@@ -2577,6 +2599,10 @@ pub const Parser = struct {
                 return value;
             },
             // Allow common keywords as identifiers in alias contexts
+            .Excluded => {
+                try self.advance();
+                return try self.allocator.dupe(u8, "excluded");
+            },
             .Count => {
                 try self.advance();
                 return try self.allocator.dupe(u8, "count");

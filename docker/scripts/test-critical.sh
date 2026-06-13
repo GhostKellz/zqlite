@@ -30,6 +30,9 @@ run_test() {
     echo ""
 }
 
+# UPSERT / ON CONFLICT excluded.* semantics
+run_test "upsert" "tests/standalone/test_upsert.zig"
+
 # Core file storage
 run_test "file_backed" "tests/standalone/test_file_backed.zig"
 

@@ -47,12 +47,14 @@ echo "=== ZQLite Valgrind Audit ==="
 echo
 
 build_test "test_security" "tests/standalone/test_security.zig"
+build_test "test_upsert" "tests/standalone/test_upsert.zig"
 build_test "test_file_backed" "tests/standalone/test_file_backed.zig"
 build_test "test_transaction_atomicity" "tests/standalone/test_transaction_atomicity.zig"
 build_test "test_concurrent_access" "tests/standalone/test_concurrent_access.zig"
 build_test "test_index_persistence" "tests/standalone/test_index_persistence.zig"
 
 run_valgrind "test_security"
+run_valgrind "test_upsert"
 run_valgrind "test_file_backed"
 run_valgrind "test_transaction_atomicity"
 run_valgrind "test_concurrent_access"
@@ -63,4 +65,4 @@ rm -rf "$VALGRIND_LOG_DIR"
 rm -f /tmp/zqlite_*.db /tmp/zqlite_critical_tests/*.db 2>/dev/null || true
 
 echo "=== Valgrind audit passed ==="
-echo "Audited tests: security, file-backed, transaction atomicity, concurrent access, index persistence"
+echo "Audited tests: security, upsert, file-backed, transaction atomicity, concurrent access, index persistence"

@@ -430,3 +430,35 @@ pub fn runUpsertReturningExecution() !void {
     defer update_row.deinit();
     try testing.expectEqualStrings("Bob", update_row.getTextByName("name").?);
 }
+
+test "SQLite UPSERT with excluded.* references" {
+    try runUpsertExcludedReferences();
+}
+
+pub fn runUpsertExcludedReferences() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const conn = try zqlite.open(allocator, ":memory:");
+    defer conn.close();
+
+    try conn.execute("CREATE TABLE keys (fingerprint TEXT PRIMARY KEY, owner TEXT, note TEXT)");
+    try conn.execute("INSERT INTO keys VALUES ('ABC', 'old-owner', 'old-note')");
+
+    // Upsert with excluded.* must take the would-be-inserted row's values.
+    const affected = try conn.exec(
+        \\INSERT INTO keys (fingerprint, owner, note) VALUES ('ABC', 'new-owner', 'new-note')
+        \\ON CONFLICT(fingerprint) DO UPDATE SET
+        \\    owner = excluded.owner,
+        \\    note = excluded.note
+    );
+    try testing.expectEqual(@as(u32, 1), affected);
+
+    var result = try conn.query("SELECT owner, note FROM keys WHERE fingerprint = 'ABC'");
+    defer result.deinit();
+    var row = result.next().?;
+    defer row.deinit();
+    try testing.expectEqualStrings("new-owner", row.getText(0).?);
+    try testing.expectEqualStrings("new-note", row.getText(1).?);
+}

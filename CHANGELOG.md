@@ -5,6 +5,33 @@ All notable changes to ZQLite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.7] - 2026-06-12
+
+### Fixed
+- **`ON CONFLICT DO UPDATE SET col = excluded.col` now parses** - the `EXCLUDED` keyword was tokenized but had no expression handler, so any upsert referencing the pseudo-table failed with `error.ExpectedValue`
+  - `parsePrimaryExpression` and `expectIdentifierOrKeyword` now treat `.Excluded` as an identifier, allowing `excluded.<column>` to parse as a qualified column reference
+- **Upsert `excluded.*` resolved against the wrong row** - the executor evaluated `excluded.<col>` against the existing (pre-conflict) row instead of the would-be-inserted row, producing stale/`NULL` values
+  - Added `evaluateUpsertAssignment` in the VM, which resolves `excluded.<col>` against the new insert values and falls back to normal expression evaluation for all other RHS forms
+  - Columns omitted from the `SET` list are preserved unchanged
+- **Parser error-path memory leak in `parseOnConflict`** - partially-built `target_columns` and assignment lists leaked when an upsert clause failed to parse
+  - Added `errdefer` cleanup for the target column slice and assignment contents, plus explicit per-iteration `catch` handling to free the in-flight column/expression without double-freeing
+
+### Added
+- **`tests/standalone/test_upsert.zig`** - standalone regression suite (GPA leak-checked) mirroring the prepared-statement + bound-parameter upsert path: parameterized `excluded.*`, literal `excluded.*`, integer columns, mixed literal/`excluded` SET lists, and non-SET column preservation
+- **`UPSERT WITH excluded.*`** case added to the comprehensive test runner (`tests/unit/sqlite_functionality_test.zig`)
+- Wired `test_upsert` into `docker/scripts/test-critical.sh` and `docker/scripts/run-valgrind.sh`
+
+### Changed
+- **docker-compose** - `zqlite-valgrind` and `zqlite-audit` services now pass `ZIG=/opt/zig-dev/zig` so the valgrind/audit scripts locate the toolchain (previously failed with `zig: not found`)
+
+### Verified
+- `zig build`
+- `zig build test`
+- `zig build test-comprehensive` (27/27, incl. `UPSERT WITH excluded.*`)
+- `zig build test-advanced`
+- `zig build test-memory`
+- docker compose: `critical`, `valgrind` (incl. `test_upsert`, audit clean), `stress` (27/27 + benchmarks), `full-validation`, `file-storage`, `chaos` (10 iterations, no flakes)
+
 ## [1.6.6] - 2026-06-01
 
 ### Fixed

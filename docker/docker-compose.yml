@@ -25,6 +25,8 @@ services:
       dockerfile: docker/Dockerfile.valgrind
       network: host
     network_mode: host
+    environment:
+      - ZIG=/opt/zig-dev/zig
     volumes:
       - /opt/zig-dev:/opt/zig-dev:ro
     command: sh /workspace/zqlite/docker/scripts/run-valgrind.sh
@@ -35,6 +37,8 @@ services:
       dockerfile: docker/Dockerfile.valgrind
       network: host
     network_mode: host
+    environment:
+      - ZIG=/opt/zig-dev/zig
     volumes:
       - /opt/zig-dev:/opt/zig-dev:ro
     command: sh /workspace/zqlite/docker/scripts/run-audit.sh

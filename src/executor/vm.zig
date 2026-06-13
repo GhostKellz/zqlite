@@ -1233,11 +1233,14 @@ pub const VirtualMachine = struct {
                                         self.connection.allocator.free(existing_row.values);
                                     }
 
-                                    // Apply the update assignments
+                                    // Apply the update assignments. References to the
+                                    // pseudo-table `excluded` must resolve against the
+                                    // would-be-inserted row (final_values), not the
+                                    // existing row.
                                     for (on_conflict_update.assignments) |assignment| {
                                         for (table.schema.columns, 0..) |col, col_idx| {
                                             if (std.mem.eql(u8, col.name, assignment.column)) {
-                                                const new_value = try self.evaluateExpression(&assignment.expr, &existing_row);
+                                                const new_value = try self.evaluateUpsertAssignment(&assignment.expr, &existing_row, table, final_values);
                                                 existing_row.values[col_idx].deinit(self.connection.allocator);
                                                 existing_row.values[col_idx] = new_value;
                                                 break;
@@ -2274,6 +2277,36 @@ pub const VirtualMachine = struct {
     }
 
     /// Evaluate an expression against a row
+    /// Evaluate the right-hand side of an ON CONFLICT DO UPDATE assignment.
+    /// A bare `excluded.<column>` reference resolves to the would-be-inserted
+    /// row's value (excluded_values); anything else evaluates against the
+    /// existing row as a normal UPDATE expression.
+    fn evaluateUpsertAssignment(
+        self: *Self,
+        expression: *const ast.Expression,
+        existing_row: *const storage.Row,
+        table: *const storage.Table,
+        excluded_values: []const storage.Value,
+    ) !storage.Value {
+        if (expression.* == .Column) {
+            const col_name = expression.Column;
+            const prefix = "excluded.";
+            if (std.mem.startsWith(u8, col_name, prefix)) {
+                const target = col_name[prefix.len..];
+                for (table.schema.columns, 0..) |col, idx| {
+                    if (std.mem.eql(u8, col.name, target)) {
+                        if (idx < excluded_values.len) {
+                            return try self.cloneValue(excluded_values[idx]);
+                        }
+                        return storage.Value.Null;
+                    }
+                }
+                return storage.Value.Null;
+            }
+        }
+        return try self.evaluateExpression(expression, existing_row);
+    }
+
     fn evaluateExpression(self: *Self, expression: *const ast.Expression, row: *const storage.Row) !storage.Value {
         return switch (expression.*) {
             .Column => |col_name| {

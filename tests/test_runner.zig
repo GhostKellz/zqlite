@@ -91,6 +91,7 @@ fn runSQLiteFunctionalityTests(allocator: std.mem.Allocator) !TestResult {
         .{ .name = "ON CONFLICT DO NOTHING", .test_fn = runOnConflictDoNothingTest },
         .{ .name = "ON CONFLICT DO UPDATE", .test_fn = runOnConflictDoUpdateTest },
         .{ .name = "UPSERT WITH RETURNING", .test_fn = runUpsertReturningTest },
+        .{ .name = "UPSERT WITH excluded.*", .test_fn = runUpsertExcludedReferencesTest },
     };
 
     for (tests) |test_case| {
@@ -363,6 +364,10 @@ fn runOnConflictDoUpdateTest() !void {
 
 fn runUpsertReturningTest() !void {
     try sqlite_functionality_test.runUpsertReturningExecution();
+}
+
+fn runUpsertExcludedReferencesTest() !void {
+    try sqlite_functionality_test.runUpsertExcludedReferences();
 }
 
 // Memory Management Tests
