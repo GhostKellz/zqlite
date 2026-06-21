@@ -1004,7 +1004,7 @@ pub const VirtualMachine = struct {
                 return try self.convertAstValueToStorage(value);
             },
             .Parameter => |param_index| {
-                return storage.Value{ .Parameter = param_index };
+                return try self.resolveValue(storage.Value{ .Parameter = param_index });
             },
             .BinaryOp => |bin| {
                 const left_val = try self.evaluateUpdateExpression(bin.left.*, row_values, table);

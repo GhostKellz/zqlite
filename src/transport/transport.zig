@@ -4,8 +4,6 @@ const std = @import("std");
 pub const PQQuicTransport = @import("pq_quic.zig").PQQuicTransport;
 pub const PQDatabaseTransport = @import("pq_quic.zig").PQDatabaseTransport;
 
-const zqlite = @import("../zqlite.zig");
-
 /// ZQLite Transport Layer
 /// High-performance networking with optional post-quantum features
 pub const Transport = struct {
@@ -14,6 +12,7 @@ pub const Transport = struct {
     connections: std.ArrayListUnmanaged(*Connection),
     is_server: bool,
     crypto_enabled: bool,
+    next_connection_id: ConnectionId,
 
     const Self = @This();
     const ConnectionId = u64;
@@ -69,6 +68,7 @@ pub const Transport = struct {
             .connections = .empty,
             .is_server = is_server,
             .crypto_enabled = false,
+            .next_connection_id = 1,
         };
     }
 
@@ -80,9 +80,12 @@ pub const Transport = struct {
     }
 
     pub fn connect(self: *Self, server_address: std.Io.net.IpAddress) !ConnectionId {
-        // Use compat clock for timestamp-based connection ID
-        const ts = zqlite.time_utils.getTimespec();
-        const conn_id: ConnectionId = @intCast(ts.sec);
+        const conn_id = self.next_connection_id;
+        self.next_connection_id +%= 1;
+        if (self.next_connection_id == 0) {
+            self.next_connection_id = 1;
+        }
+
         const connection = try Connection.init(self.allocator, conn_id, server_address);
         connection.state = .connected;
         try self.connections.append(self.allocator, connection);
@@ -156,10 +159,15 @@ test "transport basic functionality" {
     // Parse a loopback address for the transport smoke test.
     const server_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 8080);
     const conn_id = try transport.connect(server_addr);
+    const second_conn_id = try transport.connect(server_addr);
 
     try testing.expect(conn_id != 0);
-    try testing.expect(transport.getStats().active_connections == 1);
+    try testing.expect(second_conn_id != 0);
+    try testing.expect(conn_id != second_conn_id);
+    try testing.expect(transport.getStats().active_connections == 2);
 
     try transport.closeConnection(conn_id);
+    try testing.expect(transport.getStats().active_connections == 1);
+    try transport.closeConnection(second_conn_id);
     try testing.expect(transport.getStats().active_connections == 0);
 }

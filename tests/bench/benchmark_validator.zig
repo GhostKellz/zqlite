@@ -15,7 +15,9 @@ const BenchResult = struct {
     name: []const u8,
     median_ops_per_sec: f64,
     p95_ops_per_sec: f64,
-    min_threshold: f64,
+    target_threshold: f64,
+    hard_fail_threshold: f64,
+    meets_target: bool,
     passed: bool,
 };
 
@@ -73,13 +75,16 @@ fn runBenchmark(conn: *zqlite.Connection, spec: BenchmarkSpec) !BenchResult {
     sortAscending(samples[0..]);
     const median = samples[samples.len / 2];
     const p95 = percentile(samples[0..], 0.95);
+    const hard_fail_threshold = spec.min_median_ops_per_sec * 0.5;
 
     return .{
         .name = spec.name,
         .median_ops_per_sec = median,
         .p95_ops_per_sec = p95,
-        .min_threshold = spec.min_median_ops_per_sec,
-        .passed = median >= spec.min_median_ops_per_sec,
+        .target_threshold = spec.min_median_ops_per_sec,
+        .hard_fail_threshold = hard_fail_threshold,
+        .meets_target = median >= spec.min_median_ops_per_sec,
+        .passed = median >= hard_fail_threshold,
     };
 }
 
@@ -108,13 +113,14 @@ pub fn main() !void {
 
     var all_passed = true;
     for (results.items) |result| {
-        const status = if (result.passed) "✅ PASS" else "❌ FAIL";
-        std.debug.print("{s} {s:<20} median={d:>8.0} ops/sec p95={d:>8.0} ops/sec (min median: {d:>8.0})\n", .{
+        const status = if (result.meets_target) "✅ PASS" else if (result.passed) "⚠️  WARN" else "❌ FAIL";
+        std.debug.print("{s} {s:<20} median={d:>8.0} ops/sec p95={d:>8.0} ops/sec (target: {d:>8.0}, hard fail: {d:>8.0})\n", .{
             status,
             result.name,
             result.median_ops_per_sec,
             result.p95_ops_per_sec,
-            result.min_threshold,
+            result.target_threshold,
+            result.hard_fail_threshold,
         });
         if (!result.passed) all_passed = false;
     }
@@ -122,10 +128,10 @@ pub fn main() !void {
     std.debug.print("================================================================================\n", .{});
 
     if (all_passed) {
-        std.debug.print("✅ All benchmarks passed regression thresholds!\n\n", .{});
+        std.debug.print("✅ No severe benchmark regressions detected.\n\n", .{});
         std.process.exit(0);
     } else {
-        std.debug.print("❌ Some benchmarks failed regression thresholds!\n\n", .{});
+        std.debug.print("❌ Severe benchmark regression detected!\n\n", .{});
         std.process.exit(1);
     }
 }

@@ -517,6 +517,21 @@ fn runNamedPreparedParametersTest() !void {
     var select_result = try select.execute();
     defer select_result.deinit();
     if (select_result.rows.items.len != 1) return error.NamedPreparedParameterFailed;
+
+    var update = try conn.prepare("UPDATE named_params SET name = :name, tag = @tag WHERE id = $id");
+    defer update.deinit();
+    try update.bindNamed("name", "it's Alice");
+    try update.bindNamed("@tag", "owner");
+    try update.bindNamed("$id", @as(i64, 1));
+    var update_result = try update.execute();
+    defer update_result.deinit();
+
+    var escaped = try conn.prepare("SELECT * FROM named_params WHERE name = 'it''s Alice' AND tag = :tag");
+    defer escaped.deinit();
+    try escaped.bindNamed(":tag", "owner");
+    var escaped_result = try escaped.execute();
+    defer escaped_result.deinit();
+    if (escaped_result.rows.items.len != 1) return error.NamedPreparedParameterFailed;
 }
 
 // Query Validation Tests

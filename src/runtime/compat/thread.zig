@@ -72,6 +72,19 @@ pub fn clock_gettime(clock_id: std.os.linux.CLOCK) error{}!timespec {
                 ts = .{ .sec = 0, .nsec = 0 };
             }
         },
+        .macos, .ios, .tvos, .watchos, .visionos => {
+            var c_ts: std.c.timespec = undefined;
+            const c_clock: std.c.CLOCK = switch (clock_id) {
+                .REALTIME => .REALTIME,
+                .MONOTONIC => .MONOTONIC,
+                else => .REALTIME,
+            };
+            if (std.c.clock_gettime(c_clock, &c_ts) != 0) {
+                ts = .{ .sec = 0, .nsec = 0 };
+            } else {
+                ts = .{ .sec = c_ts.sec, .nsec = c_ts.nsec };
+            }
+        },
         else => {
             ts = .{ .sec = 0, .nsec = 0 };
         },

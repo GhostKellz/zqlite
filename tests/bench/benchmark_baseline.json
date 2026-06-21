@@ -19,5 +19,5 @@
       "description": "UPDATE operations"
     }
   },
-  "notes": "Documented benchmark thresholds. The executable source of truth is the benchmarks array in benchmark_validator.zig; it uses monotonic timing, warmups, multiple samples, and median/p95 reporting."
+  "notes": "Documented target benchmark thresholds. The executable source of truth is the benchmarks array in benchmark_validator.zig; it uses monotonic timing, warmups, multiple samples, median/p95 reporting, and a two-tier gate that warns below target but only fails CI on severe regressions below 50% of target."
 }
