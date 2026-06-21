@@ -386,7 +386,7 @@ pub const ServerStats = struct {
     }
 };
 
-/// Demo production database server
+/// Source-only database-server design sketch; simulated and not deployable.
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
@@ -423,7 +423,7 @@ pub fn main() !void {
     result3.print();
 
     // Create backup
-    try server.createBackup("/backups/production_backup_2024.db.enc");
+    try server.createBackup("/backups/simulated_demo_backup.db.enc");
 
     // Show server statistics
     const stats = server.getServerStats();

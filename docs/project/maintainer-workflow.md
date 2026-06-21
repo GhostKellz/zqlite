@@ -8,11 +8,13 @@ Local compiler baseline:
 /opt/zig-dev/zig version
 ```
 
-Example result:
+The authoritative minimum is `minimum_zig_version` in `build.zig.zon`. Example result:
 
 ```text
-0.17.0-dev.292+fc1c83a36
+0.17.0-dev.639+284ab0ad8
 ```
+
+Current validation toolchain at the time of this roadmap work: `0.17.0-dev.931+84f84267c`.
 
 ### Quick Validation
 
@@ -74,15 +76,17 @@ Three profiles control which features are compiled:
 
 | Profile | Features |
 |---------|----------|
-| `core` | Minimal SQLite-like: db, parser, executor |
-| `advanced` | Core + json, performance, concurrent |
-| `full` (default) | Advanced + crypto, transport, ffi |
+| `core` | Stable embedded engine and CLI |
+| `advanced` (default) | Core + JSON, performance, concurrent, FFI |
+| `experimental` | Advanced + crypto and transport scaffolding |
+| `full` | Compatibility alias for `experimental` |
 
 Usage:
 ```bash
 zig build -Dprofile=core test       # Minimal build
 zig build -Dprofile=advanced test   # Mid-tier build
-zig build test                       # Full build (default)
+zig build test                       # Stable advanced build (default)
+zig build -Dprofile=experimental test
 ```
 
 Individual feature flags can override profile defaults:
@@ -91,7 +95,7 @@ zig build -Dprofile=core -Djson=true test   # Core + JSON only
 zig build -Dcrypto=false test               # Full minus crypto
 ```
 
-When a feature is disabled, its public API becomes an empty struct or void type. Code that conditionally uses features should check `zqlite.features.*` at comptime.
+When a feature is disabled, its optional public API becomes an empty or placeholder type. Code that conditionally uses features should check `zqlite.features.*` at comptime.
 
 ## Test Targets
 
@@ -157,8 +161,8 @@ When a feature is disabled, its public API becomes an empty struct or void type.
 
 ### Source of Truth
 
-- `build.zig.zon` - package version
-- `src/version.zig` - runtime constants (must match)
+- `build.zig.zon` - sole package-version source of truth
+- `src/version.zig` - derives runtime constants from generated build options
 
 ### Build Metadata
 
@@ -169,11 +173,9 @@ When a feature is disabled, its public API becomes an empty struct or void type.
 ### Version Update Checklist
 
 1. Update `build.zig.zon` version
-2. Update `src/version.zig` PATCH constant
-3. Update `src/version.zig` test assertions
-4. Update `src/zqlite.zig` version test
-5. Update `README.md` install URL
-6. Run `zig build test` to verify
+2. Update changelog and release documentation
+3. Verify runtime and C API version reporting
+4. Run the complete release and package-consumer validation
 
 ## Release Process
 

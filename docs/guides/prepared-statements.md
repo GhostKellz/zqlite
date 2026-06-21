@@ -45,6 +45,23 @@ try stmt.bindNull(3);
 try stmt.bindParameter(4, .{ .Blob = &[_]u8{ 0x01, 0x02, 0x03 } });
 ```
 
+Bind by name:
+
+```zig
+var stmt = try conn.prepare(
+    "SELECT * FROM users WHERE id = :id AND status = @status AND tenant = $tenant",
+);
+defer stmt.deinit();
+
+try stmt.bindNamed(":id", @as(i64, 42));
+try stmt.bindNamed("status", "active"); // Prefix is optional when binding
+try stmt.bindNamed("$tenant", "default");
+```
+
+Named placeholders support `:name`, `@name`, and `$name`. Binding by name updates every repeated
+placeholder with the same bare name, so `WHERE id = :id OR parent_id = :id` needs only one
+`bindNamed("id", value)` call.
+
 ## Reusing Statements
 
 Reset clears bindings for reuse:

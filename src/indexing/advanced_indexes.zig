@@ -903,12 +903,12 @@ pub const AdvancedIndexManager = struct {
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return Self{
-            .hash_indexes = .{},
-            .unique_indexes = .{},
-            .multi_indexes = .{},
-            .btree_indexes = .{},
-            .optimized_multi_indexes = .{},
-            .bloom_hash_indexes = .{},
+            .hash_indexes = .empty,
+            .unique_indexes = .empty,
+            .multi_indexes = .empty,
+            .btree_indexes = .empty,
+            .optimized_multi_indexes = .empty,
+            .bloom_hash_indexes = .empty,
             .allocator = allocator,
         };
     }

@@ -122,6 +122,7 @@ fn runMemoryManagementTests(allocator: std.mem.Allocator) !TestResult {
         .{ .name = "Large Text Fields", .test_fn = runLargeTextTest },
         .{ .name = "Connection Lifecycle", .test_fn = runConnectionLifecycleTest },
         .{ .name = "Prepared Statement Reuse", .test_fn = runPreparedStatementReuseTest },
+        .{ .name = "Named Prepared Parameters", .test_fn = runNamedPreparedParametersTest },
     };
 
     for (tests) |test_case| {
@@ -485,6 +486,37 @@ fn runPreparedStatementReuseTest() !void {
     var count_result = try conn.query("SELECT * FROM prep_test");
     defer count_result.deinit();
     if (count_result.count() != 5) return error.PreparedStatementReuseFailed;
+}
+
+fn runNamedPreparedParametersTest() !void {
+    const allocator = getTestAllocator();
+    const conn = try zqlite.open(allocator, ":memory:");
+    defer conn.close();
+
+    try conn.execute("CREATE TABLE named_params (id INTEGER, name TEXT, tag TEXT)");
+
+    var insert = try conn.prepare("INSERT INTO named_params VALUES (:id, @name, $tag)");
+    defer insert.deinit();
+    try insert.bindNamed(":id", @as(i64, 1));
+    try insert.bindNamed("name", "Alice");
+    try insert.bindNamed("$tag", "admin");
+    var insert_result = try insert.execute();
+    defer insert_result.deinit();
+
+    var repeated = try conn.prepare("SELECT * FROM named_params WHERE id = :id OR id = :id");
+    defer repeated.deinit();
+    try repeated.bindNamed("id", @as(i64, 1));
+    var repeated_result = try repeated.execute();
+    defer repeated_result.deinit();
+    if (repeated_result.rows.items.len != 1) return error.NamedPreparedParameterFailed;
+
+    var select = try conn.prepare("SELECT * FROM named_params WHERE name = @name AND tag = $tag");
+    defer select.deinit();
+    try select.bindNamed("@name", "Alice");
+    try select.bindNamed("tag", "admin");
+    var select_result = try select.execute();
+    defer select_result.deinit();
+    if (select_result.rows.items.len != 1) return error.NamedPreparedParameterFailed;
 }
 
 // Query Validation Tests

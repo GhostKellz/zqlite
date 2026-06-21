@@ -47,6 +47,8 @@ The following components are intended for use:
 - Secure mode with ATTACH path restrictions
 - Documented SQLite-style compatibility surface in the `docs/` tree
 
+The precise stable, partial, experimental, and internal boundaries are defined in [Stability and Compatibility Policy](docs/project/stability-policy.md).
+
 ### Experimental Components (Not Production-Ready)
 
 The following components are experimental scaffolding or proof-of-concept implementations:

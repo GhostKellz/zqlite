@@ -30,6 +30,11 @@ jobs:
             zig fmt --check tests/
           fi
 
+      - name: Repository and C ABI contracts
+        run: |
+          bash scripts/check-repository-hygiene.sh
+          bash scripts/check-c-api.sh
+
   build-test:
     name: "Build & Unit Tests"
     runs-on: self-hosted
@@ -48,8 +53,18 @@ jobs:
       - name: Build
         run: zig build
 
+      - name: Build profile matrix
+        run: |
+          zig build -Dprofile=core
+          zig build -Dprofile=advanced
+          zig build -Dprofile=experimental
+          zig build -Dprofile=full
+
       - name: Run unit tests
         run: zig build test
+
+      - name: Release package consumers
+        run: zig build test-release-package
 
   memory-tests:
     name: "Memory Leak Detection"

@@ -1,12 +1,17 @@
 const std = @import("std");
 const zqlite = @import("zqlite");
+const temp_dir = @import("temp_dir.zig");
+
+var test_dir: temp_dir.TempDir = undefined;
 
 /// Test database larger than pager cache (1000 pages)
 /// Ensures cache eviction and disk I/O work correctly
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    test_dir = try .init(init.io, allocator, "zqlite-large");
+    defer test_dir.deinit();
 
     std.log.info("=== Large Database Tests (Cache Overflow) ===", .{});
 
@@ -19,7 +24,8 @@ pub fn main() !void {
 
 fn testCacheOverflow(allocator: std.mem.Allocator) !void {
     std.log.info("[TEST] Cache overflow with 5000+ inserts", .{});
-    const path = "/tmp/zqlite_large_cache.db";
+    const path = try test_dir.dbPath("cache.db");
+    defer allocator.free(path);
 
     var conn = try zqlite.open(allocator, path);
     defer conn.close();
@@ -48,7 +54,8 @@ fn testCacheOverflow(allocator: std.mem.Allocator) !void {
 
 fn testLargeRowCount(allocator: std.mem.Allocator) !void {
     std.log.info("[TEST] 10,000 row dataset", .{});
-    const path = "/tmp/zqlite_large_rows.db";
+    const path = try test_dir.dbPath("rows.db");
+    defer allocator.free(path);
 
     var conn = try zqlite.open(allocator, path);
     defer conn.close();
@@ -73,7 +80,8 @@ fn testLargeRowCount(allocator: std.mem.Allocator) !void {
 
 fn testMultipleTablesOverflow(allocator: std.mem.Allocator) !void {
     std.log.info("[TEST] Multiple tables causing cache overflow", .{});
-    const path = "/tmp/zqlite_multi_overflow.db";
+    const path = try test_dir.dbPath("multi_overflow.db");
+    defer allocator.free(path);
 
     var conn = try zqlite.open(allocator, path);
     defer conn.close();

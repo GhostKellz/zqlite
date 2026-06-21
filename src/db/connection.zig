@@ -4,6 +4,7 @@ const wal = @import("wal.zig");
 const btree = @import("btree.zig");
 const ast = @import("../parser/ast.zig");
 const parser = @import("../parser/parser.zig");
+const tokenizer = @import("../parser/tokenizer.zig");
 const planner = @import("../executor/planner.zig");
 const vm = @import("../executor/vm.zig");
 const cache_manager = @import("../performance/cache_manager.zig");
@@ -151,6 +152,16 @@ pub const UndoEntry = struct {
     }
 };
 
+pub const SavepointEntry = struct {
+    name: []const u8,
+    undo_len: usize,
+    started_transaction: bool,
+
+    pub fn deinit(self: *SavepointEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+    }
+};
+
 /// Database connection handle
 pub const Connection = struct {
     allocator: std.mem.Allocator,
@@ -161,6 +172,7 @@ pub const Connection = struct {
     owns_storage: bool, // Whether this connection owns and should clean up the storage engine
     in_transaction: bool,
     undo_log: std.ArrayListUnmanaged(UndoEntry),
+    savepoints: std.ArrayListUnmanaged(SavepointEntry),
     plan_cache: ?cache_manager.QueryPlanCache,
     result_cache: ?*query_cache.QueryCache, // Optional result cache for SELECT queries
     attached_databases: std.StringHashMap(*Self), // ATTACH DATABASE schema_name -> connection
@@ -195,6 +207,7 @@ pub const Connection = struct {
         conn.owns_storage = true;
         conn.in_transaction = false;
         conn.undo_log = .empty;
+        conn.savepoints = .empty;
         conn.plan_cache = try cache_manager.QueryPlanCache.init(allocator, 100);
         errdefer if (conn.plan_cache) |*cache| cache.deinit();
 
@@ -235,6 +248,7 @@ pub const Connection = struct {
         conn.owns_storage = true;
         conn.in_transaction = false;
         conn.undo_log = .empty;
+        conn.savepoints = .empty;
         conn.plan_cache = try cache_manager.QueryPlanCache.init(allocator, 100);
         conn.result_cache = null;
         conn.attached_databases = std.StringHashMap(*Self).init(allocator);
@@ -268,6 +282,7 @@ pub const Connection = struct {
         conn.owns_storage = false; // This connection doesn't own the storage
         conn.in_transaction = false;
         conn.undo_log = .empty;
+        conn.savepoints = .empty;
         conn.plan_cache = try cache_manager.QueryPlanCache.init(allocator, 100);
         conn.result_cache = null;
         conn.attached_databases = std.StringHashMap(*Self).init(allocator);
@@ -297,6 +312,7 @@ pub const Connection = struct {
 
     /// Begin a transaction
     pub fn beginTransaction(self: *Self) !void {
+        if (self.in_transaction) return error.TransactionAlreadyActive;
         if (self.wal) |w| {
             try w.beginTransaction();
 
@@ -341,6 +357,9 @@ pub const Connection = struct {
 
         if (self.wal) |w| {
             try w.commit();
+            // Once the WAL commit record passes its durability barrier, the
+            // transaction is committed even if a later checkpoint fails.
+            self.in_transaction = false;
             // Checkpoint WAL (truncates the file, data already in btree)
             try w.checkpointToPager(self.storage_engine.pager);
         }
@@ -348,6 +367,7 @@ pub const Connection = struct {
         // Save metadata including deleted_keys for file-backed storage
         if (!self.is_memory) {
             try self.storage_engine.saveAllMetadata();
+            try self.storage_engine.pager.flush();
         }
 
         // Clear undo log - changes are now permanent
@@ -355,12 +375,29 @@ pub const Connection = struct {
             entry.deinit(self.allocator);
         }
         self.undo_log.clearRetainingCapacity();
+        self.clearSavepoints();
         self.in_transaction = false;
     }
 
     /// Commit a transaction (alias)
     pub fn commit(self: *Self) !void {
         try self.commitTransaction();
+    }
+
+    /// Persist all pending database, metadata, and WAL state.
+    /// Flush is rejected while a transaction is active; commit or rollback it first.
+    pub fn flush(self: *Self) !void {
+        if (self.in_transaction) return error.TransactionActive;
+
+        if (self.wal) |w| {
+            try w.checkpointToPager(self.storage_engine.pager);
+        }
+        if (self.owns_storage and !self.is_memory) {
+            try self.storage_engine.saveAllMetadata();
+        }
+        if (self.owns_storage) {
+            try self.storage_engine.pager.flush();
+        }
     }
 
     /// Rollback a transaction
@@ -396,7 +433,94 @@ pub const Connection = struct {
             entry.deinit(self.allocator);
         }
         self.undo_log.clearRetainingCapacity();
+        self.clearSavepoints();
         self.in_transaction = false;
+    }
+
+    fn clearSavepoints(self: *Self) void {
+        for (self.savepoints.items) |*savepoint| {
+            savepoint.deinit(self.allocator);
+        }
+        self.savepoints.clearRetainingCapacity();
+    }
+
+    fn findSavepointIndex(self: *Self, name: []const u8) ?usize {
+        var i = self.savepoints.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.savepoints.items[i].name, name)) return i;
+        }
+        return null;
+    }
+
+    pub fn hasActiveSavepoints(self: *const Self) bool {
+        return self.savepoints.items.len > 0;
+    }
+
+    pub fn createSavepoint(self: *Self, name: []const u8) !void {
+        const started_transaction = !self.in_transaction;
+        if (started_transaction) {
+            try self.beginTransaction();
+        }
+
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        try self.savepoints.append(self.allocator, SavepointEntry{
+            .name = owned_name,
+            .undo_len = self.undo_log.items.len,
+            .started_transaction = started_transaction,
+        });
+    }
+
+    pub fn releaseSavepoint(self: *Self, name: []const u8) !void {
+        const index = self.findSavepointIndex(name) orelse return error.SavepointNotFound;
+        const commits_outer_savepoint = index == 0 and self.savepoints.items[index].started_transaction;
+
+        for (self.savepoints.items[index..]) |*savepoint| {
+            savepoint.deinit(self.allocator);
+        }
+        self.savepoints.shrinkRetainingCapacity(index);
+
+        if (commits_outer_savepoint) {
+            try self.commitTransaction();
+        }
+    }
+
+    pub fn rollbackToSavepoint(self: *Self, name: []const u8) !void {
+        const index = self.findSavepointIndex(name) orelse return error.SavepointNotFound;
+        const undo_len = self.savepoints.items[index].undo_len;
+
+        try self.rollbackUndoTo(undo_len);
+
+        if (index + 1 < self.savepoints.items.len) {
+            for (self.savepoints.items[index + 1 ..]) |*savepoint| {
+                savepoint.deinit(self.allocator);
+            }
+            self.savepoints.shrinkRetainingCapacity(index + 1);
+        }
+
+        try self.refreshAllIndexesAndCaches();
+    }
+
+    fn rollbackUndoTo(self: *Self, target_len: usize) !void {
+        while (self.undo_log.items.len > target_len) {
+            if (self.undo_log.pop()) |entry_val| {
+                var entry = entry_val;
+                self.applyUndo(&entry) catch |err| {
+                    entry.deinit(self.allocator);
+                    return err;
+                };
+                entry.deinit(self.allocator);
+            }
+        }
+    }
+
+    fn refreshAllIndexesAndCaches(self: *Self) !void {
+        var table_iter = self.storage_engine.tables.iterator();
+        while (table_iter.next()) |entry| {
+            try self.storage_engine.refreshIndexesForTable(entry.key_ptr.*);
+            self.invalidateResultCache(entry.key_ptr.*);
+        }
     }
 
     /// Apply a single undo entry (for in-memory rollback)
@@ -721,15 +845,20 @@ pub const Connection = struct {
 
     // ========== END BROAD API SURFACES ==========
 
-    /// Close the database connection
-    pub fn close(self: *Self) void {
+    /// Close the database connection and report persistence failures.
+    /// Cleanup always completes; the first durability error is returned afterward.
+    pub fn closeFallible(self: *Self) !void {
+        var first_error: ?anyerror = null;
+
         // Close all attached databases
         var attached_iter = self.attached_databases.iterator();
         while (attached_iter.next()) |entry| {
             // Free the schema name key
             self.allocator.free(entry.key_ptr.*);
             // Close the attached connection
-            entry.value_ptr.*.close();
+            entry.value_ptr.*.closeFallible() catch |err| {
+                if (first_error == null) first_error = err;
+            };
         }
         self.attached_databases.deinit();
 
@@ -744,20 +873,36 @@ pub const Connection = struct {
             self.wal_callback_ctx = null;
         }
 
+        // Clean up plan cache
+        if (self.plan_cache) |*cache| {
+            cache.deinit();
+        }
+
+        // Roll back an unfinished transaction before attempting a checkpoint.
+        // This must happen before the undo log is freed because rollback consumes
+        // and frees the undo entries itself; freeing them first would double-free.
+        if (self.in_transaction) {
+            self.rollbackTransaction() catch |err| {
+                if (first_error == null) first_error = err;
+            };
+        }
+
         // Clean up any remaining undo log entries
         for (self.undo_log.items) |*entry| {
             entry.deinit(self.allocator);
         }
         self.undo_log.deinit(self.allocator);
 
-        // Clean up plan cache
-        if (self.plan_cache) |*cache| {
-            cache.deinit();
+        for (self.savepoints.items) |*savepoint| {
+            savepoint.deinit(self.allocator);
         }
+        self.savepoints.deinit(self.allocator);
 
-        // Checkpoint any remaining WAL entries before closing
+        // Checkpoint any remaining WAL entries before closing.
         if (self.wal) |w| {
-            w.checkpointToPager(self.storage_engine.pager) catch {};
+            w.checkpointToPager(self.storage_engine.pager) catch |err| {
+                if (first_error == null) first_error = err;
+            };
             w.deinit();
         }
 
@@ -765,9 +910,13 @@ pub const Connection = struct {
         // keep the latest row counts and B-tree root pages after splits.
         if (self.owns_storage) {
             if (!self.is_memory) {
-                self.storage_engine.saveAllMetadata() catch {};
+                self.storage_engine.saveAllMetadata() catch |err| {
+                    if (first_error == null) first_error = err;
+                };
             }
-            self.storage_engine.pager.flush() catch {};
+            self.storage_engine.pager.flush() catch |err| {
+                if (first_error == null) first_error = err;
+            };
             self.storage_engine.deinit();
         }
 
@@ -775,6 +924,16 @@ pub const Connection = struct {
             self.allocator.free(p);
         }
         self.allocator.destroy(self);
+
+        if (first_error) |err| return err;
+    }
+
+    /// Convenience cleanup for defer sites. Use closeFallible() when durability
+    /// failures must be handled programmatically.
+    pub fn close(self: *Self) void {
+        self.closeFallible() catch |err| {
+            std.log.err("database close persistence failure: {s}", .{@errorName(err)});
+        };
     }
 
     /// Get database info
@@ -848,7 +1007,7 @@ pub const Connection = struct {
             // Free the schema name key
             self.allocator.free(kv.key);
             // Close the attached connection
-            kv.value.close();
+            try kv.value.closeFallible();
         } else {
             return error.SchemaNotFound;
         }
@@ -1158,6 +1317,7 @@ pub const PreparedStatement = struct {
     parsed_statement: ast.Statement,
     execution_plan: planner.ExecutionPlan,
     parameter_count: u32,
+    parameter_names: []?[]const u8,
     parameters: []storage.Value,
 
     const Self = @This();
@@ -1178,8 +1338,8 @@ pub const PreparedStatement = struct {
         var query_planner = planner.Planner.init(allocator);
         stmt.execution_plan = try query_planner.plan(&stmt.parsed_statement);
 
-        // Count parameters (? placeholders)
-        stmt.parameter_count = countParameters(sql);
+        stmt.parameter_names = try collectParameterNames(allocator, sql);
+        stmt.parameter_count = @intCast(stmt.parameter_names.len);
         stmt.parameters = try allocator.alloc(storage.Value, stmt.parameter_count);
 
         // Initialize parameters to NULL
@@ -1205,18 +1365,7 @@ pub const PreparedStatement = struct {
 
     /// Simplified parameter binding with auto-type detection
     pub fn bind(self: *Self, index: u32, value: anytype) !void {
-        const value_type = @TypeOf(value);
-        const storage_value = switch (value_type) {
-            i8, i16, i32, i64, u8, u16, u32 => storage.Value{ .Integer = @intCast(value) },
-            comptime_int => storage.Value{ .Integer = value },
-            f32, f64 => storage.Value{ .Real = @floatCast(value) },
-            comptime_float => storage.Value{ .Real = value },
-            []const u8 => storage.Value{ .Text = value },
-            *const [5:0]u8, *const [4:0]u8, *const [3:0]u8, *const [6:0]u8, *const [7:0]u8, *const [8:0]u8, *const [9:0]u8, *const [10:0]u8, *const [11:0]u8, *const [12:0]u8, *const [13:0]u8, *const [14:0]u8, *const [15:0]u8, *const [16:0]u8, *const [17:0]u8, *const [18:0]u8, *const [19:0]u8, *const [20:0]u8 => storage.Value{ .Text = value },
-            else => @compileError("Unsupported type for bind: " ++ @typeName(value_type) ++ " - use bindParameter() instead"),
-        };
-
-        try self.bindParameter(index, storage_value);
+        try self.bindParameter(index, storageValueFromAny(value));
     }
 
     /// Bind NULL value
@@ -1224,14 +1373,20 @@ pub const PreparedStatement = struct {
         try self.bindParameter(index, storage.Value.Null);
     }
 
-    /// Bind named parameter (future enhancement - for now just use positional)
     pub fn bindNamed(self: *Self, name: []const u8, value: anytype) !void {
-        // For now, this is a placeholder. Named parameters would require
-        // tracking parameter names during SQL parsing
-        _ = self;
-        _ = name;
-        _ = value;
-        return error.NamedParametersNotSupported;
+        try self.bindNamedParameter(name, storageValueFromAny(value));
+    }
+
+    pub fn bindNamedParameter(self: *Self, name: []const u8, value: storage.Value) !void {
+        var matched = false;
+        for (self.parameter_names, 0..) |maybe_param_name, i| {
+            const param_name = maybe_param_name orelse continue;
+            if (parameterNamesMatch(param_name, name)) {
+                try self.bindParameter(@intCast(i), value);
+                matched = true;
+            }
+        }
+        if (!matched) return error.NamedParameterNotFound;
     }
 
     /// Execute the prepared statement
@@ -1267,18 +1422,57 @@ pub const PreparedStatement = struct {
         }
         self.allocator.free(self.parameters);
 
+        for (self.parameter_names) |maybe_name| {
+            if (maybe_name) |name| self.allocator.free(name);
+        }
+        self.allocator.free(self.parameter_names);
+
         self.allocator.destroy(self);
     }
 
-    /// Count ? placeholders in SQL
-    fn countParameters(sql: []const u8) u32 {
-        var count: u32 = 0;
-        for (sql) |char| {
-            if (char == '?') {
-                count += 1;
+    fn storageValueFromAny(value: anytype) storage.Value {
+        const value_type = @TypeOf(value);
+        return switch (value_type) {
+            i8, i16, i32, i64, u8, u16, u32 => storage.Value{ .Integer = @intCast(value) },
+            comptime_int => storage.Value{ .Integer = value },
+            f32, f64 => storage.Value{ .Real = @floatCast(value) },
+            comptime_float => storage.Value{ .Real = value },
+            []const u8 => storage.Value{ .Text = value },
+            *const [5:0]u8, *const [4:0]u8, *const [3:0]u8, *const [6:0]u8, *const [7:0]u8, *const [8:0]u8, *const [9:0]u8, *const [10:0]u8, *const [11:0]u8, *const [12:0]u8, *const [13:0]u8, *const [14:0]u8, *const [15:0]u8, *const [16:0]u8, *const [17:0]u8, *const [18:0]u8, *const [19:0]u8, *const [20:0]u8 => storage.Value{ .Text = value },
+            else => @compileError("Unsupported type for bind: " ++ @typeName(value_type) ++ " - use bindParameter() instead"),
+        };
+    }
+
+    fn collectParameterNames(allocator: std.mem.Allocator, sql: []const u8) ![]?[]const u8 {
+        var names: std.ArrayListUnmanaged(?[]const u8) = .empty;
+        errdefer {
+            for (names.items) |maybe_name| {
+                if (maybe_name) |name| allocator.free(name);
+            }
+            names.deinit(allocator);
+        }
+
+        var tkn = tokenizer.Tokenizer.init(sql);
+        while (true) {
+            const token = try tkn.nextToken(allocator);
+            defer token.deinit(allocator);
+
+            switch (token) {
+                .QuestionMark => try names.append(allocator, null),
+                .NamedParameter => |name| try names.append(allocator, try allocator.dupe(u8, name)),
+                .EOF => break,
+                else => {},
             }
         }
-        return count;
+
+        return names.toOwnedSlice(allocator);
+    }
+
+    fn parameterNamesMatch(stored: []const u8, requested: []const u8) bool {
+        if (std.mem.eql(u8, stored, requested)) return true;
+        const stored_bare = if (stored.len > 0 and (stored[0] == ':' or stored[0] == '@' or stored[0] == '$')) stored[1..] else stored;
+        const requested_bare = if (requested.len > 0 and (requested[0] == ':' or requested[0] == '@' or requested[0] == '$')) requested[1..] else requested;
+        return std.mem.eql(u8, stored_bare, requested_bare);
     }
 
     /// Clone a storage function call

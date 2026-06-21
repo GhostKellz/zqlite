@@ -16,7 +16,8 @@ ZQLite aims to be a strong embedded SQLite-style database, not a byte-for-byte S
 | PRAGMA | Partial | Focused subset only |
 | FTS5-style virtual tables | Partial | MATCH works, persistence/features limited |
 | ATTACH / DETACH | Supported | With security policy controls |
-| SAVEPOINT | Unsupported | Not implemented |
+| SAVEPOINT / RELEASE / ROLLBACK TO | Supported | DML savepoints; DDL/catalog changes inside savepoints return an explicit error |
+| Named prepared parameters | Supported | `:name`, `@name`, `$name` |
 
 ## Intentional Deviations
 
@@ -31,14 +32,16 @@ ZQLite aims to be a strong embedded SQLite-style database, not a byte-for-byte S
 - `ATTACH DATABASE` / `DETACH DATABASE` with explicit path-policy enforcement
 - `CREATE VIRTUAL TABLE ... USING fts5(...)` plus basic `MATCH` queries
 - prepared statement bind, execute, reset, and reuse lifecycle
+- named prepared parameters and repeated-name binding
+- DML `SAVEPOINT`, `RELEASE`, and `ROLLBACK TO`
 
 ## Unsupported Or Partial Areas
 
 - Full PRAGMA coverage
-- SAVEPOINT / nested transaction semantics
+- DDL/catalog rollback through savepoints; schema changes inside active savepoints return `error.UnsupportedDDLInSavepoint`
 - Full FTS phrase and boolean query support
 - Full SQLite edge-case compatibility across all planner/executor paths
-- `INSERT ... DEFAULT VALUES`
+- Foreign-key deferral and multi-column FK references
 
 ## Tested Expectations
 

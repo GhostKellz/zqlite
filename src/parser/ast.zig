@@ -10,6 +10,9 @@ pub const Statement = union(enum) {
     BeginTransaction: TransactionStatement,
     Commit: TransactionStatement,
     Rollback: TransactionStatement,
+    Savepoint: TransactionStatement,
+    ReleaseSavepoint: TransactionStatement,
+    RollbackToSavepoint: TransactionStatement,
     CreateIndex: CreateIndexStatement,
     DropIndex: DropIndexStatement,
     DropTable: DropTableStatement,
@@ -32,6 +35,9 @@ pub const Statement = union(enum) {
             .BeginTransaction => |*stmt| stmt.deinit(allocator),
             .Commit => |*stmt| stmt.deinit(allocator),
             .Rollback => |*stmt| stmt.deinit(allocator),
+            .Savepoint => |*stmt| stmt.deinit(allocator),
+            .ReleaseSavepoint => |*stmt| stmt.deinit(allocator),
+            .RollbackToSavepoint => |*stmt| stmt.deinit(allocator),
             .CreateIndex => |*stmt| stmt.deinit(allocator),
             .DropIndex => |*stmt| stmt.deinit(allocator),
             .DropTable => |*stmt| stmt.deinit(allocator),
@@ -770,9 +776,8 @@ pub const CheckConstraint = struct {
     condition: Condition,
 
     pub fn deinit(self: CheckConstraint, allocator: std.mem.Allocator) void {
-        _ = self;
-        _ = allocator;
-        // Condition cleanup handled by parent
+        var condition = self.condition;
+        condition.deinit(allocator);
     }
 };
 

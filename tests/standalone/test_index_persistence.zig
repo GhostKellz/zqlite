@@ -1,5 +1,6 @@
 const std = @import("std");
 const zqlite = @import("zqlite");
+const temp_dir = @import("temp_dir.zig");
 
 fn textIndexKey(text: []const u8) u64 {
     var hash: u64 = 0;
@@ -10,10 +11,14 @@ fn textIndexKey(text: []const u8) u64 {
 }
 
 /// Test index persistence across connections
-pub fn main() !void {
+var test_dir: temp_dir.TempDir = undefined;
+
+pub fn main(init: std.process.Init) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    test_dir = try .init(init.io, allocator, "zqlite-index");
+    defer test_dir.deinit();
 
     std.log.info("=== Index Persistence Tests ===", .{});
 
@@ -26,7 +31,8 @@ pub fn main() !void {
 
 fn testBasicIndexPersistence(allocator: std.mem.Allocator) !void {
     std.log.info("[TEST] Basic index persistence", .{});
-    const path = "/tmp/zqlite_index_basic.db";
+    const path = try test_dir.dbPath("basic.db");
+    defer allocator.free(path);
 
     // First connection: create index and data
     {
@@ -71,7 +77,8 @@ fn testBasicIndexPersistence(allocator: std.mem.Allocator) !void {
 
 fn testUniqueIndexPersistence(allocator: std.mem.Allocator) !void {
     std.log.info("[TEST] Unique index persistence", .{});
-    const path = "/tmp/zqlite_index_unique.db";
+    const path = try test_dir.dbPath("unique.db");
+    defer allocator.free(path);
 
     // First connection: create unique index
     {
@@ -126,7 +133,8 @@ fn testUniqueIndexPersistence(allocator: std.mem.Allocator) !void {
 
 fn testMultiColumnIndexPersistence(allocator: std.mem.Allocator) !void {
     std.log.info("[TEST] Multi-column index persistence", .{});
-    const path = "/tmp/zqlite_index_multi.db";
+    const path = try test_dir.dbPath("multi.db");
+    defer allocator.free(path);
 
     // First connection
     {

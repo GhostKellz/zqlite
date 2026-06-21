@@ -15,28 +15,17 @@ pub const features = struct {
     pub const ffi = build_options.enable_ffi;
 };
 
-// Open options
-pub const OpenOptions = struct {
-    enable_async: bool = false,
-    connection_pool_size: u32 = 4,
-    enable_cache: bool = false,
-    btree_cache_size: usize = 1000,
-    plan_cache_size: usize = 100,
-    enable_sqlite_compat: bool = false,
-    enable_package_manager: bool = false,
-    enable_error_reporting: bool = false,
-    error_history_size: usize = 1000,
-};
-
 // Core database modules
 pub const db = @import("db/connection.zig");
 pub const Connection = db.Connection; // Export for convenience
+pub const OpenOptions = db.ConnectionOptions;
 pub const storage = @import("db/storage.zig");
 pub const btree = @import("db/btree.zig");
 pub const wal = @import("db/wal.zig");
 pub const pager = @import("db/pager.zig");
 pub const encryption = @import("db/encryption.zig");
 pub const connection_pool = @import("db/connection_pool.zig");
+pub const migration = @import("db/migration.zig");
 
 // SQL parsing modules
 pub const tokenizer = @import("parser/tokenizer.zig");
@@ -95,11 +84,38 @@ else
 pub const query_cache = if (build_options.enable_performance)
     @import("performance/query_cache.zig")
 else
-    struct {};
+    struct {
+        pub const QueryCache = void;
+        pub const QueryHasher = void;
+    };
 
 // Error handling
 pub const error_handling = @import("error_handling/enhanced_errors.zig");
 pub const database_errors = @import("error_handling/database_errors.zig");
+
+pub const ErrorCategory = enum(c_int) {
+    ok = 0,
+    sql = 1,
+    constraint = 2,
+    io = 3,
+    misuse = 4,
+    memory = 5,
+    authorization = 6,
+    format = 7,
+    unknown = 255,
+};
+
+pub fn categorizeError(err: anyerror) ErrorCategory {
+    return switch (err) {
+        error.OutOfMemory => .memory,
+        error.SyntaxError, error.TableNotFound, error.ColumnNotFound, error.TypeMismatch => .sql,
+        error.ConstraintViolation, error.UniqueConstraintViolation, error.MissingRequiredValue => .constraint,
+        error.IoError, error.InputOutput, error.AccessDenied, error.DiskQuota, error.FileTooBig, error.NoSpaceLeft => .io,
+        error.InvalidParameterIndex, error.ParameterIndexOutOfBounds, error.NoParametersProvided, error.NamedParameterNotFound, error.SavepointNotFound, error.TransactionAlreadyActive, error.TransactionActive, error.UnsupportedDDLInSavepoint => .misuse,
+        error.CorruptData, error.UnsupportedFormatVersion, error.InvalidFormatVersion => .format,
+        else => .unknown,
+    };
+}
 
 // Time utilities (safe timestamp functions)
 pub const time_utils = @import("time_utils.zig");
@@ -158,7 +174,7 @@ pub fn createQueryCache(allocator: std.mem.Allocator, max_entries: usize, max_me
 pub const QueryHasher = if (build_options.enable_performance)
     query_cache.QueryHasher
 else
-    @compileError("QueryHasher requires -Dperformance=true or profile=advanced/full");
+    void;
 
 /// Generate UUID v4
 pub fn generateUUID(random: std.Random) [16]u8 {

@@ -1,9 +1,9 @@
 const std = @import("std");
 const zqlite = @import("zqlite");
 
-/// 🔒 ZQLite Secure Storage System
-/// Enterprise-grade secure file storage with encryption, versioning, and access control
-/// Features: AES-256 encryption, secure metadata, audit logging, access permissions
+/// ZQLite secure-storage design sketch.
+/// Source-only demonstration with placeholder persistence and authorization paths.
+/// It is not an enterprise or production security implementation.
 const StorageError = error{
     FileNotFound,
     AccessDenied,

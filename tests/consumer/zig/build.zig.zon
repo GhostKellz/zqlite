@@ -1,0 +1,10 @@
+.{
+    .name = .zqlite_release_consumer,
+    .version = "0.0.0",
+    .fingerprint = 0x3fa4adcbd6b18484,
+    .minimum_zig_version = "0.17.0-dev.639+284ab0ad8",
+    .dependencies = .{
+        .zqlite = .{ .path = "../package" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "main.zig" },
+}

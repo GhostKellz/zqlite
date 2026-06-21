@@ -16,6 +16,20 @@ $ZIG fmt --check tests/
 echo "OK"
 echo ""
 
+echo "--- Repository and C ABI Contracts ---"
+bash scripts/check-repository-hygiene.sh
+bash scripts/check-c-api.sh
+echo "OK"
+echo ""
+
+echo "--- Build Profiles ---"
+$ZIG build -Dprofile=core
+$ZIG build -Dprofile=advanced
+$ZIG build -Dprofile=experimental
+$ZIG build -Dprofile=full
+echo "OK"
+echo ""
+
 echo "--- Build ---"
 $ZIG build
 echo "OK"
@@ -47,6 +61,10 @@ echo ""
 
 echo "--- C API Tests ---"
 $ZIG build test-c-api
+echo ""
+
+echo "--- Release Package Consumers ---"
+bash scripts/test-release-package.sh
 echo ""
 
 echo "--- Benchmark Validation ---"

@@ -16,7 +16,7 @@ Working examples demonstrating core ZQLite features:
 
 ## Experimental Showcases
 
-These demonstrate experimental/scaffolding features. They are NOT reference implementations:
+These source-only design sketches demonstrate experimental/scaffolding features. They are not wired into `zig build examples`, are not required to compile against current APIs, and are NOT reference implementations:
 
 | Example | Description |
 |---------|-------------|
@@ -24,13 +24,13 @@ These demonstrate experimental/scaffolding features. They are NOT reference impl
 | `hybrid_crypto_banking.zig` | Hybrid crypto concepts (experimental) |
 | `nextgen_database.zig` | Async/crypto/indexing scaffolding demo |
 
-## Domain Examples
+## Domain Concept Demos
 
-Larger examples showing domain-specific patterns:
+Larger source-only demonstrations containing placeholders and simulated integrations. They are not wired into the examples build and are design sketches, not deployable systems:
 
 | Example | Description |
 |---------|-------------|
-| `production_database_server.zig` | Connection pooling, backup, monitoring patterns |
+| `production_database_server.zig` | Deployment-pattern sketch; despite the historical filename, not a production server |
 | `blockchain_integration.zig` | Blockchain-style patterns |
 | `ghostmesh_vpn_coordination.zig` | VPN coordination patterns |
 | `secure_storage_system.zig` | Encrypted storage patterns |
@@ -40,15 +40,16 @@ Larger examples showing domain-specific patterns:
 Examples use `@import("zqlite")` and require the library as a dependency:
 
 ```bash
-# Build all examples
-zig build
+# Build and install examples supported by the selected profile
+zig build examples
 
-# Examples are built but not installed by default
-# To run an example, build it as an executable
+# The experimental profile changes library features but does not certify
+# source-only experimental/domain sketches as buildable examples.
+zig build examples -Dprofile=experimental
 ```
 
 ## Notes
 
 - Examples marked "experimental" use scaffolding features that are not stable
-- Domain examples demonstrate patterns but may need adaptation for real use
+- Domain concept demos contain TODOs and simulated behavior and must not be presented as production implementations
 - All examples are for demonstration purposes

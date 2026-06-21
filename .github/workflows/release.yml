@@ -27,7 +27,7 @@ jobs:
         run: ./scripts/test-release.sh
 
       - name: Build Linux release artifacts
-        run: zig build -Doptimize=ReleaseFast -Dffi=true
+        run: zig build -Dprofile=advanced -Doptimize=ReleaseFast
 
       - name: Create Linux archive
         run: |
@@ -36,15 +36,14 @@ jobs:
           TARGET="x86_64-unknown-linux-gnu"
           ARCHIVE_DIR="zqlite-${VERSION}-${TARGET}"
 
-          mkdir -p "$ARCHIVE_DIR/bin" "$ARCHIVE_DIR/lib"
+          mkdir -p "$ARCHIVE_DIR/bin" "$ARCHIVE_DIR/lib" "$ARCHIVE_DIR/include"
           cp zig-out/bin/zqlite "$ARCHIVE_DIR/bin/"
-          if [ -f zig-out/lib/libzqlite.so ]; then
-            cp zig-out/lib/libzqlite.so "$ARCHIVE_DIR/lib/"
-          fi
-          if [ -f zig-out/lib/libzqlite_c.so ]; then
-            cp zig-out/lib/libzqlite_c.so "$ARCHIVE_DIR/lib/"
-          fi
-          cp README.md CHANGELOG.md LICENSE install.sh "$ARCHIVE_DIR/"
+          cp zig-out/lib/libzqlite.a "$ARCHIVE_DIR/lib/"
+          cp zig-out/lib/libzqlite_c.a "$ARCHIVE_DIR/lib/"
+          cp zig-out/lib/libzqlite_c.so "$ARCHIVE_DIR/lib/"
+          cp zig-out/include/zqlite.h "$ARCHIVE_DIR/include/"
+          cp README.md CHANGELOG.md LICENSE SECURITY.md install.sh build.zig build.zig.zon "$ARCHIVE_DIR/"
+          cp -R src docs examples tests scripts "$ARCHIVE_DIR/"
 
           tar -czvf "zqlite-${VERSION}-${TARGET}.tar.gz" "$ARCHIVE_DIR"
 
@@ -96,7 +95,9 @@ jobs:
             ### Quick Install
 
             ```bash
-            curl -fsSL https://raw.githubusercontent.com/ghostkellz/zqlite/refs/heads/main/install.sh | bash
+            curl -fsSL https://raw.githubusercontent.com/ghostkellz/zqlite/refs/heads/main/install.sh -o install.sh
+            less install.sh
+            bash install.sh
             ```
 
             ### Manual Install

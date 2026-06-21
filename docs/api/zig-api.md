@@ -32,6 +32,12 @@ while (result.next()) |row| {
 }
 ```
 
+`query()` returns an owned result set. Call `result.deinit()` exactly once.
+Rows yielded by `result.next()` are borrowed from that result set and become
+invalid when the result is deinitialized. Values returned from row helpers such
+as `getText()` are borrowed from the row/result; copy them with your allocator
+if they must outlive the result.
+
 ### Prepared Statements
 
 ```zig
@@ -59,6 +65,19 @@ try conn.execute("BEGIN TRANSACTION");
 try conn.execute("COMMIT");
 // or: try conn.execute("ROLLBACK");
 ```
+
+### Durability
+
+Use `try conn.flush()` to synchronize pending non-transaction writes. Use `try conn.closeFallible()` when final checkpoint or synchronization failures must be handled; `close()` is a convenience cleanup that can only log such failures. See the [Durability Guide](../guides/durability.md).
+
+## Ownership and Lifetimes
+
+- `Connection` values returned by `open()` / `openMemory()` are owned by the caller; close them with `close()` or `closeFallible()`.
+- `ResultSet` values returned by `query()` own their rows and values; call `deinit()` once.
+- `Row` handles obtained from a `ResultSet` are borrowed and valid only while the result set is alive.
+- `Value.Text` and `Value.Blob` slices read from result rows are borrowed from the result set. Duplicate them if they must escape the result lifetime.
+- `PreparedStatement` values returned by `prepare()` are owned by the caller; call `deinit()`. Bound values are cloned by the statement.
+- Storage-level `Row` / `Value` instances you allocate directly follow normal Zig ownership: whoever allocates text/blob/array contents must deinitialize them with the matching allocator unless ownership is explicitly transferred to storage.
 
 ### Connection Pooling
 
@@ -101,10 +120,19 @@ conn.execute("...") catch |err| switch (err) {
 };
 ```
 
+### Storage and Catalog Errors
+
+Opening a database validates the on-disk metadata catalog and can return:
+
+- `error.CorruptCatalog` - The superblock or catalog payload failed its checksum, or a catalog record was structurally invalid.
+- `error.UnsupportedDatabaseFormat` - The catalog format version is newer than this build supports.
+
+See [Durability and Persistence](../guides/durability.md) for the catalog format and the durability guarantees of `commit()`, `flush()`, and `closeFallible()`.
+
 ## SQL Support
 
 ### Supported Statements
-- `CREATE TABLE` with constraints (PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT)
+- `CREATE TABLE` with constraints (PRIMARY KEY, NOT NULL, UNIQUE, CHECK, DEFAULT)
 - `CREATE VIRTUAL TABLE ... USING fts5` - Full-text search tables
 - `INSERT`, `UPDATE`, `DELETE`
 - `SELECT` with WHERE, ORDER BY, LIMIT, DISTINCT, GROUP BY, HAVING

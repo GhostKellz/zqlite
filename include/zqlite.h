@@ -1,130 +1,129 @@
-// Complete C FFI header for Rust integration
-// Place this in your Rust project as zqlite.h
-
 #ifndef ZQLITE_H
 #define ZQLITE_H
+
+#include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include <stdint.h>
-#include <stddef.h>
+#if defined(_WIN32) && defined(ZQLITE_BUILD_SHARED)
+#  if defined(ZQLITE_BUILDING_LIBRARY)
+#    define ZQLITE_API __declspec(dllexport)
+#  else
+#    define ZQLITE_API __declspec(dllimport)
+#  endif
+#elif defined(__GNUC__) || defined(__clang__)
+#  define ZQLITE_API __attribute__((visibility("default")))
+#else
+#  define ZQLITE_API
+#endif
 
-// Opaque types
+/* Stable C ABI surface. Functions not declared here are not supported. */
 typedef struct zqlite_connection zqlite_connection_t;
 typedef struct zqlite_result zqlite_result_t;
 typedef struct zqlite_stmt zqlite_stmt_t;
 
-// Error codes (compatible with SQLite)
-#define ZQLITE_OK           0   // Successful result
-#define ZQLITE_ERROR        1   // Generic error
-#define ZQLITE_INTERNAL     2   // Internal logic error
-#define ZQLITE_PERM         3   // Access permission denied
-#define ZQLITE_ABORT        4   // Callback routine requested abort
-#define ZQLITE_BUSY         5   // Database file is locked
-#define ZQLITE_LOCKED       6   // Database table is locked
-#define ZQLITE_NOMEM        7   // malloc() failed
-#define ZQLITE_READONLY     8   // Attempt to write readonly database
-#define ZQLITE_INTERRUPT    9   // Operation terminated by interrupt
-#define ZQLITE_IOERR       10   // Disk I/O error
-#define ZQLITE_CORRUPT     11   // Database image is malformed
-#define ZQLITE_NOTFOUND    12   // Unknown opcode in sqlite3_file_control()
-#define ZQLITE_FULL        13   // Insertion failed because database is full
-#define ZQLITE_CANTOPEN    14   // Unable to open database file
-#define ZQLITE_PROTOCOL    15   // Database lock protocol error
-#define ZQLITE_EMPTY       16   // Internal use only
-#define ZQLITE_SCHEMA      17   // Database schema changed
-#define ZQLITE_TOOBIG      18   // String or BLOB exceeds size limit
-#define ZQLITE_CONSTRAINT  19   // Constraint violation
-#define ZQLITE_MISMATCH    20   // Data type mismatch
-#define ZQLITE_MISUSE      21   // Library used incorrectly
-#define ZQLITE_NOLFS       22   // OS features not supported
-#define ZQLITE_AUTH        23   // Authorization denied
-#define ZQLITE_FORMAT      24   // Not used
-#define ZQLITE_RANGE       25   //2nd parameter to sqlite3_bind out of range
-#define ZQLITE_NOTADB      26   // File opened that is not a database file
-#define ZQLITE_ROW         100  // sqlite3_step() has another row ready
-#define ZQLITE_DONE        101  // sqlite3_step() has finished executing
+#define ZQLITE_ABI_VERSION_MAJOR 1
+#define ZQLITE_ABI_VERSION_MINOR 0
+#define ZQLITE_ABI_VERSION_PATCH 0
 
-// Column types
-#define ZQLITE_INTEGER  1
-#define ZQLITE_FLOAT    2
-#define ZQLITE_TEXT     3
-#define ZQLITE_BLOB     4
-#define ZQLITE_NULL     5
+/* SQLite-compatible numeric values for the subset returned by ZQLite. */
+#define ZQLITE_OK           0
+#define ZQLITE_ERROR        1
+#define ZQLITE_BUSY         5
+#define ZQLITE_LOCKED       6
+#define ZQLITE_NOMEM        7
+#define ZQLITE_READONLY     8
+#define ZQLITE_IOERR       10
+#define ZQLITE_CORRUPT     11
+#define ZQLITE_CONSTRAINT  19
+#define ZQLITE_MISMATCH    20
+#define ZQLITE_MISUSE      21
+#define ZQLITE_NOLFS       22
+#define ZQLITE_AUTH        23
+#define ZQLITE_FORMAT      24
+#define ZQLITE_RANGE       25
+#define ZQLITE_NOTADB      26
+#define ZQLITE_ROW        100
+#define ZQLITE_DONE       101
 
-// Core database operations
-zqlite_connection_t* zqlite_open(const char* path);
-zqlite_connection_t* zqlite_open_encrypted(const char* path, const char* password);
-int zqlite_close(zqlite_connection_t* conn);
-int zqlite_execute(zqlite_connection_t* conn, const char* sql);
+#define ZQLITE_TYPE_INTEGER 1
+#define ZQLITE_TYPE_REAL    2
+#define ZQLITE_TYPE_TEXT    3
+#define ZQLITE_TYPE_BLOB    4
+#define ZQLITE_TYPE_NULL    5
 
-// Query operations
-zqlite_result_t* zqlite_query(zqlite_connection_t* conn, const char* sql);
-int zqlite_result_row_count(zqlite_result_t* result);
-int zqlite_result_column_count(zqlite_result_t* result);
-const char* zqlite_result_column_name(zqlite_result_t* result, int column);
-int zqlite_result_column_type(zqlite_result_t* result, int row, int column);
-const char* zqlite_result_get_text(zqlite_result_t* result, int row, int column);
-int64_t zqlite_result_get_int(zqlite_result_t* result, int row, int column);
-double zqlite_result_get_real(zqlite_result_t* result, int row, int column);
-const void* zqlite_result_get_blob(zqlite_result_t* result, int row, int column, int* size);
-void zqlite_result_free(zqlite_result_t* result);
+#define ZQLITE_ERROR_CATEGORY_OK             0
+#define ZQLITE_ERROR_CATEGORY_SQL            1
+#define ZQLITE_ERROR_CATEGORY_CONSTRAINT     2
+#define ZQLITE_ERROR_CATEGORY_IO             3
+#define ZQLITE_ERROR_CATEGORY_MISUSE         4
+#define ZQLITE_ERROR_CATEGORY_MEMORY         5
+#define ZQLITE_ERROR_CATEGORY_AUTHORIZATION  6
+#define ZQLITE_ERROR_CATEGORY_FORMAT         7
+#define ZQLITE_ERROR_CATEGORY_UNKNOWN      255
 
-// Prepared statements
-zqlite_stmt_t* zqlite_prepare(zqlite_connection_t* conn, const char* sql);
-int zqlite_bind_int(zqlite_stmt_t* stmt, int index, int64_t value);
-int zqlite_bind_real(zqlite_stmt_t* stmt, int index, double value);
-int zqlite_bind_text(zqlite_stmt_t* stmt, int index, const char* value);
-int zqlite_bind_blob(zqlite_stmt_t* stmt, int index, const void* data, int size);
-int zqlite_bind_null(zqlite_stmt_t* stmt, int index);
-int zqlite_step(zqlite_stmt_t* stmt);
-int zqlite_reset(zqlite_stmt_t* stmt);
-int zqlite_finalize(zqlite_stmt_t* stmt);
+ZQLITE_API zqlite_connection_t *zqlite_open(const char *path);
+ZQLITE_API void zqlite_close(zqlite_connection_t *conn);
+ZQLITE_API int zqlite_execute(zqlite_connection_t *conn, const char *sql);
 
-// Statement result access
-int zqlite_column_count(zqlite_stmt_t* stmt);
-const char* zqlite_column_name(zqlite_stmt_t* stmt, int column);
-int zqlite_column_type(zqlite_stmt_t* stmt, int column);
-const char* zqlite_column_text(zqlite_stmt_t* stmt, int column);
-int64_t zqlite_column_int(zqlite_stmt_t* stmt, int column);
-double zqlite_column_real(zqlite_stmt_t* stmt, int column);
-const void* zqlite_column_blob(zqlite_stmt_t* stmt, int column, int* size);
+ZQLITE_API zqlite_result_t *zqlite_query(zqlite_connection_t *conn, const char *sql);
+ZQLITE_API int zqlite_result_row_count(zqlite_result_t *result);
+ZQLITE_API int zqlite_result_column_count(zqlite_result_t *result);
+ZQLITE_API const char *zqlite_result_column_name(zqlite_result_t *result, int column);
+ZQLITE_API int zqlite_result_get_type(zqlite_result_t *result, int row, int column);
+/* The returned string is allocated and must be released with zqlite_free_string. */
+ZQLITE_API const char *zqlite_result_get_text(zqlite_result_t *result, int row, int column);
+ZQLITE_API void zqlite_result_free(zqlite_result_t *result);
+ZQLITE_API void zqlite_free_string(const char *str);
 
-// Transactions
-int zqlite_begin_transaction(zqlite_connection_t* conn);
-int zqlite_commit_transaction(zqlite_connection_t* conn);
-int zqlite_rollback_transaction(zqlite_connection_t* conn);
+ZQLITE_API zqlite_stmt_t *zqlite_prepare(zqlite_connection_t *conn, const char *sql);
+ZQLITE_API int zqlite_bind_int(zqlite_stmt_t *stmt, int index, int64_t value);
+ZQLITE_API int zqlite_bind_text(zqlite_stmt_t *stmt, int index, const char *value);
+ZQLITE_API int zqlite_bind_real(zqlite_stmt_t *stmt, int index, double value);
+ZQLITE_API int zqlite_bind_null(zqlite_stmt_t *stmt, int index);
+ZQLITE_API int zqlite_bind_blob(zqlite_stmt_t *stmt, int index, const void *value, size_t len);
+ZQLITE_API int zqlite_bind_int_named(zqlite_stmt_t *stmt, const char *name, int64_t value);
+ZQLITE_API int zqlite_bind_text_named(zqlite_stmt_t *stmt, const char *name, const char *value);
+ZQLITE_API int zqlite_bind_real_named(zqlite_stmt_t *stmt, const char *name, double value);
+ZQLITE_API int zqlite_bind_null_named(zqlite_stmt_t *stmt, const char *name);
+ZQLITE_API int zqlite_bind_blob_named(zqlite_stmt_t *stmt, const char *name, const void *value, size_t len);
+ZQLITE_API int zqlite_step(zqlite_stmt_t *stmt);
+ZQLITE_API int zqlite_column_count(zqlite_stmt_t *stmt);
+ZQLITE_API const char *zqlite_column_name(zqlite_stmt_t *stmt, int column);
+ZQLITE_API int zqlite_column_type(zqlite_stmt_t *stmt, int column);
+ZQLITE_API int64_t zqlite_column_int64(zqlite_stmt_t *stmt, int column);
+ZQLITE_API double zqlite_column_double(zqlite_stmt_t *stmt, int column);
+ZQLITE_API const char *zqlite_column_text(zqlite_stmt_t *stmt, int column);
+ZQLITE_API const void *zqlite_column_blob(zqlite_stmt_t *stmt, int column);
+ZQLITE_API size_t zqlite_column_bytes(zqlite_stmt_t *stmt, int column);
+ZQLITE_API int zqlite_reset(zqlite_stmt_t *stmt);
+ZQLITE_API int zqlite_finalize(zqlite_stmt_t *stmt);
 
-// JSON support (zqlite extension)
-int zqlite_json_extract(zqlite_connection_t* conn, const char* json, const char* path, char** result);
-int zqlite_json_set(zqlite_connection_t* conn, const char* json, const char* path, const char* value, char** result);
-int zqlite_json_type(zqlite_connection_t* conn, const char* json, const char* path, char** result);
+ZQLITE_API int zqlite_begin_transaction(zqlite_connection_t *conn);
+ZQLITE_API int zqlite_commit_transaction(zqlite_connection_t *conn);
+ZQLITE_API int zqlite_rollback_transaction(zqlite_connection_t *conn);
 
-// Error handling
-const char* zqlite_errmsg(zqlite_connection_t* conn);
-int zqlite_errcode(zqlite_connection_t* conn);
+/* Error strings are connection-owned and valid until the next operation. */
+ZQLITE_API const char *zqlite_errmsg(zqlite_connection_t *conn);
+ZQLITE_API int zqlite_errcode(zqlite_connection_t *conn);
+ZQLITE_API int zqlite_errcategory(zqlite_connection_t *conn);
+ZQLITE_API const char *zqlite_errsql(zqlite_connection_t *conn);
 
-// Memory management
-// IMPORTANT: Call zqlite_free_string() to free strings returned by zqlite_result_get_text
-// and other functions that return allocated strings. Failure to do so causes memory leaks.
-void zqlite_free_string(const char* str);
-
-// Utility functions
-const char* zqlite_version();
-int64_t zqlite_last_insert_rowid(zqlite_connection_t* conn);
-int zqlite_changes(zqlite_connection_t* conn);
-void zqlite_shutdown();
-
-// Advanced features for AI/VPN/Crypto projects
-int zqlite_enable_wal_mode(zqlite_connection_t* conn);
-int zqlite_vacuum(zqlite_connection_t* conn);
-int zqlite_backup(zqlite_connection_t* conn, const char* dest_path);
-int zqlite_create_index(zqlite_connection_t* conn, const char* table, const char* column, const char* index_type);
+ZQLITE_API const char *zqlite_version(void);
+ZQLITE_API int zqlite_abi_version(void);
+ZQLITE_API int zqlite_abi_version_major(void);
+ZQLITE_API int zqlite_abi_version_minor(void);
+ZQLITE_API int zqlite_abi_version_patch(void);
+ZQLITE_API int zqlite_pq_available(void);
+ZQLITE_API const char *zqlite_pq_status(void);
+ZQLITE_API const char *zqlite_pq_backend(void);
+ZQLITE_API void zqlite_shutdown(void);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // ZQLITE_H
+#endif

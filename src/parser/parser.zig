@@ -71,6 +71,8 @@ pub const Parser = struct {
             .Begin => try self.parseTransaction(),
             .Commit => try self.parseCommit(),
             .Rollback => try self.parseRollback(),
+            .Savepoint => try self.parseSavepoint(),
+            .Release => try self.parseRelease(),
             .Drop => try self.parseDrop(),
             .Pragma => try self.parsePragma(),
             .Explain => try self.parseExplain(),
@@ -576,6 +578,33 @@ pub const Parser = struct {
             columns = try column_list.toOwnedSlice(self.allocator);
         }
 
+        // Parse DEFAULT VALUES as a single row with no explicit values. The VM
+        // fills every column from DEFAULT or NULL/NOT NULL rules.
+        if (std.meta.activeTag(self.current_token) == .Default) {
+            try self.advance();
+            try self.expect(.Values);
+
+            var values: std.ArrayListUnmanaged([]ast.Value) = .empty;
+            defer values.deinit(self.allocator);
+            try values.append(self.allocator, try self.allocator.alloc(ast.Value, 0));
+
+            var returning: ?ast.ReturningClause = null;
+            if (std.meta.activeTag(self.current_token) == .Returning) {
+                returning = try self.parseReturning();
+            }
+
+            return ast.Statement{
+                .Insert = ast.InsertStatement{
+                    .table = table_name,
+                    .columns = columns,
+                    .values = try values.toOwnedSlice(self.allocator),
+                    .or_conflict = or_conflict,
+                    .on_conflict = null,
+                    .returning = returning,
+                },
+            };
+        }
+
         // Parse VALUES clause
         try self.expect(.Values);
 
@@ -797,6 +826,16 @@ pub const Parser = struct {
     fn parseRollback(self: *Self) !ast.Statement {
         try self.expect(.Rollback);
 
+        if (std.meta.activeTag(self.current_token) == .To) {
+            try self.advance();
+            if (std.meta.activeTag(self.current_token) == .Savepoint) {
+                try self.advance();
+            }
+            return ast.Statement{
+                .RollbackToSavepoint = ast.TransactionStatement{ .savepoint_name = try self.expectIdentifier() },
+            };
+        }
+
         // Optional TRANSACTION keyword
         if (std.meta.activeTag(self.current_token) == .Transaction) {
             try self.advance();
@@ -804,6 +843,25 @@ pub const Parser = struct {
 
         return ast.Statement{
             .Rollback = ast.TransactionStatement{ .savepoint_name = null },
+        };
+    }
+
+    /// Parse SAVEPOINT statement
+    fn parseSavepoint(self: *Self) !ast.Statement {
+        try self.expect(.Savepoint);
+        return ast.Statement{
+            .Savepoint = ast.TransactionStatement{ .savepoint_name = try self.expectIdentifier() },
+        };
+    }
+
+    /// Parse RELEASE [SAVEPOINT] statement
+    fn parseRelease(self: *Self) !ast.Statement {
+        try self.expect(.Release);
+        if (std.meta.activeTag(self.current_token) == .Savepoint) {
+            try self.advance();
+        }
+        return ast.Statement{
+            .ReleaseSavepoint = ast.TransactionStatement{ .savepoint_name = try self.expectIdentifier() },
         };
     }
 
@@ -2300,6 +2358,12 @@ pub const Parser = struct {
                 try self.advance();
                 return ast.Expression{ .Parameter = param_index };
             },
+            .NamedParameter => {
+                const param_index = self.parameter_index;
+                self.parameter_index += 1;
+                try self.advance();
+                return ast.Expression{ .Parameter = param_index };
+            },
             .LeftParen => {
                 try self.advance(); // consume '('
                 // Check if this is a subquery
@@ -2425,6 +2489,11 @@ pub const Parser = struct {
             .String => |s| ast.Value{ .Text = try self.allocator.dupe(u8, s) },
             .Null => ast.Value.Null,
             .QuestionMark => blk: {
+                const param_index = self.parameter_index;
+                self.parameter_index += 1;
+                break :blk ast.Value{ .Parameter = param_index };
+            },
+            .NamedParameter => blk: {
                 const param_index = self.parameter_index;
                 self.parameter_index += 1;
                 break :blk ast.Value{ .Parameter = param_index };
@@ -2671,12 +2740,28 @@ pub const Parser = struct {
                 const ref_column_name = try self.expectIdentifier();
                 try self.expect(.RightParen);
 
+                var on_delete: ?ast.ForeignKeyAction = null;
+                var on_update: ?ast.ForeignKeyAction = null;
+                while (std.meta.activeTag(self.current_token) == .On) {
+                    try self.advance();
+
+                    if (std.meta.activeTag(self.current_token) == .Delete) {
+                        try self.advance();
+                        on_delete = try self.parseForeignKeyAction();
+                    } else if (std.meta.activeTag(self.current_token) == .Update) {
+                        try self.advance();
+                        on_update = try self.parseForeignKeyAction();
+                    } else {
+                        return error.ExpectedDeleteOrUpdate;
+                    }
+                }
+
                 return ast.TableConstraint{ .ForeignKey = ast.ForeignKeyConstraint{
                     .column = column,
                     .reference_table = ref_table_name,
                     .reference_column = ref_column_name,
-                    .on_delete = null,
-                    .on_update = null,
+                    .on_delete = on_delete,
+                    .on_update = on_update,
                 } };
             },
             .Unique => {

@@ -1,23 +1,86 @@
 const std = @import("std");
 const zqlite = @import("zqlite");
 
-/// Benchmark validator for CI regression detection
-/// Runs benchmarks and validates against baseline thresholds
+const warmup_iterations = 1;
+const sample_count = 5;
+
+const BenchmarkSpec = struct {
+    name: []const u8,
+    operations: usize,
+    min_median_ops_per_sec: f64,
+    run: *const fn (*zqlite.Connection, usize) anyerror!void,
+};
+
 const BenchResult = struct {
     name: []const u8,
-    ops_per_sec: f64,
+    median_ops_per_sec: f64,
+    p95_ops_per_sec: f64,
     min_threshold: f64,
     passed: bool,
 };
 
-/// Get current time in nanoseconds for CI benchmark validation.
+const benchmarks = [_]BenchmarkSpec{
+    .{ .name = "Simple INSERT", .operations = 10, .min_median_ops_per_sec = 1000.0, .run = runSimpleInsert },
+    .{ .name = "Bulk INSERT", .operations = 10, .min_median_ops_per_sec = 500.0, .run = runBulkInsert },
+    .{ .name = "SELECT query", .operations = 50, .min_median_ops_per_sec = 500.0, .run = runSelectQuery },
+    .{ .name = "UPDATE", .operations = 50, .min_median_ops_per_sec = 50.0, .run = runUpdate },
+};
+
 fn getNanoTime() i128 {
     var ts: std.posix.timespec = undefined;
-    const result = std.posix.system.clock_gettime(.REALTIME, &ts);
+    const result = std.posix.system.clock_gettime(.MONOTONIC, &ts);
     if (std.posix.errno(result) == .SUCCESS) {
         return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
     }
     return 0;
+}
+
+fn sortAscending(values: []f64) void {
+    var i: usize = 1;
+    while (i < values.len) : (i += 1) {
+        const key = values[i];
+        var j = i;
+        while (j > 0 and values[j - 1] > key) : (j -= 1) {
+            values[j] = values[j - 1];
+        }
+        values[j] = key;
+    }
+}
+
+fn percentile(sorted_values: []const f64, pct: f64) f64 {
+    if (sorted_values.len == 0) return 0;
+    const raw_index = pct * @as(f64, @floatFromInt(sorted_values.len - 1));
+    const index: usize = @intFromFloat(@ceil(raw_index));
+    return sorted_values[@min(index, sorted_values.len - 1)];
+}
+
+fn runBenchmark(conn: *zqlite.Connection, spec: BenchmarkSpec) !BenchResult {
+    var i: usize = 0;
+    while (i < warmup_iterations) : (i += 1) {
+        try spec.run(conn, spec.operations);
+    }
+
+    var samples: [sample_count]f64 = undefined;
+    i = 0;
+    while (i < sample_count) : (i += 1) {
+        const start = getNanoTime();
+        try spec.run(conn, spec.operations);
+        const end = getNanoTime();
+        const duration_s = @max(@as(f64, @floatFromInt(end - start)) / std.time.ns_per_s, 0.000_001);
+        samples[i] = @as(f64, @floatFromInt(spec.operations)) / duration_s;
+    }
+
+    sortAscending(samples[0..]);
+    const median = samples[samples.len / 2];
+    const p95 = percentile(samples[0..], 0.95);
+
+    return .{
+        .name = spec.name,
+        .median_ops_per_sec = median,
+        .p95_ops_per_sec = p95,
+        .min_threshold = spec.min_median_ops_per_sec,
+        .passed = median >= spec.min_median_ops_per_sec,
+    };
 }
 
 pub fn main() !void {
@@ -30,116 +93,27 @@ pub fn main() !void {
     defer conn.close();
 
     try conn.execute("CREATE TABLE bench (id INTEGER, value TEXT)");
+    try conn.execute("INSERT INTO bench (id, value) VALUES (1, 'seed')");
+    try conn.execute("INSERT INTO bench (id, value) VALUES (99, 'update-seed')");
 
     var results: std.ArrayList(BenchResult) = .empty;
     defer results.deinit(allocator);
 
-    // Benchmark 1: Simple INSERTs
-    {
-        const num_ops: usize = 10;
-        const start = getNanoTime();
-
-        var i: usize = 0;
-        while (i < num_ops) : (i += 1) {
-            try conn.execute("INSERT INTO bench (id, value) VALUES (1, 'test')");
-        }
-
-        const end_time = getNanoTime();
-        const duration_s = @as(f64, @floatFromInt(end_time - start)) / 1_000_000_000.0;
-        const ops_per_sec = @as(f64, @floatFromInt(num_ops)) / duration_s;
-        const min_threshold = 1000.0; // CI-friendly threshold
-
-        try results.append(allocator, .{
-            .name = "Simple INSERT",
-            .ops_per_sec = ops_per_sec,
-            .min_threshold = min_threshold,
-            .passed = ops_per_sec >= min_threshold,
-        });
+    for (benchmarks) |spec| {
+        try results.append(allocator, try runBenchmark(conn, spec));
     }
 
-    // Benchmark 2: Bulk INSERTs
-    {
-        const num_ops: usize = 10;
-        const start = getNanoTime();
-
-        try conn.execute("BEGIN TRANSACTION");
-        var i: usize = 0;
-        while (i < num_ops) : (i += 1) {
-            try conn.execute("INSERT INTO bench (id, value) VALUES (2, 'bulk')");
-        }
-        try conn.execute("COMMIT");
-
-        const end_time = getNanoTime();
-        const duration_s = @as(f64, @floatFromInt(end_time - start)) / 1_000_000_000.0;
-        const ops_per_sec = @as(f64, @floatFromInt(num_ops)) / duration_s;
-        const min_threshold = 500.0; // CI-friendly threshold
-
-        try results.append(allocator, .{
-            .name = "Bulk INSERT",
-            .ops_per_sec = ops_per_sec,
-            .min_threshold = min_threshold,
-            .passed = ops_per_sec >= min_threshold,
-        });
-    }
-
-    // Benchmark 3: SELECT queries
-    {
-        const num_ops: usize = 50;
-        const start = getNanoTime();
-
-        var i: usize = 0;
-        while (i < num_ops) : (i += 1) {
-            var result = try conn.query("SELECT * FROM bench");
-            result.deinit();
-        }
-
-        const end_time = getNanoTime();
-        const duration_s = @as(f64, @floatFromInt(end_time - start)) / 1_000_000_000.0;
-        const ops_per_sec = @as(f64, @floatFromInt(num_ops)) / duration_s;
-        const min_threshold = 500.0; // CI-friendly threshold
-
-        try results.append(allocator, .{
-            .name = "SELECT query",
-            .ops_per_sec = ops_per_sec,
-            .min_threshold = min_threshold,
-            .passed = ops_per_sec >= min_threshold,
-        });
-    }
-
-    // Benchmark 4: UPDATEs
-    {
-        const num_ops: usize = 50;
-        const start = getNanoTime();
-
-        var i: usize = 0;
-        while (i < num_ops) : (i += 1) {
-            try conn.execute("UPDATE bench SET value = 'updated' WHERE id = 1");
-        }
-
-        const end_time = getNanoTime();
-        const duration_s = @as(f64, @floatFromInt(end_time - start)) / 1_000_000_000.0;
-        const ops_per_sec = @as(f64, @floatFromInt(num_ops)) / duration_s;
-        const min_threshold = 50.0; // CI-friendly threshold
-
-        try results.append(allocator, .{
-            .name = "UPDATE",
-            .ops_per_sec = ops_per_sec,
-            .min_threshold = min_threshold,
-            .passed = ops_per_sec >= min_threshold,
-        });
-    }
-
-    // Print results
-    std.debug.print("Benchmark Results:\n", .{});
+    std.debug.print("Benchmark Results ({d} warmup, {d} samples, monotonic clock):\n", .{ warmup_iterations, sample_count });
     std.debug.print("--------------------------------------------------------------------------------\n", .{});
 
     var all_passed = true;
     for (results.items) |result| {
         const status = if (result.passed) "✅ PASS" else "❌ FAIL";
-        std.debug.print("{s} {s:<20} {d:>8.0} ops/sec (min: {d:>8.0})\n", .{
+        std.debug.print("{s} {s:<20} median={d:>8.0} ops/sec p95={d:>8.0} ops/sec (min median: {d:>8.0})\n", .{
             status,
             result.name,
-            result.ops_per_sec,
+            result.median_ops_per_sec,
+            result.p95_ops_per_sec,
             result.min_threshold,
         });
         if (!result.passed) all_passed = false;
@@ -153,5 +127,38 @@ pub fn main() !void {
     } else {
         std.debug.print("❌ Some benchmarks failed regression thresholds!\n\n", .{});
         std.process.exit(1);
+    }
+}
+
+fn runSimpleInsert(conn: *zqlite.Connection, num_ops: usize) !void {
+    var i: usize = 0;
+    while (i < num_ops) : (i += 1) {
+        try conn.execute("INSERT INTO bench (id, value) VALUES (1, 'test')");
+    }
+}
+
+fn runBulkInsert(conn: *zqlite.Connection, num_ops: usize) !void {
+    try conn.execute("BEGIN TRANSACTION");
+    errdefer conn.rollbackTransaction() catch {};
+
+    var i: usize = 0;
+    while (i < num_ops) : (i += 1) {
+        try conn.execute("INSERT INTO bench (id, value) VALUES (2, 'bulk')");
+    }
+    try conn.execute("COMMIT");
+}
+
+fn runSelectQuery(conn: *zqlite.Connection, num_ops: usize) !void {
+    var i: usize = 0;
+    while (i < num_ops) : (i += 1) {
+        var result = try conn.query("SELECT * FROM bench");
+        result.deinit();
+    }
+}
+
+fn runUpdate(conn: *zqlite.Connection, num_ops: usize) !void {
+    var i: usize = 0;
+    while (i < num_ops) : (i += 1) {
+        try conn.execute("UPDATE bench SET value = 'updated' WHERE id = 99");
     }
 }

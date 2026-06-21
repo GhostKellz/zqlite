@@ -136,9 +136,10 @@ pub const MigrationManager = struct {
 
         try stmt.bind(0, @as(i64, @intCast(migration.version)));
         try stmt.bind(1, migration.name);
-        try stmt.bind(2, checksum);
+        try stmt.bind(2, @as([]const u8, checksum));
 
-        _ = try stmt.execute(self.connection);
+        var result = try stmt.execute();
+        defer result.deinit();
     }
 
     /// Remove migration record
@@ -149,7 +150,8 @@ pub const MigrationManager = struct {
         defer stmt.deinit();
 
         try stmt.bind(0, @as(i64, @intCast(version)));
-        _ = try stmt.execute(self.connection);
+        var result = try stmt.execute();
+        defer result.deinit();
     }
 
     /// Calculate checksum for migration verification

@@ -12,6 +12,7 @@ pub const WriteAheadLog = struct {
     transaction_id: u64,
     log_entries: std.ArrayListUnmanaged(LogEntry),
     wal_path: []const u8,
+    fault_once: ?FaultPoint,
 
     const Self = @This();
 
@@ -21,6 +22,26 @@ pub const WriteAheadLog = struct {
 
     /// Maximum total size for old_data + new_data combined (128KB)
     pub const MAX_ENTRY_DATA_SIZE: u32 = 128 * 1024;
+
+    pub const FaultPoint = enum {
+        read,
+        write,
+        partial_write,
+        sync,
+        truncate,
+    };
+
+    pub fn injectFaultOnce(self: *Self, point: FaultPoint) void {
+        self.fault_once = point;
+    }
+
+    fn consumeFault(self: *Self, point: FaultPoint) bool {
+        if (self.fault_once == point) {
+            self.fault_once = null;
+            return true;
+        }
+        return false;
+    }
 
     /// Initialize WAL
     pub fn init(allocator: std.mem.Allocator, db_path: []const u8) !*Self {
@@ -32,6 +53,7 @@ pub const WriteAheadLog = struct {
         wal.is_transaction_active = false;
         wal.transaction_id = 0;
         wal.log_entries = .empty;
+        wal.fault_once = null;
 
         // Create WAL path: db_path + "-wal"
         const wal_path = try std.fmt.allocPrint(allocator, "{s}-wal", .{db_path});
@@ -71,7 +93,6 @@ pub const WriteAheadLog = struct {
         }
 
         self.transaction_id += 1;
-        self.is_transaction_active = true;
         self.clearLogEntries();
 
         // Write BEGIN record
@@ -84,8 +105,11 @@ pub const WriteAheadLog = struct {
             .new_data = &.{},
         };
 
-        try self.log_entries.append(self.allocator, begin_entry);
+        // Persist before marking the transaction active or recording it, so a
+        // failed BEGIN leaves the WAL in a clean, inactive state.
         try self.writeLogEntry(begin_entry);
+        try self.log_entries.append(self.allocator, begin_entry);
+        self.is_transaction_active = true;
     }
 
     /// Log a page modification
@@ -114,8 +138,11 @@ pub const WriteAheadLog = struct {
             .new_data = new_data_copy,
         };
 
-        try self.log_entries.append(self.allocator, entry);
+        // Persist the record before tracking it in memory. If the write fails,
+        // the errdefers above free the copies and the entry is never recorded,
+        // so the in-memory undo log can never reference freed memory.
         try self.writeLogEntry(entry);
+        try self.log_entries.append(self.allocator, entry);
     }
 
     /// Commit the current transaction
@@ -138,7 +165,8 @@ pub const WriteAheadLog = struct {
 
         // Sync to ensure commit is durable
         if (self.fd) |fd| {
-            posix.fdatasync(fd) catch {};
+            if (self.consumeFault(.sync)) return error.InjectedSyncFailure;
+            try posix.fdatasync(fd);
         }
 
         self.is_transaction_active = false;
@@ -183,12 +211,12 @@ pub const WriteAheadLog = struct {
 
             if (entry.entry_type == .PageWrite and entry.old_data.len > 0) {
                 // Restore the old page data
-                const page = target_pager.getPage(entry.page_id) catch continue;
+                const page = try target_pager.getPage(entry.page_id);
                 const end_offset = entry.offset + @as(u32, @intCast(entry.old_data.len));
 
                 if (end_offset <= page.data.len) {
                     @memcpy(page.data[entry.offset..end_offset], entry.old_data);
-                    target_pager.markDirty(entry.page_id) catch {};
+                    try target_pager.markDirty(entry.page_id);
                 }
             }
         }
@@ -212,7 +240,7 @@ pub const WriteAheadLog = struct {
         self.clearLogEntries();
 
         // Truncate WAL after rollback
-        self.truncateFile();
+        try self.truncateFile();
     }
 
     /// Checkpoint - apply WAL changes to main database
@@ -226,7 +254,7 @@ pub const WriteAheadLog = struct {
             return error.TransactionActive;
         }
 
-        const file_size = self.getFileSize() catch return;
+        const file_size = try self.getFileSize();
         if (file_size == 0) return;
 
         // First pass: collect all committed transaction IDs
@@ -237,7 +265,7 @@ pub const WriteAheadLog = struct {
         var buffer: [8192]u8 = undefined;
 
         while (@as(u64, @intCast(position)) < file_size) {
-            const bytes_read = self.readAt(&buffer, position) catch break;
+            const bytes_read = try self.readAt(&buffer, position);
             if (bytes_read < 25) break;
 
             var buffer_pos: usize = 0;
@@ -250,25 +278,26 @@ pub const WriteAheadLog = struct {
                         const remaining_file = file_size - @as(u64, @intCast(position));
                         if (full_entry_size == 0 or full_entry_size > remaining_file) break;
 
-                        const large_buf = self.allocator.alloc(u8, full_entry_size) catch break;
+                        const large_buf = try self.allocator.alloc(u8, full_entry_size);
                         defer self.allocator.free(large_buf);
 
-                        const large_read = self.readAt(large_buf, position) catch break;
+                        const large_read = try self.readAt(large_buf, position);
                         if (large_read < full_entry_size) break;
 
-                        const large_entry = LogEntry.deserialize(self.allocator, large_buf) catch break;
+                        const large_entry = try LogEntry.deserialize(self.allocator, large_buf);
                         defer {
                             if (large_entry.old_data.len > 0) self.allocator.free(large_entry.old_data);
                             if (large_entry.new_data.len > 0) self.allocator.free(large_entry.new_data);
                         }
 
                         if (large_entry.entry_type == .Commit) {
-                            committed_transactions.put(large_entry.transaction_id, {}) catch break;
+                            try committed_transactions.put(large_entry.transaction_id, {});
                         }
 
                         position += @as(i64, @intCast(full_entry_size));
                         continue;
                     }
+                    if (err != error.BufferTooSmall) return err;
                     break;
                 };
                 defer {
@@ -294,7 +323,7 @@ pub const WriteAheadLog = struct {
             position = 0;
 
             while (@as(u64, @intCast(position)) < file_size) {
-                const bytes_read = self.readAt(&buffer, position) catch break;
+                const bytes_read = try self.readAt(&buffer, position);
                 if (bytes_read < 25) break;
 
                 var buffer_pos: usize = 0;
@@ -307,33 +336,30 @@ pub const WriteAheadLog = struct {
                             const remaining_file = file_size - @as(u64, @intCast(position));
                             if (full_entry_size == 0 or full_entry_size > remaining_file) break;
 
-                            const large_buf = self.allocator.alloc(u8, full_entry_size) catch break;
+                            const large_buf = try self.allocator.alloc(u8, full_entry_size);
                             defer self.allocator.free(large_buf);
 
-                            const large_read = self.readAt(large_buf, position) catch break;
+                            const large_read = try self.readAt(large_buf, position);
                             if (large_read < full_entry_size) break;
 
-                            const large_entry = LogEntry.deserialize(self.allocator, large_buf) catch break;
+                            const large_entry = try LogEntry.deserialize(self.allocator, large_buf);
                             defer {
                                 if (large_entry.old_data.len > 0) self.allocator.free(large_entry.old_data);
                                 if (large_entry.new_data.len > 0) self.allocator.free(large_entry.new_data);
                             }
 
                             if (large_entry.entry_type == .PageWrite and committed_transactions.contains(large_entry.transaction_id)) {
-                                const page = pager_inst.getPage(large_entry.page_id) catch {
-                                    position += @as(i64, @intCast(full_entry_size));
-                                    continue;
-                                };
+                                const page = try pager_inst.getPage(large_entry.page_id);
                                 const end_offset = large_entry.offset + @as(u32, @intCast(large_entry.new_data.len));
-                                if (end_offset <= page.data.len) {
-                                    @memcpy(page.data[large_entry.offset..end_offset], large_entry.new_data);
-                                    pager_inst.markDirty(large_entry.page_id) catch {};
-                                }
+                                if (end_offset > page.data.len) return error.WalEntryOutOfBounds;
+                                @memcpy(page.data[large_entry.offset..end_offset], large_entry.new_data);
+                                try pager_inst.markDirty(large_entry.page_id);
                             }
 
                             position += @as(i64, @intCast(full_entry_size));
                             continue;
                         }
+                        if (err != error.BufferTooSmall) return err;
                         break;
                     };
                     defer {
@@ -342,17 +368,11 @@ pub const WriteAheadLog = struct {
                     }
 
                     if (entry.entry_type == .PageWrite and committed_transactions.contains(entry.transaction_id)) {
-                        const page = pager_inst.getPage(entry.page_id) catch {
-                            const entry_size = getEntrySize(&entry);
-                            position += @as(i64, @intCast(entry_size));
-                            buffer_pos += entry_size;
-                            continue;
-                        };
+                        const page = try pager_inst.getPage(entry.page_id);
                         const end_offset = entry.offset + @as(u32, @intCast(entry.new_data.len));
-                        if (end_offset <= page.data.len) {
-                            @memcpy(page.data[entry.offset..end_offset], entry.new_data);
-                            pager_inst.markDirty(entry.page_id) catch {};
-                        }
+                        if (end_offset > page.data.len) return error.WalEntryOutOfBounds;
+                        @memcpy(page.data[entry.offset..end_offset], entry.new_data);
+                        try pager_inst.markDirty(entry.page_id);
                     }
 
                     const entry_size = getEntrySize(&entry);
@@ -369,7 +389,7 @@ pub const WriteAheadLog = struct {
         }
 
         // Truncate WAL file after successful checkpoint
-        self.truncateFile();
+        try self.truncateFile();
     }
 
     /// Get the size of a log entry
@@ -379,7 +399,7 @@ pub const WriteAheadLog = struct {
 
     /// Recover from WAL on startup
     fn recover(self: *Self) !void {
-        const file_size = self.getFileSize() catch return;
+        const file_size = try self.getFileSize();
         if (file_size == 0) return;
 
         var buffer: [8192]u8 = undefined;
@@ -387,7 +407,7 @@ pub const WriteAheadLog = struct {
         var max_transaction_id: u64 = 0;
 
         while (@as(u64, @intCast(position)) < file_size) {
-            const bytes_read = self.readAt(&buffer, position) catch break;
+            const bytes_read = try self.readAt(&buffer, position);
             if (bytes_read < 25) break;
 
             var buffer_pos: usize = 0;
@@ -400,13 +420,13 @@ pub const WriteAheadLog = struct {
                         const remaining_file = file_size - @as(u64, @intCast(position));
                         if (full_entry_size == 0 or full_entry_size > remaining_file) break;
 
-                        const large_buf = self.allocator.alloc(u8, full_entry_size) catch break;
+                        const large_buf = try self.allocator.alloc(u8, full_entry_size);
                         defer self.allocator.free(large_buf);
 
-                        const large_read = self.readAt(large_buf, position) catch break;
+                        const large_read = try self.readAt(large_buf, position);
                         if (large_read < full_entry_size) break;
 
-                        const large_entry = LogEntry.deserialize(self.allocator, large_buf) catch break;
+                        const large_entry = try LogEntry.deserialize(self.allocator, large_buf);
                         defer {
                             if (large_entry.old_data.len > 0) self.allocator.free(large_entry.old_data);
                             if (large_entry.new_data.len > 0) self.allocator.free(large_entry.new_data);
@@ -416,6 +436,7 @@ pub const WriteAheadLog = struct {
                         position += @as(i64, @intCast(full_entry_size));
                         continue;
                     }
+                    if (err != error.BufferTooSmall) return err;
                     break;
                 };
                 defer {
@@ -447,7 +468,7 @@ pub const WriteAheadLog = struct {
         const serialized = try entry.serialize(buffer);
 
         // Append to WAL file (write at end)
-        const file_size = self.getFileSize() catch 0;
+        const file_size = try self.getFileSize();
         try self.writeAtAll(serialized, @as(i64, @intCast(file_size)));
     }
 
@@ -460,6 +481,7 @@ pub const WriteAheadLog = struct {
 
     fn readAt(self: *Self, buf: []u8, offset: i64) !usize {
         if (self.fd) |fd_val| {
+            if (self.consumeFault(.read)) return error.InjectedReadFailure;
             return preadAll(fd_val, buf, offset);
         }
         return error.FileNotOpen;
@@ -467,22 +489,31 @@ pub const WriteAheadLog = struct {
 
     fn writeAtAll(self: *Self, buf: []const u8, offset: i64) !void {
         if (self.fd) |fd_val| {
+            if (self.consumeFault(.write)) return error.InjectedWriteFailure;
+            if (self.consumeFault(.partial_write)) {
+                const partial_len = @max(@as(usize, 1), buf.len / 2);
+                try pwriteAll(fd_val, buf[0..partial_len], offset);
+                return error.InjectedPartialWrite;
+            }
             return pwriteAll(fd_val, buf, offset);
         }
         return error.FileNotOpen;
     }
 
-    fn truncateFile(self: *Self) void {
+    fn truncateFile(self: *Self) !void {
+        if (self.consumeFault(.truncate)) return error.InjectedTruncateFailure;
         if (self.fd) |wal_fd| {
             if (comptime native_os == .windows) {
-                return;
+                return error.Unsupported;
             } else if (comptime native_os == .linux) {
-                _ = std.os.linux.ftruncate(wal_fd, 0);
+                const rc = std.os.linux.ftruncate(wal_fd, 0);
+                if (std.os.linux.errno(rc) != .SUCCESS) return error.TruncateError;
             } else {
-                _ = std.c.ftruncate(wal_fd, 0);
+                if (std.c.ftruncate(wal_fd, 0) != 0) return error.TruncateError;
             }
             return;
         }
+        return error.FileNotOpen;
     }
 
     /// Clear log entries and free memory
@@ -681,7 +712,13 @@ pub const LogEntry = struct {
 
         var pos: usize = 0;
 
-        const entry_type: LogEntryType = @enumFromInt(buffer[pos]);
+        const entry_type: LogEntryType = switch (buffer[pos]) {
+            1 => .Begin,
+            2 => .PageWrite,
+            3 => .Commit,
+            4 => .Rollback,
+            else => return error.InvalidWalEntryType,
+        };
         pos += 1;
 
         const transaction_id = std.mem.readInt(u64, buffer[pos..][0..8], .little);

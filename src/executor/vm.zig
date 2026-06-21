@@ -201,6 +201,9 @@ pub const VirtualMachine = struct {
             .BeginTransaction => try self.executeBeginTransaction(result),
             .Commit => try self.executeCommit(result),
             .Rollback => try self.executeRollback(result),
+            .Savepoint => |*savepoint| try self.executeSavepoint(savepoint, result),
+            .ReleaseSavepoint => |*savepoint| try self.executeReleaseSavepoint(savepoint, result),
+            .RollbackToSavepoint => |*savepoint| try self.executeRollbackToSavepoint(savepoint, result),
             .CreateIndex => |*create_idx| try self.executeCreateIndex(create_idx, result),
             .DropIndex => |*drop_idx| try self.executeDropIndex(drop_idx, result),
             .DropTable => |*drop_tbl| try self.executeDropTable(drop_tbl, result),
@@ -283,6 +286,9 @@ pub const VirtualMachine = struct {
             .BeginTransaction => try self.executeBeginTransaction(result),
             .Commit => try self.executeCommit(result),
             .Rollback => try self.executeRollback(result),
+            .Savepoint => |*savepoint| try self.executeSavepoint(savepoint, result),
+            .ReleaseSavepoint => |*savepoint| try self.executeReleaseSavepoint(savepoint, result),
+            .RollbackToSavepoint => |*savepoint| try self.executeRollbackToSavepoint(savepoint, result),
             .CreateIndex => |*create_idx| try self.executeCreateIndex(create_idx, result),
             .DropIndex => |*drop_idx| try self.executeDropIndex(drop_idx, result),
             .DropTable => |*drop_tbl| try self.executeDropTable(drop_tbl, result),
@@ -1177,6 +1183,9 @@ pub const VirtualMachine = struct {
                 }
             }
 
+            try self.validateCheckConstraints(table, final_values);
+            try self.validateNotNullConstraints(table, final_values);
+            try self.validateForeignKeyReferences(table, final_values);
             try self.connection.storage_engine.checkUniqueIndexes(table, final_values);
 
             // Handle ON CONFLICT - check for primary key conflict before insert
@@ -1257,6 +1266,10 @@ pub const VirtualMachine = struct {
                                             continue;
                                         }
                                     }
+
+                                    try self.validateCheckConstraints(table, existing_row.values);
+                                    try self.validateNotNullConstraints(table, existing_row.values);
+                                    try self.validateForeignKeyReferences(table, existing_row.values);
 
                                     var replacement_values = try self.connection.allocator.alloc(storage.Value, existing_row.values.len);
                                     var replacement_initialized: usize = 0;
@@ -1388,8 +1401,246 @@ pub const VirtualMachine = struct {
         try result.rows.append(self.connection.allocator, storage.Row{ .values = return_values });
     }
 
+    fn validateCheckConstraints(self: *Self, table: *storage.Table, row_values: []const storage.Value) !void {
+        if (table.schema.check_constraints.len == 0) return;
+
+        const row = storage.Row{ .values = @constCast(row_values) };
+        const previous_table = self.current_table;
+        self.current_table = table;
+        defer self.current_table = previous_table;
+
+        for (table.schema.check_constraints) |*condition| {
+            const truth = try self.evaluateConditionTruth(condition, &row);
+            if (truth == .False) return error.ConstraintViolation;
+        }
+    }
+
+    fn validateNotNullConstraints(self: *Self, table: *storage.Table, row_values: []const storage.Value) !void {
+        _ = self;
+        for (table.schema.columns, 0..) |column, i| {
+            if (i >= row_values.len) return error.MissingRequiredValue;
+            if (!column.is_nullable and row_values[i] == .Null) return error.MissingRequiredValue;
+        }
+    }
+
+    fn validateForeignKeyReferences(self: *Self, table: *storage.Table, row_values: []const storage.Value) !void {
+        return self.validateForeignKeyReferencesSkipping(table, row_values, null);
+    }
+
+    fn validateForeignKeyReferencesSkipping(self: *Self, table: *storage.Table, row_values: []const storage.Value, skip_foreign_key: ?*const ast.ForeignKeyConstraint) !void {
+        for (table.schema.foreign_keys) |foreign_key| {
+            if (skip_foreign_key) |skip| {
+                if (sameForeignKey(foreign_key, skip.*)) continue;
+            }
+            const child_column = foreign_key.column orelse return error.ConstraintViolation;
+            const child_idx = table.getColumnIndex(child_column) orelse return error.ConstraintViolation;
+            if (child_idx >= row_values.len) return error.ConstraintViolation;
+            const child_value = row_values[child_idx];
+
+            // SQL FK semantics: NULL child keys do not require a parent row.
+            if (child_value == .Null) continue;
+
+            const parent_table = self.connection.storage_engine.getTable(foreign_key.reference_table) orelse return error.ConstraintViolation;
+            const parent_idx = parent_table.getColumnIndex(foreign_key.reference_column) orelse return error.ConstraintViolation;
+            if (!try self.tableHasValue(parent_table, parent_idx, child_value)) {
+                return error.ConstraintViolation;
+            }
+        }
+    }
+
+    fn sameForeignKey(a: ast.ForeignKeyConstraint, b: ast.ForeignKeyConstraint) bool {
+        const a_column = a.column orelse return b.column == null;
+        const b_column = b.column orelse return false;
+        return std.mem.eql(u8, a_column, b_column) and
+            std.mem.eql(u8, a.reference_table, b.reference_table) and
+            std.mem.eql(u8, a.reference_column, b.reference_column);
+    }
+
+    fn tableHasValue(self: *Self, table: *storage.Table, column_idx: usize, value: storage.Value) !bool {
+        const rows = try table.selectWithKeys(self.connection.allocator);
+        defer {
+            for (rows) |item| {
+                for (item.row.values) |row_value| row_value.deinit(self.connection.allocator);
+                self.connection.allocator.free(item.row.values);
+            }
+            self.connection.allocator.free(rows);
+        }
+
+        for (rows) |item| {
+            if (column_idx < item.row.values.len and self.valuesEqual(item.row.values[column_idx], value)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn applyParentForeignKeyDeleteActions(self: *Self, parent_table: *storage.Table, parent_values: []const storage.Value) anyerror!void {
+        var table_it = self.connection.storage_engine.tables.iterator();
+        while (table_it.next()) |entry| {
+            const child_table = entry.value_ptr.*;
+            for (child_table.schema.foreign_keys) |foreign_key| {
+                if (!std.mem.eql(u8, foreign_key.reference_table, parent_table.name)) continue;
+                const parent_idx = parent_table.getColumnIndex(foreign_key.reference_column) orelse return error.ConstraintViolation;
+                if (parent_idx >= parent_values.len or parent_values[parent_idx] == .Null) continue;
+                if (try self.childReferencesValue(child_table, foreign_key, parent_values[parent_idx])) {
+                    try switch (foreign_key.on_delete orelse .NoAction) {
+                        .Restrict, .NoAction => error.ConstraintViolation,
+                        .Cascade => try self.deleteChildRowsReferencing(child_table, foreign_key, parent_values[parent_idx]),
+                        .SetNull => try self.updateChildRowsReferencing(child_table, foreign_key, parent_values[parent_idx], storage.Value.Null),
+                    };
+                }
+            }
+        }
+    }
+
+    fn applyParentForeignKeyUpdateActions(self: *Self, parent_table: *storage.Table, old_values: []const storage.Value, new_values: []const storage.Value) anyerror!void {
+        var table_it = self.connection.storage_engine.tables.iterator();
+        while (table_it.next()) |entry| {
+            const child_table = entry.value_ptr.*;
+            for (child_table.schema.foreign_keys) |foreign_key| {
+                if (!std.mem.eql(u8, foreign_key.reference_table, parent_table.name)) continue;
+                const parent_idx = parent_table.getColumnIndex(foreign_key.reference_column) orelse return error.ConstraintViolation;
+                if (parent_idx >= old_values.len or parent_idx >= new_values.len) return error.ConstraintViolation;
+                if (self.valuesEqual(old_values[parent_idx], new_values[parent_idx])) continue;
+                if (old_values[parent_idx] == .Null) continue;
+                if (try self.childReferencesValue(child_table, foreign_key, old_values[parent_idx])) {
+                    try switch (foreign_key.on_update orelse .NoAction) {
+                        .Restrict, .NoAction => error.ConstraintViolation,
+                        .Cascade => try self.updateChildRowsReferencing(child_table, foreign_key, old_values[parent_idx], new_values[parent_idx]),
+                        .SetNull => try self.updateChildRowsReferencing(child_table, foreign_key, old_values[parent_idx], storage.Value.Null),
+                    };
+                }
+            }
+        }
+    }
+
+    fn childReferencesValue(self: *Self, child_table: *storage.Table, foreign_key: ast.ForeignKeyConstraint, parent_value: storage.Value) !bool {
+        const child_column = foreign_key.column orelse return false;
+        const child_idx = child_table.getColumnIndex(child_column) orelse return error.ConstraintViolation;
+
+        const rows = try child_table.selectWithKeys(self.connection.allocator);
+        defer {
+            for (rows) |item| {
+                for (item.row.values) |row_value| row_value.deinit(self.connection.allocator);
+                self.connection.allocator.free(item.row.values);
+            }
+            self.connection.allocator.free(rows);
+        }
+
+        for (rows) |item| {
+            if (child_idx >= item.row.values.len) continue;
+            const child_value = item.row.values[child_idx];
+            if (child_value != .Null and self.valuesEqual(child_value, parent_value)) return true;
+        }
+        return false;
+    }
+
+    fn deleteChildRowsReferencing(self: *Self, child_table: *storage.Table, foreign_key: ast.ForeignKeyConstraint, parent_value: storage.Value) anyerror!void {
+        const child_column = foreign_key.column orelse return error.ConstraintViolation;
+        const child_idx = child_table.getColumnIndex(child_column) orelse return error.ConstraintViolation;
+
+        const rows = try child_table.selectWithKeys(self.connection.allocator);
+        defer {
+            for (rows) |item| {
+                for (item.row.values) |row_value| row_value.deinit(self.connection.allocator);
+                self.connection.allocator.free(item.row.values);
+            }
+            self.connection.allocator.free(rows);
+        }
+
+        var changed = false;
+        for (rows) |item| {
+            if (child_idx >= item.row.values.len) continue;
+            const child_value = item.row.values[child_idx];
+            if (child_value == .Null or !self.valuesEqual(child_value, parent_value)) continue;
+
+            try self.applyParentForeignKeyDeleteActions(child_table, item.row.values);
+
+            if (self.connection.in_transaction) {
+                const table_name_copy = try self.connection.allocator.dupe(u8, child_table.name);
+                try self.connection.logUndo(db.UndoEntry{
+                    .operation = .Delete,
+                    .table_name = table_name_copy,
+                    .row_id = item.key,
+                    .new_row_id = null,
+                    .old_values = null,
+                });
+            }
+
+            try child_table.delete(self.connection.allocator, item.key);
+            changed = true;
+        }
+
+        if (changed) {
+            try self.connection.storage_engine.refreshIndexesForTable(child_table.name);
+            self.connection.invalidateResultCache(child_table.name);
+        }
+    }
+
+    fn updateChildRowsReferencing(self: *Self, child_table: *storage.Table, foreign_key: ast.ForeignKeyConstraint, parent_value: storage.Value, replacement_value: storage.Value) anyerror!void {
+        const child_column = foreign_key.column orelse return error.ConstraintViolation;
+        const child_idx = child_table.getColumnIndex(child_column) orelse return error.ConstraintViolation;
+
+        const rows = try child_table.selectWithKeys(self.connection.allocator);
+        defer {
+            for (rows) |item| {
+                for (item.row.values) |row_value| row_value.deinit(self.connection.allocator);
+                self.connection.allocator.free(item.row.values);
+            }
+            self.connection.allocator.free(rows);
+        }
+
+        var changed = false;
+        for (rows) |item| {
+            if (child_idx >= item.row.values.len) continue;
+            const child_value = item.row.values[child_idx];
+            if (child_value == .Null or !self.valuesEqual(child_value, parent_value)) continue;
+
+            var updated_values = try self.connection.allocator.alloc(storage.Value, item.row.values.len);
+            var values_cloned: usize = 0;
+            errdefer {
+                for (updated_values[0..values_cloned]) |value| value.deinit(self.connection.allocator);
+                self.connection.allocator.free(updated_values);
+            }
+
+            for (item.row.values, 0..) |value, i| {
+                updated_values[i] = try value.clone(self.connection.allocator);
+                values_cloned = i + 1;
+            }
+            updated_values[child_idx].deinit(self.connection.allocator);
+            updated_values[child_idx] = try replacement_value.clone(self.connection.allocator);
+
+            try self.validateNotNullConstraints(child_table, updated_values);
+            try self.validateCheckConstraints(child_table, updated_values);
+            try self.validateForeignKeyReferencesSkipping(child_table, updated_values, &foreign_key);
+            try self.applyParentForeignKeyUpdateActions(child_table, item.row.values, updated_values);
+
+            const new_row_id: i64 = @intCast(child_table.row_count);
+            if (self.connection.in_transaction) {
+                const table_name_copy = try self.connection.allocator.dupe(u8, child_table.name);
+                try self.connection.logUndo(db.UndoEntry{
+                    .operation = .Update,
+                    .table_name = table_name_copy,
+                    .row_id = item.key,
+                    .new_row_id = new_row_id,
+                    .old_values = null,
+                });
+            }
+
+            try child_table.updateRow(self.connection.allocator, item.key, updated_values);
+            changed = true;
+        }
+
+        if (changed) {
+            try self.connection.storage_engine.refreshIndexesForTable(child_table.name);
+            self.connection.invalidateResultCache(child_table.name);
+        }
+    }
+
     /// Execute create table
     fn executeCreateTable(self: *Self, create: *planner.CreateTableStep, result: *ExecutionResult) !void {
+        try self.rejectSchemaChangeInSavepoint();
+
         // Check if table exists and if_not_exists is true
         if (create.if_not_exists and self.connection.storage_engine.getTable(create.table_name) != null) {
             return; // Table already exists, skip creation
@@ -1412,6 +1663,7 @@ pub const VirtualMachine = struct {
                 .data_type = column.data_type,
                 .is_primary_key = column.is_primary_key,
                 .is_nullable = column.is_nullable,
+                .is_unique = column.is_unique,
                 .default_value = if (column.default_value) |default_value|
                     self.cloneStorageDefaultValue(default_value) catch {
                         self.connection.allocator.free(cloned_columns[i].name);
@@ -1429,12 +1681,62 @@ pub const VirtualMachine = struct {
 
         var schema = storage.TableSchema{
             .columns = cloned_columns,
+            .check_constraints = create.check_constraints,
+            .foreign_keys = create.foreign_keys,
         };
-        defer schema.deinit(self.connection.allocator);
+        defer {
+            // create.check_constraints are owned by the execution plan. The
+            // storage engine clones them during createTable; only cloned_columns
+            // are owned by this temporary schema.
+            schema.check_constraints = &.{};
+            schema.foreign_keys = &.{};
+            schema.deinit(self.connection.allocator);
+        }
 
         try self.connection.storage_engine.createTable(create.table_name, schema);
         self.connection.invalidateResultCache(create.table_name);
+
+        // Enforce inline UNIQUE column constraints by auto-creating a unique index.
+        // The index is persisted in the catalog, so the constraint survives reopen.
+        for (create.columns) |column| {
+            if (!column.is_unique or column.is_primary_key) continue;
+            try self.createAutoUniqueIndex(create.table_name, column.name);
+        }
+
+        for (create.unique_constraints, 0..) |unique, i| {
+            try self.createAutoUniqueIndexForColumns(create.table_name, unique.columns, i + 1);
+        }
+
         result.affected_rows = 1;
+    }
+
+    /// Create a deterministic unique index backing an inline UNIQUE column
+    /// constraint. The index name mirrors SQLite's `sqlite_autoindex_*` scheme so
+    /// it is recognizable and unlikely to collide with user index names.
+    fn createAutoUniqueIndex(self: *Self, table_name: []const u8, column_name: []const u8) !void {
+        const index_name = try std.fmt.allocPrint(
+            self.connection.allocator,
+            "sqlite_autoindex_{s}_{s}",
+            .{ table_name, column_name },
+        );
+        defer self.connection.allocator.free(index_name);
+
+        var columns = [_][]const u8{column_name};
+        try self.connection.storage_engine.createIndex(index_name, table_name, columns[0..], true);
+    }
+
+    /// Create a deterministic unique index backing a table-level UNIQUE(...)
+    /// constraint. The index is persisted in the catalog with the rest of the
+    /// table metadata, so enforcement survives reopen.
+    fn createAutoUniqueIndexForColumns(self: *Self, table_name: []const u8, column_names: [][]const u8, ordinal: usize) !void {
+        const index_name = try std.fmt.allocPrint(
+            self.connection.allocator,
+            "sqlite_autoindex_{s}_unique_{d}",
+            .{ table_name, ordinal },
+        );
+        defer self.connection.allocator.free(index_name);
+
+        try self.connection.storage_engine.createIndex(index_name, table_name, column_names, true);
     }
 
     /// Execute update using logical updates with transaction undo support
@@ -1527,6 +1829,11 @@ pub const VirtualMachine = struct {
                 // Get the new row_id before updating (it will be table.row_count)
                 const new_row_id: i64 = @intCast(table.row_count);
 
+                try self.validateCheckConstraints(table, updated_values);
+                try self.validateNotNullConstraints(table, updated_values);
+                try self.validateForeignKeyReferences(table, updated_values);
+                try self.applyParentForeignKeyUpdateActions(table, item.row.values, updated_values);
+
                 // Log undo entry before updating (if in transaction)
                 if (self.connection.in_transaction) {
                     const table_name_copy = try self.connection.allocator.dupe(u8, update.table_name);
@@ -1596,6 +1903,8 @@ pub const VirtualMachine = struct {
             }
 
             if (should_delete) {
+                try self.applyParentForeignKeyDeleteActions(table, item.row.values);
+
                 // Handle RETURNING clause - capture row values BEFORE delete
                 if (delete.returning_columns) |ret_cols| {
                     try self.addReturningRow(result, table, item.row.values, ret_cols);
@@ -1631,15 +1940,49 @@ pub const VirtualMachine = struct {
 
     /// Evaluate a condition against a row
     fn evaluateCondition(self: *Self, condition: *const ast.Condition, row: *const storage.Row) anyerror!bool {
+        return (try self.evaluateConditionTruth(condition, row)) == .True;
+    }
+
+    const SqlTruth = enum {
+        True,
+        False,
+        Unknown,
+
+        fn not(self: SqlTruth) SqlTruth {
+            return switch (self) {
+                .True => .False,
+                .False => .True,
+                .Unknown => .Unknown,
+            };
+        }
+    };
+
+    fn sqlAnd(left: SqlTruth, right: SqlTruth) SqlTruth {
+        if (left == .False or right == .False) return .False;
+        if (left == .Unknown or right == .Unknown) return .Unknown;
+        return .True;
+    }
+
+    fn sqlOr(left: SqlTruth, right: SqlTruth) SqlTruth {
+        if (left == .True or right == .True) return .True;
+        if (left == .Unknown or right == .Unknown) return .Unknown;
+        return .False;
+    }
+
+    fn boolTruth(value: bool) SqlTruth {
+        return if (value) .True else .False;
+    }
+
+    fn evaluateConditionTruth(self: *Self, condition: *const ast.Condition, row: *const storage.Row) anyerror!SqlTruth {
         return switch (condition.*) {
-            .Comparison => |*comp| try self.evaluateComparison(comp, row),
+            .Comparison => |*comp| try self.evaluateComparisonTruth(comp, row),
             .Logical => |*logical| {
-                const left_result = try self.evaluateCondition(logical.left, row);
-                const right_result = try self.evaluateCondition(logical.right, row);
+                const left_result = try self.evaluateConditionTruth(logical.left, row);
+                const right_result = try self.evaluateConditionTruth(logical.right, row);
 
                 return switch (logical.operator) {
-                    .And => left_result and right_result,
-                    .Or => left_result or right_result,
+                    .And => sqlAnd(left_result, right_result),
+                    .Or => sqlOr(left_result, right_result),
                 };
             },
         };
@@ -1647,21 +1990,25 @@ pub const VirtualMachine = struct {
 
     /// Evaluate a comparison condition
     fn evaluateComparison(self: *Self, comp: *const ast.ComparisonCondition, row: *const storage.Row) !bool {
+        return (try self.evaluateComparisonTruth(comp, row)) == .True;
+    }
+
+    fn evaluateComparisonTruth(self: *Self, comp: *const ast.ComparisonCondition, row: *const storage.Row) !SqlTruth {
         const left_value = try self.evaluateExpression(&comp.left, row);
         defer left_value.deinit(self.connection.allocator);
 
         // Handle IS NULL / IS NOT NULL (don't need to evaluate right side)
         if (comp.operator == .IsNull) {
-            return left_value == .Null;
+            return boolTruth(left_value == .Null);
         }
         if (comp.operator == .IsNotNull) {
-            return left_value != .Null;
+            return boolTruth(left_value != .Null);
         }
 
         // Handle IN / NOT IN with InList or Subquery
         if (comp.operator == .In or comp.operator == .NotIn) {
-            const in_result = try self.evaluateInCondition(left_value, &comp.right, row);
-            return if (comp.operator == .In) in_result else !in_result;
+            const in_result = try self.evaluateInConditionTruth(left_value, &comp.right, row);
+            return if (comp.operator == .In) in_result else in_result.not();
         }
 
         const right_value = try self.evaluateExpression(&comp.right, row);
@@ -1673,31 +2020,36 @@ pub const VirtualMachine = struct {
                 const high_value = try self.evaluateExpression(&extra_expr, row);
                 defer high_value.deinit(self.connection.allocator);
 
+                if (left_value == .Null or right_value == .Null or high_value == .Null) return .Unknown;
+
                 const cmp_low = self.compareValues(left_value, right_value);
                 const cmp_high = self.compareValues(left_value, high_value);
                 const in_range = (cmp_low == .gt or cmp_low == .eq) and (cmp_high == .lt or cmp_high == .eq);
 
-                return if (comp.operator == .Between) in_range else !in_range;
+                const result = boolTruth(in_range);
+                return if (comp.operator == .Between) result else result.not();
             }
-            return false;
+            return .False;
         }
 
+        if (left_value == .Null or right_value == .Null) return .Unknown;
+
         return switch (comp.operator) {
-            .Equal => self.compareValues(left_value, right_value) == .eq,
-            .NotEqual => self.compareValues(left_value, right_value) != .eq,
-            .LessThan => self.compareValues(left_value, right_value) == .lt,
+            .Equal => boolTruth(self.compareValues(left_value, right_value) == .eq),
+            .NotEqual => boolTruth(self.compareValues(left_value, right_value) != .eq),
+            .LessThan => boolTruth(self.compareValues(left_value, right_value) == .lt),
             .LessThanOrEqual => {
                 const cmp = self.compareValues(left_value, right_value);
-                return cmp == .lt or cmp == .eq;
+                return boolTruth(cmp == .lt or cmp == .eq);
             },
-            .GreaterThan => self.compareValues(left_value, right_value) == .gt,
+            .GreaterThan => boolTruth(self.compareValues(left_value, right_value) == .gt),
             .GreaterThanOrEqual => {
                 const cmp = self.compareValues(left_value, right_value);
-                return cmp == .gt or cmp == .eq;
+                return boolTruth(cmp == .gt or cmp == .eq);
             },
-            .Like => self.evaluateLike(left_value, right_value, false),
-            .NotLike => self.evaluateLike(left_value, right_value, true),
-            .Match => self.evaluateMatch(left_value, right_value),
+            .Like => boolTruth(self.evaluateLike(left_value, right_value, false)),
+            .NotLike => boolTruth(self.evaluateLike(left_value, right_value, true)),
+            .Match => boolTruth(self.evaluateMatch(left_value, right_value)),
             .In, .NotIn => unreachable, // Already handled above
             .IsNull, .IsNotNull, .Between, .NotBetween => unreachable, // Already handled above
         };
@@ -1705,37 +2057,54 @@ pub const VirtualMachine = struct {
 
     /// Evaluate IN condition with InList or Subquery
     fn evaluateInCondition(self: *Self, left_value: storage.Value, right_expr: *const ast.Expression, row: *const storage.Row) anyerror!bool {
+        return (try self.evaluateInConditionTruth(left_value, right_expr, row)) == .True;
+    }
+
+    fn evaluateInConditionTruth(self: *Self, left_value: storage.Value, right_expr: *const ast.Expression, row: *const storage.Row) anyerror!SqlTruth {
+        if (left_value == .Null) return .Unknown;
+
         switch (right_expr.*) {
             .InList => |list| {
                 // Check if left_value matches any value in the list
+                var saw_null = false;
                 for (list) |ast_val| {
                     const val = try self.convertAstValueToStorage(ast_val);
                     defer val.deinit(self.connection.allocator);
+                    if (val == .Null) {
+                        saw_null = true;
+                        continue;
+                    }
                     if (self.compareValues(left_value, val) == .eq) {
-                        return true;
+                        return .True;
                     }
                 }
-                return false;
+                return if (saw_null) .Unknown else .False;
             },
             .Subquery => |subquery| {
                 // Execute subquery and check if left_value matches any result
                 var result = try self.executeSubquery(subquery);
                 defer result.deinit();
 
+                var saw_null = false;
                 for (result.rows.items) |subrow| {
                     if (subrow.values.len > 0) {
+                        if (subrow.values[0] == .Null) {
+                            saw_null = true;
+                            continue;
+                        }
                         if (self.compareValues(left_value, subrow.values[0]) == .eq) {
-                            return true;
+                            return .True;
                         }
                     }
                 }
-                return false;
+                return if (saw_null) .Unknown else .False;
             },
             else => {
                 // Fall back to simple equality comparison
                 const right_value = try self.evaluateExpression(right_expr, row);
                 defer right_value.deinit(self.connection.allocator);
-                return self.compareValues(left_value, right_value) == .eq;
+                if (right_value == .Null) return .Unknown;
+                return boolTruth(self.compareValues(left_value, right_value) == .eq);
             },
         }
     }
@@ -3584,9 +3953,29 @@ pub const VirtualMachine = struct {
         try self.connection.rollbackTransaction();
     }
 
+    fn executeSavepoint(self: *Self, savepoint: *planner.SavepointStep, result: *ExecutionResult) !void {
+        _ = result;
+        try self.connection.createSavepoint(savepoint.name);
+    }
+
+    fn executeReleaseSavepoint(self: *Self, savepoint: *planner.SavepointStep, result: *ExecutionResult) !void {
+        _ = result;
+        try self.connection.releaseSavepoint(savepoint.name);
+    }
+
+    fn executeRollbackToSavepoint(self: *Self, savepoint: *planner.SavepointStep, result: *ExecutionResult) !void {
+        _ = result;
+        try self.connection.rollbackToSavepoint(savepoint.name);
+    }
+
+    fn rejectSchemaChangeInSavepoint(self: *Self) !void {
+        if (self.connection.hasActiveSavepoints()) return error.UnsupportedDDLInSavepoint;
+    }
+
     /// Execute CREATE INDEX
     fn executeCreateIndex(self: *Self, create_idx: *planner.CreateIndexStep, result: *ExecutionResult) !void {
         _ = result;
+        try self.rejectSchemaChangeInSavepoint();
 
         // Check if table exists
         const table = self.connection.storage_engine.getTable(create_idx.table_name) orelse {
@@ -3628,6 +4017,7 @@ pub const VirtualMachine = struct {
     /// Execute DROP INDEX
     fn executeDropIndex(self: *Self, drop_idx: *planner.DropIndexStep, result: *ExecutionResult) !void {
         _ = result;
+        try self.rejectSchemaChangeInSavepoint();
 
         // Check if index exists
         if (self.connection.storage_engine.getIndex(drop_idx.index_name) == null) {
@@ -3647,6 +4037,7 @@ pub const VirtualMachine = struct {
     /// Execute DROP TABLE
     fn executeDropTable(self: *Self, drop_tbl: *planner.DropTableStep, result: *ExecutionResult) !void {
         _ = result;
+        try self.rejectSchemaChangeInSavepoint();
 
         // Check if table exists
         if (self.connection.storage_engine.getTable(drop_tbl.table_name) == null) {
@@ -3822,18 +4213,21 @@ pub const VirtualMachine = struct {
     /// Execute ATTACH DATABASE statement
     fn executeAttach(self: *Self, attach: *planner.AttachStep, result: *ExecutionResult) !void {
         _ = result; // ATTACH doesn't return rows
+        try self.rejectSchemaChangeInSavepoint();
         try self.connection.attachDatabase(attach.file_path, attach.schema_name);
     }
 
     /// Execute DETACH DATABASE statement
     fn executeDetach(self: *Self, detach: *planner.DetachStep, result: *ExecutionResult) !void {
         _ = result; // DETACH doesn't return rows
+        try self.rejectSchemaChangeInSavepoint();
         try self.connection.detachDatabase(detach.schema_name);
     }
 
     /// Execute CREATE VIRTUAL TABLE statement (FTS5)
     fn executeCreateVirtualTable(self: *Self, create_vt: *planner.CreateVirtualTableStep, result: *ExecutionResult) !void {
         _ = result; // CREATE doesn't return rows
+        try self.rejectSchemaChangeInSavepoint();
         const allocator = self.connection.allocator;
 
         // Only FTS5 module is currently supported
@@ -4484,6 +4878,9 @@ pub const VirtualMachine = struct {
             .BeginTransaction => try allocator.dupe(u8, "BEGIN TRANSACTION"),
             .Commit => try allocator.dupe(u8, "COMMIT"),
             .Rollback => try allocator.dupe(u8, "ROLLBACK"),
+            .Savepoint => |savepoint| try std.fmt.allocPrint(allocator, "SAVEPOINT {s}", .{savepoint.name}),
+            .ReleaseSavepoint => |savepoint| try std.fmt.allocPrint(allocator, "RELEASE SAVEPOINT {s}", .{savepoint.name}),
+            .RollbackToSavepoint => |savepoint| try std.fmt.allocPrint(allocator, "ROLLBACK TO SAVEPOINT {s}", .{savepoint.name}),
             .CreateIndex => |idx| try std.fmt.allocPrint(allocator, "CREATE INDEX {s} ON {s}", .{ idx.index_name, idx.table_name }),
             .DropIndex => |idx| try std.fmt.allocPrint(allocator, "DROP INDEX {s}", .{idx.index_name}),
             .DropTable => |drop| try std.fmt.allocPrint(allocator, "DROP TABLE {s}", .{drop.table_name}),

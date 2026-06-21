@@ -130,10 +130,14 @@ fn demoSimplifiedParameterBinding(conn: *zqlite.Connection) !void {
 
     try stmt3.bind(0, "user456");
     try stmt3.bind(1, "user2@example.com");
-    try stmt3.bind(2, optional_name); // Optional -> NULL
+    if (optional_name) |name| {
+        try stmt3.bind(2, name);
+    } else {
+        try stmt3.bindNull(2);
+    }
     _ = try stmt3.execute();
 
-    std.debug.print("   ✅ Optional types automatically convert to NULL\n", .{});
+    std.debug.print("   ✅ Optional values bind explicitly as values or NULL\n", .{});
 }
 
 /// Test the new transaction convenience methods

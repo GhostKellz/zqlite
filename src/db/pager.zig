@@ -190,10 +190,30 @@ pub const Pager = struct {
     cache_hits: u64,
     cache_misses: u64,
     encryption: encryption.Encryption,
+    fault_once: ?FaultPoint,
 
     const Self = @This();
     pub const DEFAULT_PAGE_SIZE = 4096;
     const MAX_CACHED_PAGES = 1000;
+
+    pub const FaultPoint = enum {
+        read,
+        write,
+        partial_write,
+        sync,
+    };
+
+    pub fn injectFaultOnce(self: *Self, point: FaultPoint) void {
+        self.fault_once = point;
+    }
+
+    fn consumeFault(self: *Self, point: FaultPoint) bool {
+        if (self.fault_once == point) {
+            self.fault_once = null;
+            return true;
+        }
+        return false;
+    }
 
     /// Initialize pager with file backing
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !*Self {
@@ -210,6 +230,7 @@ pub const Pager = struct {
         // SECURITY: Default to no encryption for backwards compatibility.
         // For production use with sensitive data, call setEncryption() after init.
         pager.encryption = encryption.Encryption.initPlain();
+        pager.fault_once = null;
 
         if (comptime native_os == .windows) {
             allocator.destroy(pager);
@@ -231,7 +252,7 @@ pub const Pager = struct {
         pager.fd = fd;
 
         // Read existing page count from file size using lseek
-        const file_size = getFileSize(fd) catch 0;
+        const file_size = try getFileSize(fd);
         if (file_size > 0) {
             pager.next_page_id = @intCast(file_size / DEFAULT_PAGE_SIZE + 1);
         }
@@ -253,6 +274,7 @@ pub const Pager = struct {
         // SECURITY: In-memory databases use no encryption by default.
         // This is typically acceptable since data doesn't persist to disk.
         pager.encryption = encryption.Encryption.initPlain();
+        pager.fault_once = null;
 
         return pager;
     }
@@ -307,6 +329,7 @@ pub const Pager = struct {
         if (!self.is_memory) {
             const offset: i64 = @as(i64, page_id - 1) * @as(i64, self.page_size);
             if (self.fd) |fd| {
+                if (self.consumeFault(.read)) return error.InjectedReadFailure;
                 const bytes_read = try preadAll(fd, page.data, offset);
                 if (bytes_read < self.page_size) {
                     @memset(page.data[bytes_read..], 0);
@@ -356,7 +379,8 @@ pub const Pager = struct {
 
         // Sync file to disk
         if (self.fd) |fd| {
-            posix.fdatasync(fd) catch {};
+            if (self.consumeFault(.sync)) return error.InjectedSyncFailure;
+            try posix.fdatasync(fd);
         }
     }
 
@@ -364,6 +388,12 @@ pub const Pager = struct {
     fn writePage(self: *Self, page: *Page) !void {
         const offset: i64 = @as(i64, page.id - 1) * @as(i64, self.page_size);
         if (self.fd) |fd| {
+            if (self.consumeFault(.write)) return error.InjectedWriteFailure;
+            if (self.consumeFault(.partial_write)) {
+                const partial_len = @max(@as(usize, 1), page.data.len / 2);
+                try pwriteAll(fd, page.data[0..partial_len], offset);
+                return error.InjectedPartialWrite;
+            }
             try pwriteAll(fd, page.data, offset);
         }
     }

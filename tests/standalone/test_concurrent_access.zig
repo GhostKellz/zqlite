@@ -1,12 +1,17 @@
 const std = @import("std");
 const zqlite = @import("zqlite");
+const temp_dir = @import("temp_dir.zig");
+
+var test_dir: temp_dir.TempDir = undefined;
 
 /// Test concurrent access to same database file
 /// Uses multiple threads to simulate concurrent connections
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    test_dir = try .init(init.io, allocator, "zqlite-concurrent");
+    defer test_dir.deinit();
 
     std.log.info("=== Concurrent Access Tests ===", .{});
 
@@ -19,7 +24,8 @@ pub fn main() !void {
 
 fn testMultipleReaders(allocator: std.mem.Allocator) !void {
     std.log.info("[TEST] Multiple sequential readers", .{});
-    const path = "/tmp/zqlite_concurrent_read.db";
+    const path = try test_dir.dbPath("read.db");
+    defer allocator.free(path);
 
     // Setup: create database with data
     {
@@ -78,7 +84,8 @@ fn testMultipleReaders(allocator: std.mem.Allocator) !void {
 
 fn testReaderWriter(allocator: std.mem.Allocator) !void {
     std.log.info("[TEST] Reader and writer connections", .{});
-    const path = "/tmp/zqlite_concurrent_rw.db";
+    const path = try test_dir.dbPath("rw.db");
+    defer allocator.free(path);
 
     // Setup
     {
@@ -113,7 +120,8 @@ fn testReaderWriter(allocator: std.mem.Allocator) !void {
 
 fn testSequentialConnections(allocator: std.mem.Allocator) !void {
     std.log.info("[TEST] Rapid sequential connections", .{});
-    const path = "/tmp/zqlite_concurrent_seq.db";
+    const path = try test_dir.dbPath("seq.db");
+    defer allocator.free(path);
 
     // Setup
     {

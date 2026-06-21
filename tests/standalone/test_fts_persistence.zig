@@ -1,16 +1,18 @@
 const std = @import("std");
 const zqlite = @import("zqlite");
+const temp_dir = @import("temp_dir.zig");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
-    const io = std.Options.debug_io;
+    var test_dir = try temp_dir.TempDir.init(init.io, allocator, "zqlite-fts");
+    defer test_dir.deinit();
 
     std.log.info("=== FTS Persistence Tests ===", .{});
 
-    const path = "/tmp/zqlite_fts_persistence.db";
-    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const path = try test_dir.dbPath("fts_persistence.db");
+    defer allocator.free(path);
 
     {
         var conn = try zqlite.open(allocator, path);
@@ -49,6 +51,5 @@ pub fn main() !void {
         std.log.info("[PASS] FTS metadata and inserts survive reopen", .{});
     }
 
-    std.Io.Dir.cwd().deleteFile(io, path) catch {};
     std.log.info("=== ALL FTS PERSISTENCE TESTS PASSED ===", .{});
 }

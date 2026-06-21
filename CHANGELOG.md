@@ -5,6 +5,52 @@ All notable changes to ZQLite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.8] - 2026-06-21
+
+### Added
+- **Authoritative release validation target** - `zig build check` now runs the stable release validation gate used for local release confidence.
+- **Explicit SQLite differential target** - added `zig build test-sqlite-diff`, an opt-in compatibility suite that requires `sqlite3` on `PATH` and compares ZQLite behavior against SQLite for the currently supported subset.
+- **SQL compatibility matrix** - added `tests/sql_compatibility.tsv`, `scripts/generate-sql-compat-matrix.sh`, and `docs/sql-compatibility.md` to make supported/partial/unsupported SQL behavior explicit and machine-readable.
+- **DML savepoint support** - implemented `SAVEPOINT`, `RELEASE [SAVEPOINT]`, and `ROLLBACK TO [SAVEPOINT]` for row-level changes.
+  - Covered nested savepoints, rollback-to-inner-savepoint behavior, release semantics, outer-savepoint implicit commit, file-backed/WAL persistence, FK cascade rollback, and unique-index refresh after rollback.
+  - Schema/catalog changes inside active savepoints now fail explicitly with `error.UnsupportedDDLInSavepoint` rather than pretending DDL rollback is supported.
+- **Named prepared-statement parameters** - added `:name`, `@name`, and `$name` parsing/binding support.
+  - Zig prepared statements now support `bindNamed(...)`, including repeated-name binding.
+  - C ABI now exposes `zqlite_bind_int_named`, `zqlite_bind_text_named`, `zqlite_bind_real_named`, `zqlite_bind_null_named`, and `zqlite_bind_blob_named`.
+- **Stable public error categories** - added Zig `ErrorCategory` / `categorizeError(...)` and C `zqlite_errcategory(...)` with category constants for application-level error branching.
+- **C ABI metadata and row access** - added explicit ABI version exports, symbol visibility controls, prepared-statement row stepping, typed column access, column names, blob binding, and package-consumer coverage for C99/C++ modes.
+
+### Changed
+- **Standalone file-backed tests now use per-run temp directories** - replaced hardcoded `/tmp/zqlite_test_*.db` paths and brittle cleanup lists with a unique temp-directory harness and single tree cleanup.
+- **Benchmark validation is less noisy and more defensible** - benchmark validation now uses a monotonic clock, warmups, five samples, median/p95 reporting, isolated UPDATE measurements, and one in-source threshold table.
+- **Public API ownership docs** - documented result/row/value ownership and borrowing rules for the Zig API.
+- **C API docs** - documented prepared-statement stepping, borrowed/caller-freed ownership, named binding functions, ABI versioning, and error categories.
+- **SQLite compatibility docs** - updated the compatibility docs for SAVEPOINT, named parameters, foreign-key actions, DEFAULT VALUES, and explicitly unsupported DDL savepoint rollback.
+
+### Fixed
+- **Durability and storage error handling** - stopped suppressing critical WAL checkpoint, metadata save, pager flush, and sync errors.
+  - Added fallible flush/close semantics and tests for injected write, sync, WAL, checkpoint, and recovery failures.
+  - Preserved the rule that a durable commit record remains committed even if later checkpoint/flush work fails.
+- **Metadata catalog scalability and integrity** - replaced fixed single-page metadata with a versioned multi-page catalog, checksums, feature flags, explicit format-version checks, and legacy migration coverage.
+- **UNIQUE semantics** - UNIQUE indexes and constraints now treat NULL values as distinct.
+  - Inline column `UNIQUE` and table-level `UNIQUE(...)` constraints are planned, enforced through persisted auto-indexes, and verified across close/reopen.
+- **CHECK constraints** - column/table CHECK constraints are now planned, persisted, and enforced on INSERT/UPDATE using SQL semantics where only FALSE rejects and UNKNOWN/NULL passes.
+- **Foreign keys** - implemented supported single-column FK enforcement.
+  - Child INSERT/UPDATE parent existence is checked.
+  - Parent DELETE/UPDATE RESTRICT/NO ACTION is enforced.
+  - `ON DELETE CASCADE`, `ON DELETE SET NULL`, and `ON UPDATE CASCADE` are executed and covered by file-backed and differential tests.
+- **NULL three-valued logic** - fixed NULL propagation for `IN`, `LIKE`, `AND`, and `OR`; WHERE treats UNKNOWN as non-matching and CHECK allows UNKNOWN.
+- **INSERT DEFAULT VALUES and function defaults** - added `INSERT ... DEFAULT VALUES` and verified literal/function defaults including `CURRENT_TIMESTAMP` on partial inserts and close/reopen.
+- **C ABI behavior** - `zqlite_step` now returns row/done semantics instead of discarding result rows, and the C ABI allocator uses a thread-safe `SafeAllocator`.
+- **Public OpenOptions duplication** - top-level `OpenOptions` is now the active `db.ConnectionOptions` alias.
+
+### Verified
+- `zig fmt --check src/ tests/ build.zig`
+- `zig build check --summary all`
+- `zig build test-sqlite-diff --summary all`
+- C ABI header/export/constant consistency check
+- C package consumer smoke tests in C99 and C++ modes
+
 ## [1.6.7] - 2026-06-12
 
 ### Fixed

@@ -558,5 +558,5 @@ pub fn main() !void {
 
     std.debug.print("\n✅ Blockchain Integration Demo completed!\n", .{});
     const version = zqlite.version;
-    std.debug.print("{s} provides secure, high-performance blockchain data storage\n", .{version.FULL_VERSION_STRING});
+    std.debug.print("{s} blockchain design sketch uses simulated integrations and is not production-ready\n", .{version.FULL_VERSION_STRING});
 }

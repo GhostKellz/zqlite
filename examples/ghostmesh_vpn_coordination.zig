@@ -1,9 +1,9 @@
 const std = @import("std");
 const zqlite = @import("zqlite");
 
-/// 🔒 GhostMesh VPN Coordination Server using ZQLite
-/// Manages peer connections, routing tables, and secure tunnels for mesh VPN
-/// Provides centralized coordination for decentralized mesh network
+/// GhostMesh VPN coordination design sketch using ZQLite.
+/// Networking, key agreement, authentication, and persistence paths are simulated.
+/// This source-only demonstration is not a deployable VPN coordinator.
 const VPNError = error{
     PeerNotFound,
     InvalidCredentials,

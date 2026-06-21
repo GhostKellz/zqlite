@@ -26,6 +26,9 @@ pub const Planner = struct {
             .BeginTransaction => |*trans| try self.planTransaction(trans),
             .Commit => |*trans| try self.planCommit(trans),
             .Rollback => |*trans| try self.planRollback(trans),
+            .Savepoint => |*trans| try self.planSavepoint(trans),
+            .ReleaseSavepoint => |*trans| try self.planReleaseSavepoint(trans),
+            .RollbackToSavepoint => |*trans| try self.planRollbackToSavepoint(trans),
             .CreateIndex => |*create_idx| try self.planCreateIndex(create_idx),
             .DropIndex => |*drop_idx| try self.planDropIndex(drop_idx),
             .DropTable => |*drop_tbl| try self.planDropTable(drop_tbl),
@@ -450,13 +453,60 @@ pub const Planner = struct {
                     }
                     break :blk null;
                 },
+                .is_unique = blk: {
+                    for (col_def.constraints) |constraint| {
+                        if (constraint == .Unique) break :blk true;
+                    }
+                    break :blk false;
+                },
             });
+        }
+
+        var unique_constraints: std.ArrayListUnmanaged(UniqueConstraintStep) = .empty;
+        var check_constraints: std.ArrayListUnmanaged(ast.Condition) = .empty;
+        var foreign_keys: std.ArrayListUnmanaged(ast.ForeignKeyConstraint) = .empty;
+
+        for (create.columns) |col_def| {
+            for (col_def.constraints) |constraint| {
+                if (constraint == .Check) {
+                    try check_constraints.append(self.allocator, try self.cloneCondition(&constraint.Check.condition));
+                } else if (constraint == .ForeignKey) {
+                    try foreign_keys.append(self.allocator, try self.cloneForeignKeyWithColumn(constraint.ForeignKey, col_def.name));
+                }
+            }
+        }
+
+        for (create.table_constraints) |constraint| {
+            switch (constraint) {
+                .Unique => |unique| {
+                    var unique_columns = try self.allocator.alloc([]const u8, unique.columns.len);
+                    errdefer self.allocator.free(unique_columns);
+
+                    for (unique.columns, 0..) |column, i| {
+                        unique_columns[i] = try self.allocator.dupe(u8, column);
+                    }
+
+                    try unique_constraints.append(self.allocator, .{
+                        .columns = unique_columns,
+                    });
+                },
+                .Check => |check| {
+                    try check_constraints.append(self.allocator, try self.cloneCondition(&check.condition));
+                },
+                .ForeignKey => |foreign_key| {
+                    try foreign_keys.append(self.allocator, try self.cloneForeignKeyWithColumn(foreign_key, foreign_key.column orelse return error.ColumnNotFound));
+                },
+                else => {},
+            }
         }
 
         try steps.append(self.allocator, ExecutionStep{
             .CreateTable = CreateTableStep{
                 .table_name = try self.allocator.dupe(u8, create.table_name),
                 .columns = try columns.toOwnedSlice(self.allocator),
+                .unique_constraints = try unique_constraints.toOwnedSlice(self.allocator),
+                .check_constraints = try check_constraints.toOwnedSlice(self.allocator),
+                .foreign_keys = try foreign_keys.toOwnedSlice(self.allocator),
                 .if_not_exists = create.if_not_exists,
             },
         });
@@ -588,6 +638,42 @@ pub const Planner = struct {
         };
     }
 
+    fn planSavepoint(self: *Self, trans: *const ast.TransactionStatement) !ExecutionPlan {
+        const name = trans.savepoint_name orelse return error.ExpectedIdentifier;
+        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        try steps.append(self.allocator, ExecutionStep{
+            .Savepoint = SavepointStep{ .name = try self.allocator.dupe(u8, name) },
+        });
+        return ExecutionPlan{
+            .steps = try steps.toOwnedSlice(self.allocator),
+            .allocator = self.allocator,
+        };
+    }
+
+    fn planReleaseSavepoint(self: *Self, trans: *const ast.TransactionStatement) !ExecutionPlan {
+        const name = trans.savepoint_name orelse return error.ExpectedIdentifier;
+        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        try steps.append(self.allocator, ExecutionStep{
+            .ReleaseSavepoint = SavepointStep{ .name = try self.allocator.dupe(u8, name) },
+        });
+        return ExecutionPlan{
+            .steps = try steps.toOwnedSlice(self.allocator),
+            .allocator = self.allocator,
+        };
+    }
+
+    fn planRollbackToSavepoint(self: *Self, trans: *const ast.TransactionStatement) !ExecutionPlan {
+        const name = trans.savepoint_name orelse return error.ExpectedIdentifier;
+        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        try steps.append(self.allocator, ExecutionStep{
+            .RollbackToSavepoint = SavepointStep{ .name = try self.allocator.dupe(u8, name) },
+        });
+        return ExecutionPlan{
+            .steps = try steps.toOwnedSlice(self.allocator),
+            .allocator = self.allocator,
+        };
+    }
+
     /// Plan create index statement
     fn planCreateIndex(self: *Self, create_idx: *const ast.CreateIndexStatement) !ExecutionPlan {
         var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
@@ -674,6 +760,16 @@ pub const Planner = struct {
                     },
                 };
             },
+        };
+    }
+
+    fn cloneForeignKeyWithColumn(self: *Self, foreign_key: ast.ForeignKeyConstraint, column_name: []const u8) !ast.ForeignKeyConstraint {
+        return .{
+            .column = try self.allocator.dupe(u8, column_name),
+            .reference_table = try self.allocator.dupe(u8, foreign_key.reference_table),
+            .reference_column = try self.allocator.dupe(u8, foreign_key.reference_column),
+            .on_delete = foreign_key.on_delete,
+            .on_update = foreign_key.on_update,
         };
     }
 
@@ -1269,6 +1365,9 @@ pub const ExecutionStep = union(enum) {
     BeginTransaction,
     Commit,
     Rollback,
+    Savepoint: SavepointStep,
+    ReleaseSavepoint: SavepointStep,
+    RollbackToSavepoint: SavepointStep,
     CreateIndex: CreateIndexStep,
     DropIndex: DropIndexStep,
     DropTable: DropTableStep,
@@ -1301,6 +1400,9 @@ pub const ExecutionStep = union(enum) {
             .BeginTransaction => {},
             .Commit => {},
             .Rollback => {},
+            .Savepoint => |*step| step.deinit(allocator),
+            .ReleaseSavepoint => |*step| step.deinit(allocator),
+            .RollbackToSavepoint => |*step| step.deinit(allocator),
             .CreateIndex => |*step| step.deinit(allocator),
             .DropIndex => |*step| step.deinit(allocator),
             .DropTable => |*step| step.deinit(allocator),
@@ -1315,6 +1417,14 @@ pub const ExecutionStep = union(enum) {
             .Detach => |*step| step.deinit(allocator),
             .CreateVirtualTable => |*step| step.deinit(allocator),
         }
+    }
+};
+
+pub const SavepointStep = struct {
+    name: []const u8,
+
+    pub fn deinit(self: *SavepointStep, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
     }
 };
 
@@ -1461,6 +1571,9 @@ pub const InsertStep = struct {
 pub const CreateTableStep = struct {
     table_name: []const u8,
     columns: []storage.Column,
+    unique_constraints: []UniqueConstraintStep,
+    check_constraints: []ast.Condition,
+    foreign_keys: []ast.ForeignKeyConstraint,
     if_not_exists: bool,
 
     pub fn deinit(self: *CreateTableStep, allocator: std.mem.Allocator) void {
@@ -1470,6 +1583,29 @@ pub const CreateTableStep = struct {
             if (column.default_value) |default_value| {
                 default_value.deinit(allocator);
             }
+        }
+        allocator.free(self.columns);
+        for (self.unique_constraints) |*constraint| {
+            constraint.deinit(allocator);
+        }
+        allocator.free(self.unique_constraints);
+        for (self.check_constraints) |*condition| {
+            condition.deinit(allocator);
+        }
+        allocator.free(self.check_constraints);
+        for (self.foreign_keys) |foreign_key| {
+            foreign_key.deinit(allocator);
+        }
+        allocator.free(self.foreign_keys);
+    }
+};
+
+pub const UniqueConstraintStep = struct {
+    columns: [][]const u8,
+
+    pub fn deinit(self: *UniqueConstraintStep, allocator: std.mem.Allocator) void {
+        for (self.columns) |column| {
+            allocator.free(column);
         }
         allocator.free(self.columns);
     }

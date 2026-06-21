@@ -37,11 +37,12 @@ Current package dependency footprint: no external Zig package dependencies.
 - Prepared statements with parameter binding
 - C FFI bindings
 
-**Experimental features** (not stable):
+**Experimental features** (explicit opt-in, not stable):
 - Post-quantum crypto scaffolding (ML-KEM, ML-DSA)
 - Transport layer hooks
 
 See [Stable vs Experimental](docs/security/stable-vs-experimental.md) for details.
+See [Stability and Compatibility Policy](docs/project/stability-policy.md) for the supported API, ABI, and database-format boundaries.
 
 ## Install
 
@@ -111,6 +112,8 @@ cd zqlite
 zig build
 zig build test
 ```
+
+The default `advanced` profile enables stable optional features and the C ABI, but not crypto or transport scaffolding. Use `-Dprofile=core` for the minimal engine or `-Dprofile=experimental` for explicitly experimental modules. Examples are built separately with `zig build examples`.
 
 ## Test
 

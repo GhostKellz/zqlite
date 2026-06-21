@@ -7,24 +7,29 @@ pub fn build(b: *std.Build) void {
     // ============================================================
     // Build Profiles
     // ============================================================
-    // core     = SQLite-like minimal (db, parser, executor)
-    // advanced = PostgreSQL features (core + json, performance, concurrent)
-    // full     = Everything (advanced + crypto, transport, cluster, ffi)
-    const profile = b.option([]const u8, "profile", "Build profile: core, advanced, full (default: full)") orelse "full";
+    // core         = stable embedded database core
+    // advanced     = stable default (core + json, performance, concurrent, ffi)
+    // experimental = advanced + crypto and simulated transport scaffolding
+    // full         = compatibility alias for experimental
+    const Profile = enum { core, advanced, experimental, full };
+    const requested_profile = b.option(Profile, "profile", "Build profile: core, advanced, experimental (full is an alias)") orelse .advanced;
+    const is_advanced = requested_profile == .advanced;
+    const is_experimental = requested_profile == .experimental or requested_profile == .full;
+    const profile = if (is_experimental) "experimental" else @tagName(requested_profile);
 
     // Individual feature flags (can override profile defaults)
     const enable_crypto = b.option(bool, "crypto", "Enable post-quantum crypto") orelse
-        std.mem.eql(u8, profile, "full");
+        is_experimental;
     const enable_transport = b.option(bool, "transport", "Enable PQ-QUIC transport") orelse
-        std.mem.eql(u8, profile, "full");
+        is_experimental;
     const enable_json = b.option(bool, "json", "Enable JSON support") orelse
-        (std.mem.eql(u8, profile, "advanced") or std.mem.eql(u8, profile, "full"));
+        (is_advanced or is_experimental);
     const enable_performance = b.option(bool, "performance", "Enable query cache/connection pool") orelse
-        (std.mem.eql(u8, profile, "advanced") or std.mem.eql(u8, profile, "full"));
+        (is_advanced or is_experimental);
     const enable_concurrent = b.option(bool, "concurrent", "Enable async operations") orelse
-        (std.mem.eql(u8, profile, "advanced") or std.mem.eql(u8, profile, "full"));
+        (is_advanced or is_experimental);
     const enable_ffi = b.option(bool, "ffi", "Enable C API") orelse
-        std.mem.eql(u8, profile, "full");
+        (is_advanced or is_experimental);
 
     // Build metadata options
     const build_options = b.addOptions();
@@ -72,10 +77,11 @@ pub fn build(b: *std.Build) void {
     // Install the library
     b.installArtifact(lib);
 
-    // Create C library for FFI (only if enabled)
+    // Create static and shared C ABI libraries when FFI is enabled.
     if (enable_ffi) {
-        const c_lib = b.addLibrary(.{
+        const c_lib_static = b.addLibrary(.{
             .name = "zqlite_c",
+            .linkage = .static,
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/ffi/c_api.zig"),
                 .target = target,
@@ -83,12 +89,24 @@ pub fn build(b: *std.Build) void {
             }),
         });
 
-        // Link the main library to the C FFI
-        c_lib.root_module.addImport("zqlite", lib.root_module);
+        c_lib_static.root_module.addImport("zqlite", lib.root_module);
+        b.installArtifact(c_lib_static);
 
-        // Install the C library
-        b.installArtifact(c_lib);
+        const c_lib_shared = b.addLibrary(.{
+            .name = "zqlite_c",
+            .linkage = .dynamic,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/ffi/c_api.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        c_lib_shared.root_module.addImport("zqlite", lib.root_module);
+        b.installArtifact(c_lib_shared);
     }
+
+    // The installed C header is part of the supported C ABI contract.
+    b.getInstallStep().dependOn(&b.addInstallHeaderFile(b.path("include/zqlite.h"), "zqlite.h").step);
 
     // Export the zqlite module for use by other packages
     const zqlite_module = b.addModule("zqlite", .{
@@ -359,18 +377,6 @@ pub fn build(b: *std.Build) void {
 
     const run_file_backed_test = b.addRunArtifact(file_backed_test);
 
-    // Cleanup for file-backed tests
-    const cleanup_file_backed = b.addSystemCommand(&.{ "rm", "-f" });
-    cleanup_file_backed.addArgs(&.{
-        "/tmp/zqlite_test_basic.db",
-        "/tmp/zqlite_test_insert.db",
-        "/tmp/zqlite_test_multi.db",
-        "/tmp/zqlite_test_persist.db",
-        "/tmp/zqlite_test_update.db",
-        "/tmp/zqlite_test_large.db",
-    });
-    run_file_backed_test.step.dependOn(&cleanup_file_backed.step);
-
     const file_backed_step = b.step("test-file-backed", "Run file-backed storage persistence tests");
     file_backed_step.dependOn(&run_file_backed_test.step);
 
@@ -389,15 +395,6 @@ pub fn build(b: *std.Build) void {
 
     const run_transaction_test = b.addRunArtifact(transaction_test);
 
-    // Cleanup for transaction tests
-    const cleanup_transaction = b.addSystemCommand(&.{ "rm", "-f" });
-    cleanup_transaction.addArgs(&.{
-        "/tmp/zqlite_txn_commit.db",
-        "/tmp/zqlite_txn_rollback.db",
-        "/tmp/zqlite_txn_nested.db",
-    });
-    run_transaction_test.step.dependOn(&cleanup_transaction.step);
-
     const transaction_step = b.step("test-transaction", "Run transaction atomicity tests (COMMIT/ROLLBACK persistence)");
     transaction_step.dependOn(&run_transaction_test.step);
 
@@ -405,6 +402,65 @@ pub fn build(b: *std.Build) void {
     const storage_step = b.step("test-storage", "Run all storage tests (file-backed + transaction atomicity)");
     storage_step.dependOn(&run_file_backed_test.step);
     storage_step.dependOn(&run_transaction_test.step);
+
+    const durability_error_test = b.addExecutable(.{
+        .name = "test_durability_errors",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/standalone/test_durability_errors.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    durability_error_test.root_module.addImport("zqlite", lib.root_module);
+    durability_error_test.root_module.addOptions("build_options", build_options);
+    const run_durability_error_test = b.addRunArtifact(durability_error_test);
+    const durability_error_step = b.step("test-durability-errors", "Run injected persistence failure tests");
+    durability_error_step.dependOn(&run_durability_error_test.step);
+    storage_step.dependOn(&run_durability_error_test.step);
+
+    const wal_recovery_test = b.addExecutable(.{
+        .name = "test_wal_recovery",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/standalone/test_wal_recovery.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    wal_recovery_test.root_module.addImport("zqlite", lib.root_module);
+    wal_recovery_test.root_module.addOptions("build_options", build_options);
+    const run_wal_recovery_test = b.addRunArtifact(wal_recovery_test);
+    const wal_recovery_step = b.step("test-wal-recovery", "Run WAL corruption and crash-recovery tests");
+    wal_recovery_step.dependOn(&run_wal_recovery_test.step);
+    storage_step.dependOn(&run_wal_recovery_test.step);
+
+    const catalog_format_test = b.addExecutable(.{
+        .name = "test_catalog_format",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/standalone/test_catalog_format.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    catalog_format_test.root_module.addImport("zqlite", lib.root_module);
+    catalog_format_test.root_module.addOptions("build_options", build_options);
+    const run_catalog_format_test = b.addRunArtifact(catalog_format_test);
+    const catalog_format_step = b.step("test-catalog-format", "Run catalog format, corruption, and migration tests");
+    catalog_format_step.dependOn(&run_catalog_format_test.step);
+    storage_step.dependOn(&run_catalog_format_test.step);
+
+    const sqlite_diff_test = b.addExecutable(.{
+        .name = "test_sqlite_diff",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/standalone/test_sqlite_diff.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    sqlite_diff_test.root_module.addImport("zqlite", lib.root_module);
+    sqlite_diff_test.root_module.addOptions("build_options", build_options);
+    const run_sqlite_diff_test = b.addRunArtifact(sqlite_diff_test);
+    const sqlite_diff_step = b.step("test-sqlite-diff", "Run explicit SQLite differential tests; requires sqlite3 on PATH");
+    sqlite_diff_step.dependOn(&run_sqlite_diff_test.step);
 
     if (enable_ffi) {
         const c_api_tests = b.addTest(.{
@@ -476,24 +532,47 @@ pub fn build(b: *std.Build) void {
     const minimal_bench_step = b.step("bench-minimal", "Run minimal benchmark (debug)");
     minimal_bench_step.dependOn(&run_minimal_bench.step);
 
-    // Basic examples that work without external dependencies
-    createBasicExample(b, "powerdns_example", lib, target, optimize, build_options);
-    createBasicExample(b, "cipher_dns", lib, target, optimize, build_options);
+    // Examples are explicit opt-in artifacts and are not part of the default install.
+    const examples_step = b.step("examples", "Build and install examples supported by the selected profile");
 
-    // v1.2.2 Universal API examples
-    createBasicExample(b, "universal_api_demo", lib, target, optimize, build_options);
-    createBasicExample(b, "web_backend_demo", lib, target, optimize, build_options);
+    const stable_examples = [_][]const u8{
+        "powerdns_example",
+        "cipher_dns",
+        "simple_api_test",
+        "improved_api_demo",
+        "insert_memory_regression_test",
+        "datetime_test",
+        "demo_enhanced_features",
+        "advanced_indexing_demo",
+        "universal_api_demo",
+        "web_backend_demo",
+    };
+    for (stable_examples) |name| {
+        createBasicExample(b, examples_step, name, lib, target, optimize, build_options);
+    }
 
     // v1.3.0 PostgreSQL compatibility demos
-    createDemo(b, "uuid_demo", lib, target, optimize, build_options);
-    createDemo(b, "json_demo", lib, target, optimize, build_options);
-    createDemo(b, "connection_pool_demo", lib, target, optimize, build_options);
-    createDemo(b, "window_functions_demo", lib, target, optimize, build_options);
-    createDemo(b, "query_cache_demo", lib, target, optimize, build_options);
-    createDemo(b, "array_operations_demo", lib, target, optimize, build_options);
+    createDemo(b, examples_step, "uuid_demo", lib, target, optimize, build_options);
+    if (enable_json) createDemo(b, examples_step, "json_demo", lib, target, optimize, build_options);
+    createDemo(b, examples_step, "connection_pool_demo", lib, target, optimize, build_options);
+    createDemo(b, examples_step, "window_functions_demo", lib, target, optimize, build_options);
+    if (enable_performance) createDemo(b, examples_step, "query_cache_demo", lib, target, optimize, build_options);
+    createDemo(b, examples_step, "array_operations_demo", lib, target, optimize, build_options);
+
+    const check_c_api_cmd = b.addSystemCommand(&.{ "bash", "scripts/check-c-api.sh" });
+    const check_c_api_step = b.step("check-c-api", "Verify that the C header matches implementation exports and constants");
+    check_c_api_step.dependOn(&check_c_api_cmd.step);
+
+    const release_smoke_cmd = b.addSystemCommand(&.{ "bash", "scripts/test-release-package.sh" });
+    const release_smoke_step = b.step("test-release-package", "Build a release layout and test Zig and C consumers");
+    release_smoke_step.dependOn(&release_smoke_cmd.step);
+
+    const release_validation_cmd = b.addSystemCommand(&.{ "bash", "scripts/test-release.sh" });
+    const check_step = b.step("check", "Run the authoritative stable release validation gate");
+    check_step.dependOn(&release_validation_cmd.step);
 }
 
-fn createBasicExample(b: *std.Build, name: []const u8, lib: *std.Build.Step.Compile, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options) void {
+fn createBasicExample(b: *std.Build, examples_step: *std.Build.Step, name: []const u8, lib: *std.Build.Step.Compile, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options) void {
     const example = b.addExecutable(.{
         .name = name,
         .root_module = b.createModule(.{
@@ -505,10 +584,10 @@ fn createBasicExample(b: *std.Build, name: []const u8, lib: *std.Build.Step.Comp
 
     example.root_module.addImport("zqlite", lib.root_module);
     example.root_module.addOptions("build_options", build_options);
-    b.installArtifact(example);
+    examples_step.dependOn(&b.addInstallArtifact(example, .{}).step);
 }
 
-fn createDemo(b: *std.Build, name: []const u8, lib: *std.Build.Step.Compile, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options) void {
+fn createDemo(b: *std.Build, examples_step: *std.Build.Step, name: []const u8, lib: *std.Build.Step.Compile, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options) void {
     const demo = b.addExecutable(.{
         .name = name,
         .root_module = b.createModule(.{
@@ -520,5 +599,5 @@ fn createDemo(b: *std.Build, name: []const u8, lib: *std.Build.Step.Compile, tar
 
     demo.root_module.addImport("zqlite", lib.root_module);
     demo.root_module.addOptions("build_options", build_options);
-    b.installArtifact(demo);
+    examples_step.dependOn(&b.addInstallArtifact(demo, .{}).step);
 }

@@ -7,7 +7,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("🚀 ZQLite v0.8.0 - Core Feature Test\n", .{});
+    std.debug.print("ZQLite Core Feature Test\n", .{});
 
     // Test 1: Parser improvements (DEFAULT clauses)
     std.debug.print("📝 Testing SQL Parser improvements...\n", .{});
@@ -21,8 +21,8 @@ pub fn main() !void {
     // Test 2: Connection and prepared statement binding
     std.debug.print("⚡ Testing Simplified Parameter Binding...\n", .{});
 
-    var conn = try zqlite.openMemory();
-    defer conn.deinit();
+    const conn = try zqlite.openMemory(allocator);
+    defer conn.close();
 
     // Create table
     try conn.execute("CREATE TABLE test (id INTEGER, name TEXT)");

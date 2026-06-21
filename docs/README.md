@@ -14,6 +14,7 @@
 
 - [Secure Mode](guides/secure-mode.md) - ATTACH path policies, secure connections
 - [Transactions](guides/transactions.md) - BEGIN, COMMIT, ROLLBACK
+- [Durability](guides/durability.md) - Commit, flush, close, and persistence-error semantics
 - [Prepared Statements](guides/prepared-statements.md) - Parameterized queries
 
 ## Compatibility
@@ -39,6 +40,7 @@
 ## Project
 
 - [Release Process](project/release-process.md) - Release checklist and verification flow
+- [Stability Policy](project/stability-policy.md) - Supported surface, compatibility rules, and experimental promotion criteria
 
 The root documentation entrypoints are intentionally small:
 
@@ -68,4 +70,5 @@ zig build test               # Unit tests
 zig build test-comprehensive # Full test suite
 zig build test-security      # Security tests
 zig build bench              # Performance benchmarks
+zig build examples           # Explicitly build/install profile-compatible examples
 ```

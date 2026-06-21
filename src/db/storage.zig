@@ -2,9 +2,30 @@ const std = @import("std");
 const btree = @import("btree.zig");
 const pager = @import("pager.zig");
 const memory_pool = @import("memory_pool.zig");
+const ast = @import("../parser/ast.zig");
 
 /// Row identifier type used throughout the database
 pub const RowId = u64;
+
+/// Persistent descriptor for one catalog chain slot (one half of the A/B pair).
+const SlotDescriptor = struct {
+    first_page: u32 = 0,
+    page_count: u32 = 0,
+    payload_len: u64 = 0,
+    checksum: u32 = 0,
+    generation: u64 = 0,
+};
+
+/// In-memory mirror of the on-disk superblock. The catalog payload is stored in
+/// one of two alternating page chains; `active_slot` selects the live one. A
+/// rewrite always targets the inactive slot and is only made authoritative by a
+/// separate, fsync-ordered superblock update, so a crash mid-rewrite never
+/// destroys the last durable catalog.
+const CatalogState = struct {
+    active_slot: u8 = 0,
+    generation: u64 = 0,
+    slots: [2]SlotDescriptor = .{ .{}, .{} },
+};
 
 /// Storage engine that manages tables and data persistence
 pub const StorageEngine = struct {
@@ -16,6 +37,10 @@ pub const StorageEngine = struct {
     indexes: std.StringHashMap(*Index),
     fts_indexes: std.StringHashMap(*FTSIndex), // Full-text search indexes
     is_memory: bool,
+    catalog: CatalogState,
+    /// True when the database was opened in the legacy single-page catalog
+    /// format and has not yet been migrated to the superblock format.
+    legacy_format: bool,
 
     const Self = @This();
 
@@ -34,9 +59,36 @@ pub const StorageEngine = struct {
         engine.indexes = std.StringHashMap(*Index).init(allocator);
         engine.fts_indexes = std.StringHashMap(*FTSIndex).init(allocator);
         engine.is_memory = false;
+        engine.catalog = .{};
+        engine.legacy_format = false;
 
-        // Load existing tables from file
-        try engine.loadTables();
+        // If opening the catalog fails (I/O error, corruption, or an unsupported
+        // format) tear down anything that was partially loaded so the caller is
+        // not left owning a half-initialized engine.
+        errdefer {
+            var t_it = engine.tables.iterator();
+            while (t_it.next()) |e| {
+                e.value_ptr.*.deinit();
+                engine.allocator.free(e.key_ptr.*);
+            }
+            engine.tables.deinit();
+            var i_it = engine.indexes.iterator();
+            while (i_it.next()) |e| {
+                e.value_ptr.*.deinit(engine.allocator);
+                engine.allocator.free(e.key_ptr.*);
+            }
+            engine.indexes.deinit();
+            var f_it = engine.fts_indexes.iterator();
+            while (f_it.next()) |e| {
+                e.value_ptr.*.deinit(engine.allocator);
+                engine.allocator.free(e.key_ptr.*);
+            }
+            engine.fts_indexes.deinit();
+            engine.memory_pool.deinit();
+        }
+
+        // Load existing catalog from file
+        try engine.loadCatalog();
 
         return engine;
     }
@@ -56,6 +108,8 @@ pub const StorageEngine = struct {
         engine.indexes = std.StringHashMap(*Index).init(allocator);
         engine.fts_indexes = std.StringHashMap(*FTSIndex).init(allocator);
         engine.is_memory = true;
+        engine.catalog = .{};
+        engine.legacy_format = false;
 
         return engine;
     }
@@ -128,243 +182,457 @@ pub const StorageEngine = struct {
         }
     }
 
-    /// Atomically rewrite table and index metadata to the metadata page.
-    /// This ensures consistency after drops or schema changes.
+    /// Atomically rewrite the catalog using the versioned superblock format.
+    ///
+    /// The full catalog is serialized into a single owned buffer, written to the
+    /// inactive A/B chain, and only then made authoritative by a separate,
+    /// fsync-ordered superblock update. A crash at any point leaves the previous
+    /// durable catalog intact, and the serialized buffer cannot silently truncate
+    /// records the way the old single-page writer could.
     fn rewriteAllMetadata(self: *Self) !void {
         if (self.is_memory) return;
 
-        const page = try self.pager.getPage(METADATA_PAGE_ID);
+        const payload = try self.serializeCatalog();
+        defer self.allocator.free(payload);
 
-        // Clear the page first
-        @memset(page.data, 0);
+        const inactive: usize = if (self.catalog.active_slot == 0) 1 else 0;
 
-        // Write magic number
-        std.mem.writeInt(u32, page.data[0..4], METADATA_MAGIC, .little);
+        // 1. Write the catalog payload into the inactive slot's page chain.
+        var new_slot = try self.writeCatalogPayload(inactive, payload);
+        new_slot.generation = self.catalog.generation + 1;
 
-        var offset: usize = 8;
-        var table_count: u32 = 0;
+        // Barrier 1: the chain pages must be durable before the superblock can
+        // reference them, so a crash mid-rewrite never exposes a torn catalog.
+        try self.pager.flush();
 
-        // Write all tables
-        var table_iterator = self.tables.iterator();
-        while (table_iterator.next()) |entry| {
-            const table = entry.value_ptr.*;
+        // Build the prospective new superblock state without committing it in
+        // memory yet; if writing/flushing the superblock fails, the old active
+        // slot remains authoritative both on disk and in memory.
+        var new_state = self.catalog;
+        new_state.slots[inactive] = new_slot;
+        new_state.active_slot = @intCast(inactive);
+        new_state.generation = new_slot.generation;
 
-            // Check if we have space for this table (estimate)
-            const deleted_count = table.deleted_keys.count();
-            const min_space = 4 + table.name.len + 14 + 4 + (deleted_count * 8);
-            if (offset + min_space > page.data.len) {
-                break; // No more space
-            }
+        try self.writeSuperblock(new_state);
 
-            // Write table name
-            std.mem.writeInt(u16, page.data[offset..][0..2], @intCast(table.name.len), .little);
-            offset += 2;
-            @memcpy(page.data[offset..][0..table.name.len], table.name);
-            offset += table.name.len;
+        // Barrier 2: the superblock pointer flip is now durable.
+        try self.pager.flush();
 
-            // Write btree root page (4 bytes)
-            std.mem.writeInt(u32, page.data[offset..][0..4], table.btree.root_page, .little);
-            offset += 4;
-
-            // Write row count (8 bytes)
-            std.mem.writeInt(u64, page.data[offset..][0..8], table.row_count, .little);
-            offset += 8;
-
-            // Write deleted keys count (4 bytes)
-            std.mem.writeInt(u32, page.data[offset..][0..4], @intCast(deleted_count), .little);
-            offset += 4;
-
-            // Write each deleted key (8 bytes each)
-            var dk_iter = table.deleted_keys.keyIterator();
-            while (dk_iter.next()) |key_ptr| {
-                if (offset + 8 > page.data.len) break;
-                std.mem.writeInt(u64, page.data[offset..][0..8], key_ptr.*, .little);
-                offset += 8;
-            }
-
-            // Write column count
-            std.mem.writeInt(u16, page.data[offset..][0..2], @intCast(table.schema.columns.len), .little);
-            offset += 2;
-
-            // Write columns
-            for (table.schema.columns) |column| {
-                const col_space = 4 + column.name.len;
-                if (offset + col_space > page.data.len) break;
-
-                std.mem.writeInt(u16, page.data[offset..][0..2], @intCast(column.name.len), .little);
-                offset += 2;
-                @memcpy(page.data[offset..][0..column.name.len], column.name);
-                offset += column.name.len;
-
-                page.data[offset] = @intFromEnum(column.data_type);
-                offset += 1;
-
-                var flags: u8 = 0;
-                if (column.is_primary_key) flags |= 0x01;
-                if (column.is_nullable) flags |= 0x02;
-                page.data[offset] = flags;
-                offset += 1;
-            }
-
-            table_count += 1;
-        }
-
-        // Write final table count
-        std.mem.writeInt(u32, page.data[4..8], table_count, .little);
-
-        const ext_magic_offset = page.data.len - 4;
-
-        // Write index count and index definitions after table metadata.
-        if (offset + 4 <= ext_magic_offset) {
-            const index_count_offset = offset;
-            offset += 4;
-
-            var index_count: u32 = 0;
-            var index_iterator = self.indexes.iterator();
-            while (index_iterator.next()) |entry| {
-                const index = entry.value_ptr.*;
-
-                var required_space: usize = 2 + index.name.len + 2 + index.table_name.len + 1 + 2;
-                for (index.column_names) |column_name| {
-                    required_space += 2 + column_name.len;
-                }
-
-                if (offset + required_space > ext_magic_offset) {
-                    break;
-                }
-
-                std.mem.writeInt(u16, page.data[offset..][0..2], @intCast(index.name.len), .little);
-                offset += 2;
-                @memcpy(page.data[offset..][0..index.name.len], index.name);
-                offset += index.name.len;
-
-                std.mem.writeInt(u16, page.data[offset..][0..2], @intCast(index.table_name.len), .little);
-                offset += 2;
-                @memcpy(page.data[offset..][0..index.table_name.len], index.table_name);
-                offset += index.table_name.len;
-
-                page.data[offset] = if (index.is_unique) 0x01 else 0x00;
-                offset += 1;
-
-                std.mem.writeInt(u16, page.data[offset..][0..2], @intCast(index.column_names.len), .little);
-                offset += 2;
-
-                for (index.column_names) |column_name| {
-                    std.mem.writeInt(u16, page.data[offset..][0..2], @intCast(column_name.len), .little);
-                    offset += 2;
-                    @memcpy(page.data[offset..][0..column_name.len], column_name);
-                    offset += column_name.len;
-                }
-
-                index_count += 1;
-            }
-
-            std.mem.writeInt(u32, page.data[index_count_offset..][0..4], index_count, .little);
-        }
-
-        if (offset + 4 <= ext_magic_offset) {
-            var extension_offset = offset;
-
-            const table_extension_count_offset = extension_offset;
-            extension_offset += 4;
-            var table_extension_count: u32 = 0;
-
-            var table_extension_iter = self.tables.iterator();
-            while (table_extension_iter.next()) |entry| {
-                const table = entry.value_ptr.*;
-
-                var extension_size: usize = 2 + table.name.len + 2;
-                for (table.schema.columns) |column| {
-                    if (column.default_value) |default_value| {
-                        const default_size = serializedDefaultValueSize(default_value) orelse continue;
-                        extension_size += 2 + column.name.len + default_size;
-                    }
-                }
-
-                if (extension_size == 2 + table.name.len + 2) {
-                    continue;
-                }
-
-                if (extension_offset + extension_size > ext_magic_offset) {
-                    break;
-                }
-
-                std.mem.writeInt(u16, page.data[extension_offset..][0..2], @intCast(table.name.len), .little);
-                extension_offset += 2;
-                @memcpy(page.data[extension_offset..][0..table.name.len], table.name);
-                extension_offset += table.name.len;
-
-                const default_count_offset = extension_offset;
-                extension_offset += 2;
-                var default_count: u16 = 0;
-
-                for (table.schema.columns) |column| {
-                    const default_value = column.default_value orelse continue;
-                    const default_size = serializedDefaultValueSize(default_value) orelse continue;
-                    if (extension_offset + 2 + column.name.len + default_size > ext_magic_offset) {
-                        break;
-                    }
-
-                    std.mem.writeInt(u16, page.data[extension_offset..][0..2], @intCast(column.name.len), .little);
-                    extension_offset += 2;
-                    @memcpy(page.data[extension_offset..][0..column.name.len], column.name);
-                    extension_offset += column.name.len;
-                    writeDefaultValue(page.data, &extension_offset, default_value) catch break;
-                    default_count += 1;
-                }
-
-                std.mem.writeInt(u16, page.data[default_count_offset..][0..2], default_count, .little);
-                table_extension_count += 1;
-            }
-
-            if (extension_offset + 4 <= ext_magic_offset) {
-                std.mem.writeInt(u32, page.data[table_extension_count_offset..][0..4], table_extension_count, .little);
-
-                const fts_count_offset = extension_offset;
-                extension_offset += 4;
-                var fts_count: u32 = 0;
-
-                var fts_iter = self.fts_indexes.iterator();
-                while (fts_iter.next()) |entry| {
-                    const fts_index = entry.value_ptr.*;
-                    var required_space: usize = 2 + fts_index.table_name.len + 2;
-                    for (fts_index.column_names) |column_name| {
-                        required_space += 2 + column_name.len;
-                    }
-
-                    if (extension_offset + required_space > ext_magic_offset) {
-                        break;
-                    }
-
-                    std.mem.writeInt(u16, page.data[extension_offset..][0..2], @intCast(fts_index.table_name.len), .little);
-                    extension_offset += 2;
-                    @memcpy(page.data[extension_offset..][0..fts_index.table_name.len], fts_index.table_name);
-                    extension_offset += fts_index.table_name.len;
-
-                    std.mem.writeInt(u16, page.data[extension_offset..][0..2], @intCast(fts_index.column_names.len), .little);
-                    extension_offset += 2;
-                    for (fts_index.column_names) |column_name| {
-                        std.mem.writeInt(u16, page.data[extension_offset..][0..2], @intCast(column_name.len), .little);
-                        extension_offset += 2;
-                        @memcpy(page.data[extension_offset..][0..column_name.len], column_name);
-                        extension_offset += column_name.len;
-                    }
-
-                    fts_count += 1;
-                }
-
-                std.mem.writeInt(u32, page.data[fts_count_offset..][0..4], fts_count, .little);
-                std.mem.writeInt(u32, page.data[ext_magic_offset..][0..4], METADATA_EXT_MAGIC, .little);
-            }
-        }
-
-        // Mark page as dirty to ensure it's written
-        try self.pager.markDirty(METADATA_PAGE_ID);
+        // Only now is the new catalog authoritative.
+        self.catalog = new_state;
+        self.legacy_format = false;
     }
 
     /// Save metadata for all tables (public wrapper for commits)
     pub fn saveAllMetadata(self: *Self) !void {
         try self.rewriteAllMetadata();
+    }
+
+    fn appendInt(self: *Self, buf: *std.ArrayListUnmanaged(u8), comptime T: type, value: T) !void {
+        var tmp: [@divExact(@typeInfo(T).int.bits, 8)]u8 = undefined;
+        std.mem.writeInt(T, &tmp, value, .little);
+        try buf.appendSlice(self.allocator, &tmp);
+    }
+
+    fn appendMetadataValue(self: *Self, buf: *std.ArrayListUnmanaged(u8), value: Value) !void {
+        switch (value) {
+            .Null => try buf.append(self.allocator, @intFromEnum(MetadataValueTag.Null)),
+            .Integer => |v| {
+                try buf.append(self.allocator, @intFromEnum(MetadataValueTag.Integer));
+                try self.appendInt(buf, i64, v);
+            },
+            .Text => |t| {
+                try buf.append(self.allocator, @intFromEnum(MetadataValueTag.Text));
+                try self.appendInt(buf, u16, @intCast(t.len));
+                try buf.appendSlice(self.allocator, t);
+            },
+            .Real => |r| {
+                try buf.append(self.allocator, @intFromEnum(MetadataValueTag.Real));
+                try self.appendInt(buf, u64, @bitCast(r));
+            },
+            .Boolean => |b| {
+                try buf.append(self.allocator, @intFromEnum(MetadataValueTag.Boolean));
+                try buf.append(self.allocator, if (b) @as(u8, 1) else 0);
+            },
+            .SmallInt => |s| {
+                try buf.append(self.allocator, @intFromEnum(MetadataValueTag.SmallInt));
+                try self.appendInt(buf, i16, s);
+            },
+            .BigInt => |b| {
+                try buf.append(self.allocator, @intFromEnum(MetadataValueTag.BigInt));
+                try self.appendInt(buf, i64, b);
+            },
+            .Blob => |bl| {
+                try buf.append(self.allocator, @intFromEnum(MetadataValueTag.Blob));
+                try self.appendInt(buf, u16, @intCast(bl.len));
+                try buf.appendSlice(self.allocator, bl);
+            },
+            else => return error.UnsupportedMetadataValue,
+        }
+    }
+
+    fn appendFunctionArgument(self: *Self, buf: *std.ArrayListUnmanaged(u8), arg: Column.FunctionArgument) !void {
+        switch (arg) {
+            .Literal => |lit| {
+                try buf.append(self.allocator, @intFromEnum(MetadataFunctionArgTag.Literal));
+                try self.appendMetadataValue(buf, lit);
+            },
+            .Column => |col| {
+                try buf.append(self.allocator, @intFromEnum(MetadataFunctionArgTag.Column));
+                try self.appendInt(buf, u16, @intCast(col.len));
+                try buf.appendSlice(self.allocator, col);
+            },
+            .Parameter => |p| {
+                try buf.append(self.allocator, @intFromEnum(MetadataFunctionArgTag.Parameter));
+                try self.appendInt(buf, u32, p);
+            },
+        }
+    }
+
+    fn appendDefaultValue(self: *Self, buf: *std.ArrayListUnmanaged(u8), dv: Column.DefaultValue) !void {
+        switch (dv) {
+            .Literal => |lit| {
+                try buf.append(self.allocator, @intFromEnum(MetadataDefaultTag.Literal));
+                try self.appendMetadataValue(buf, lit);
+            },
+            .FunctionCall => |fc| {
+                try buf.append(self.allocator, @intFromEnum(MetadataDefaultTag.FunctionCall));
+                try self.appendInt(buf, u16, @intCast(fc.name.len));
+                try buf.appendSlice(self.allocator, fc.name);
+                try self.appendInt(buf, u16, @intCast(fc.arguments.len));
+                for (fc.arguments) |a| try self.appendFunctionArgument(buf, a);
+            },
+        }
+    }
+
+    fn appendAstValue(self: *Self, buf: *std.ArrayListUnmanaged(u8), value: ast.Value) !void {
+        const storage_value: Value = switch (value) {
+            .Integer => |v| .{ .Integer = v },
+            .Text => |v| .{ .Text = v },
+            .Real => |v| .{ .Real = v },
+            .Blob => |v| .{ .Blob = v },
+            .Null => .Null,
+            .Parameter => return error.UnsupportedCheckConstraint,
+            .FunctionCall, .Case => return error.UnsupportedCheckConstraint,
+        };
+        try self.appendMetadataValue(buf, storage_value);
+    }
+
+    fn appendCheckExpression(self: *Self, buf: *std.ArrayListUnmanaged(u8), expr: ast.Expression) !void {
+        switch (expr) {
+            .Column => |column| {
+                try buf.append(self.allocator, 1);
+                try self.appendInt(buf, u16, @intCast(column.len));
+                try buf.appendSlice(self.allocator, column);
+            },
+            .Literal => |value| {
+                try buf.append(self.allocator, 2);
+                try self.appendAstValue(buf, value);
+            },
+            .Parameter => |param| {
+                try buf.append(self.allocator, 3);
+                try self.appendInt(buf, u32, param);
+            },
+            .BinaryOp => |bin| {
+                try buf.append(self.allocator, 4);
+                try buf.append(self.allocator, @intFromEnum(bin.op));
+                try self.appendCheckExpression(buf, bin.left.*);
+                try self.appendCheckExpression(buf, bin.right.*);
+            },
+            .InList => |list| {
+                try buf.append(self.allocator, 5);
+                try self.appendInt(buf, u16, @intCast(list.len));
+                for (list) |value| try self.appendAstValue(buf, value);
+            },
+            .Subquery => return error.UnsupportedCheckConstraint,
+        }
+    }
+
+    fn appendCheckCondition(self: *Self, buf: *std.ArrayListUnmanaged(u8), condition: ast.Condition) !void {
+        switch (condition) {
+            .Comparison => |comp| {
+                try buf.append(self.allocator, 1);
+                try buf.append(self.allocator, @intFromEnum(comp.operator));
+                try self.appendCheckExpression(buf, comp.left);
+                try self.appendCheckExpression(buf, comp.right);
+                if (comp.extra) |extra| {
+                    try buf.append(self.allocator, 1);
+                    try self.appendCheckExpression(buf, extra);
+                } else {
+                    try buf.append(self.allocator, 0);
+                }
+            },
+            .Logical => |logical| {
+                try buf.append(self.allocator, 2);
+                try buf.append(self.allocator, @intFromEnum(logical.operator));
+                try self.appendCheckCondition(buf, logical.left.*);
+                try self.appendCheckCondition(buf, logical.right.*);
+            },
+        }
+    }
+
+    fn appendForeignKeyAction(self: *Self, buf: *std.ArrayListUnmanaged(u8), action: ?ast.ForeignKeyAction) !void {
+        if (action) |value| {
+            try buf.append(self.allocator, 1);
+            try buf.append(self.allocator, @intFromEnum(value));
+        } else {
+            try buf.append(self.allocator, 0);
+        }
+    }
+
+    fn appendForeignKey(self: *Self, buf: *std.ArrayListUnmanaged(u8), foreign_key: ast.ForeignKeyConstraint) !void {
+        const column = foreign_key.column orelse return error.InvalidForeignKey;
+        try self.appendInt(buf, u16, @intCast(column.len));
+        try buf.appendSlice(self.allocator, column);
+        try self.appendInt(buf, u16, @intCast(foreign_key.reference_table.len));
+        try buf.appendSlice(self.allocator, foreign_key.reference_table);
+        try self.appendInt(buf, u16, @intCast(foreign_key.reference_column.len));
+        try buf.appendSlice(self.allocator, foreign_key.reference_column);
+        try self.appendForeignKeyAction(buf, foreign_key.on_delete);
+        try self.appendForeignKeyAction(buf, foreign_key.on_update);
+    }
+
+    /// Serialize the entire catalog (tables, indexes, column defaults, FTS
+    /// indexes) into a single owned buffer. Growing freely means catalog records
+    /// are never silently dropped to fit a fixed page.
+    fn serializeCatalog(self: *Self) ![]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
+
+        // Tables
+        try self.appendInt(&buf, u32, @intCast(self.tables.count()));
+        var table_it = self.tables.iterator();
+        while (table_it.next()) |entry| {
+            const table = entry.value_ptr.*;
+            try self.appendInt(&buf, u16, @intCast(table.name.len));
+            try buf.appendSlice(self.allocator, table.name);
+            try self.appendInt(&buf, u32, table.btree.root_page);
+            try self.appendInt(&buf, u64, table.row_count);
+            try self.appendInt(&buf, u32, @intCast(table.deleted_keys.count()));
+            var dk = table.deleted_keys.keyIterator();
+            while (dk.next()) |key_ptr| try self.appendInt(&buf, u64, key_ptr.*);
+            try self.appendInt(&buf, u16, @intCast(table.schema.columns.len));
+            for (table.schema.columns) |column| {
+                try self.appendInt(&buf, u16, @intCast(column.name.len));
+                try buf.appendSlice(self.allocator, column.name);
+                try buf.append(self.allocator, @intFromEnum(column.data_type));
+                var flags: u8 = 0;
+                if (column.is_primary_key) flags |= 0x01;
+                if (column.is_nullable) flags |= 0x02;
+                try buf.append(self.allocator, flags);
+            }
+        }
+
+        // Indexes
+        try self.appendInt(&buf, u32, @intCast(self.indexes.count()));
+        var index_it = self.indexes.iterator();
+        while (index_it.next()) |entry| {
+            const index = entry.value_ptr.*;
+            try self.appendInt(&buf, u16, @intCast(index.name.len));
+            try buf.appendSlice(self.allocator, index.name);
+            try self.appendInt(&buf, u16, @intCast(index.table_name.len));
+            try buf.appendSlice(self.allocator, index.table_name);
+            try buf.append(self.allocator, if (index.is_unique) @as(u8, 0x01) else 0x00);
+            try self.appendInt(&buf, u16, @intCast(index.column_names.len));
+            for (index.column_names) |cn| {
+                try self.appendInt(&buf, u16, @intCast(cn.len));
+                try buf.appendSlice(self.allocator, cn);
+            }
+        }
+
+        // Table extensions: per-column default values. Only tables with at least
+        // one serializable default contribute a record.
+        var ext_count: u32 = 0;
+        var ext_count_it = self.tables.iterator();
+        while (ext_count_it.next()) |entry| {
+            const table = entry.value_ptr.*;
+            for (table.schema.columns) |column| {
+                if (column.default_value) |dv| {
+                    if (serializedDefaultValueSize(dv) != null) {
+                        ext_count += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        try self.appendInt(&buf, u32, ext_count);
+
+        var ext_it = self.tables.iterator();
+        while (ext_it.next()) |entry| {
+            const table = entry.value_ptr.*;
+            var default_count: u16 = 0;
+            for (table.schema.columns) |column| {
+                if (column.default_value) |dv| {
+                    if (serializedDefaultValueSize(dv) != null) default_count += 1;
+                }
+            }
+            if (default_count == 0) continue;
+
+            try self.appendInt(&buf, u16, @intCast(table.name.len));
+            try buf.appendSlice(self.allocator, table.name);
+            try self.appendInt(&buf, u16, default_count);
+            for (table.schema.columns) |column| {
+                const dv = column.default_value orelse continue;
+                if (serializedDefaultValueSize(dv) == null) continue;
+                try self.appendInt(&buf, u16, @intCast(column.name.len));
+                try buf.appendSlice(self.allocator, column.name);
+                try self.appendDefaultValue(&buf, dv);
+            }
+        }
+
+        // FTS indexes
+        try self.appendInt(&buf, u32, @intCast(self.fts_indexes.count()));
+        var fts_it = self.fts_indexes.iterator();
+        while (fts_it.next()) |entry| {
+            const fts_index = entry.value_ptr.*;
+            try self.appendInt(&buf, u16, @intCast(fts_index.table_name.len));
+            try buf.appendSlice(self.allocator, fts_index.table_name);
+            try self.appendInt(&buf, u16, @intCast(fts_index.column_names.len));
+            for (fts_index.column_names) |cn| {
+                try self.appendInt(&buf, u16, @intCast(cn.len));
+                try buf.appendSlice(self.allocator, cn);
+            }
+        }
+
+        // CHECK constraints. This section is appended after the older catalog
+        // sections so existing databases without it remain readable.
+        var check_ext_count: u32 = 0;
+        var check_count_it = self.tables.iterator();
+        while (check_count_it.next()) |entry| {
+            if (entry.value_ptr.*.schema.check_constraints.len > 0) check_ext_count += 1;
+        }
+        try self.appendInt(&buf, u32, check_ext_count);
+
+        var check_it = self.tables.iterator();
+        while (check_it.next()) |entry| {
+            const table = entry.value_ptr.*;
+            if (table.schema.check_constraints.len == 0) continue;
+
+            try self.appendInt(&buf, u16, @intCast(table.name.len));
+            try buf.appendSlice(self.allocator, table.name);
+            try self.appendInt(&buf, u16, @intCast(table.schema.check_constraints.len));
+            for (table.schema.check_constraints) |condition| {
+                try self.appendCheckCondition(&buf, condition);
+            }
+        }
+
+        // FOREIGN KEY constraints, appended after CHECK constraints.
+        var fk_ext_count: u32 = 0;
+        var fk_count_it = self.tables.iterator();
+        while (fk_count_it.next()) |entry| {
+            if (entry.value_ptr.*.schema.foreign_keys.len > 0) fk_ext_count += 1;
+        }
+        try self.appendInt(&buf, u32, fk_ext_count);
+
+        var fk_it = self.tables.iterator();
+        while (fk_it.next()) |entry| {
+            const table = entry.value_ptr.*;
+            if (table.schema.foreign_keys.len == 0) continue;
+
+            try self.appendInt(&buf, u16, @intCast(table.name.len));
+            try buf.appendSlice(self.allocator, table.name);
+            try self.appendInt(&buf, u16, @intCast(table.schema.foreign_keys.len));
+            for (table.schema.foreign_keys) |foreign_key| {
+                try self.appendForeignKey(&buf, foreign_key);
+            }
+        }
+
+        return buf.toOwnedSlice(self.allocator);
+    }
+
+    /// Write a serialized payload into the page chain backing one A/B slot,
+    /// reusing the slot's existing pages and allocating more only when needed.
+    /// All pages owned by the slot stay linked so none are leaked across rewrites.
+    fn writeCatalogPayload(self: *Self, slot_index: usize, payload: []const u8) !SlotDescriptor {
+        const capacity: usize = self.pager.page_size - CATALOG_PAGE_HEADER;
+        const needed_pages: usize = if (payload.len == 0)
+            1
+        else
+            (payload.len + capacity - 1) / capacity;
+
+        var pages: std.ArrayListUnmanaged(u32) = .empty;
+        defer pages.deinit(self.allocator);
+
+        // Reuse the slot's existing chain pages.
+        const existing = self.catalog.slots[slot_index];
+        if (existing.first_page != 0 and existing.page_count != 0) {
+            var current = existing.first_page;
+            var count: u32 = 0;
+            while (current != 0 and count < existing.page_count) {
+                try pages.append(self.allocator, current);
+                const page = try self.pager.getPage(current);
+                current = std.mem.readInt(u32, page.data[0..4], .little);
+                count += 1;
+            }
+        }
+
+        // Allocate any additional pages the payload requires.
+        while (pages.items.len < needed_pages) {
+            const new_id = try self.pager.allocatePage();
+            try pages.append(self.allocator, new_id);
+        }
+
+        const total_pages = pages.items.len;
+        var written: usize = 0;
+        for (pages.items, 0..) |page_id, i| {
+            const page = try self.pager.getPage(page_id);
+            @memset(page.data, 0);
+            const next_id: u32 = if (i + 1 < total_pages) pages.items[i + 1] else 0;
+            std.mem.writeInt(u32, page.data[0..4], next_id, .little);
+
+            var page_len: usize = 0;
+            if (written < payload.len) {
+                const remaining = payload.len - written;
+                page_len = @min(remaining, capacity);
+                @memcpy(page.data[CATALOG_PAGE_HEADER..][0..page_len], payload[written..][0..page_len]);
+                written += page_len;
+            }
+            std.mem.writeInt(u32, page.data[4..8], @intCast(page_len), .little);
+            try self.pager.markDirty(page_id);
+        }
+
+        return SlotDescriptor{
+            .first_page = if (total_pages > 0) pages.items[0] else 0,
+            .page_count = @intCast(total_pages),
+            .payload_len = payload.len,
+            .checksum = std.hash.Crc32.hash(payload),
+            .generation = 0,
+        };
+    }
+
+    fn writeSlotDescriptor(dst: []u8, slot: SlotDescriptor) void {
+        std.mem.writeInt(u32, dst[0..4], slot.first_page, .little);
+        std.mem.writeInt(u32, dst[4..8], slot.page_count, .little);
+        std.mem.writeInt(u64, dst[8..16], slot.payload_len, .little);
+        std.mem.writeInt(u32, dst[16..20], slot.checksum, .little);
+        std.mem.writeInt(u64, dst[20..28], slot.generation, .little);
+    }
+
+    fn readSlotDescriptor(src: []const u8) SlotDescriptor {
+        return SlotDescriptor{
+            .first_page = std.mem.readInt(u32, src[0..4], .little),
+            .page_count = std.mem.readInt(u32, src[4..8], .little),
+            .payload_len = std.mem.readInt(u64, src[8..16], .little),
+            .checksum = std.mem.readInt(u32, src[16..20], .little),
+            .generation = std.mem.readInt(u64, src[20..28], .little),
+        };
+    }
+
+    /// Write the superblock (page 1) describing the given catalog state. The
+    /// header is covered by a CRC32 so a torn or zeroed superblock is detected.
+    fn writeSuperblock(self: *Self, state: CatalogState) !void {
+        const page = try self.pager.getPage(SUPERBLOCK_PAGE_ID);
+        @memset(page.data, 0);
+        std.mem.writeInt(u32, page.data[SB_OFF_MAGIC..][0..4], SUPERBLOCK_MAGIC, .little);
+        std.mem.writeInt(u16, page.data[SB_OFF_VERSION..][0..2], CATALOG_FORMAT_VERSION, .little);
+        std.mem.writeInt(u16, page.data[SB_OFF_FLAGS..][0..2], 0, .little);
+        page.data[SB_OFF_ACTIVE] = state.active_slot;
+        std.mem.writeInt(u64, page.data[SB_OFF_GENERATION..][0..8], state.generation, .little);
+        writeSlotDescriptor(page.data[SB_OFF_SLOT_A..][0..SLOT_DESC_LEN], state.slots[0]);
+        writeSlotDescriptor(page.data[SB_OFF_SLOT_B..][0..SLOT_DESC_LEN], state.slots[1]);
+        const checksum = std.hash.Crc32.hash(page.data[0..SB_HEADER_LEN]);
+        std.mem.writeInt(u32, page.data[SB_OFF_HEADER_CHECKSUM..][0..4], checksum, .little);
+        try self.pager.markDirty(SUPERBLOCK_PAGE_ID);
     }
 
     /// Create an index
@@ -466,6 +734,9 @@ pub const StorageEngine = struct {
         for (index.column_names) |column_name| {
             const column_idx = table.getColumnIndex(column_name) orelse return false;
             if (column_idx >= existing_values.len or column_idx >= candidate_values.len) return false;
+            // SQL treats NULLs as distinct for uniqueness: a row with a NULL in any
+            // indexed column never conflicts, so multiple NULLs are permitted.
+            if (existing_values[column_idx] == .Null or candidate_values[column_idx] == .Null) return false;
             if (!valueEquals(existing_values[column_idx], candidate_values[column_idx])) return false;
         }
         return true;
@@ -532,6 +803,9 @@ pub const StorageEngine = struct {
         if (index.column_names.len == 1) {
             const column_idx = table.getColumnIndex(index.column_names[0]) orelse return null;
             if (column_idx >= values.len) return null;
+            // SQL treats NULLs as distinct, so a NULL-bearing row is not indexed and
+            // never participates in uniqueness checks. Callers skip a null key.
+            if (values[column_idx] == .Null) return null;
             return valueToIndexKey(values[column_idx]);
         }
 
@@ -539,6 +813,7 @@ pub const StorageEngine = struct {
         for (index.column_names) |column_name| {
             const column_idx = table.getColumnIndex(column_name) orelse return null;
             if (column_idx >= values.len) return null;
+            if (values[column_idx] == .Null) return null;
 
             const component = valueToIndexKey(values[column_idx]);
             combined = (combined ^ component) *% 0x100000001b3;
@@ -578,9 +853,31 @@ pub const StorageEngine = struct {
     ///   - N bytes: name
     ///   - 1 byte: data type
     ///   - 1 byte: flags (is_primary_key, is_nullable)
-    const METADATA_MAGIC: u32 = 0x5A514C54; // "ZQLT"
+    const METADATA_MAGIC: u32 = 0x5A514C54; // "ZQLT" (legacy single-page catalog)
     const METADATA_PAGE_ID: u32 = 1;
-    const METADATA_EXT_MAGIC: u32 = 0x5A514558; // "ZQEX"
+    const METADATA_EXT_MAGIC: u32 = 0x5A514558; // "ZQEX" (legacy extension marker)
+
+    // Versioned multi-page catalog format. Page 1 holds a fixed superblock that
+    // points at one of two alternating catalog page chains (A/B ping-pong); the
+    // catalog payload itself lives in dynamically allocated chained pages.
+    const SUPERBLOCK_PAGE_ID: u32 = 1;
+    const SUPERBLOCK_MAGIC: u32 = 0x5A444231; // "ZDB1"
+    const CATALOG_FORMAT_VERSION: u16 = 1;
+
+    // Superblock field offsets within page 1.
+    const SB_OFF_MAGIC: usize = 0; // u32 magic
+    const SB_OFF_VERSION: usize = 4; // u16 format version
+    const SB_OFF_FLAGS: usize = 6; // u16 reserved flags
+    const SB_OFF_ACTIVE: usize = 8; // u8 active slot (0 or 1)
+    const SB_OFF_GENERATION: usize = 12; // u64 global generation counter
+    const SB_OFF_SLOT_A: usize = 20; // slot A descriptor (SLOT_DESC_LEN bytes)
+    const SB_OFF_SLOT_B: usize = 48; // slot B descriptor (SLOT_DESC_LEN bytes)
+    const SB_OFF_HEADER_CHECKSUM: usize = 76; // u32 CRC32 over bytes [0..SB_HEADER_LEN)
+    const SB_HEADER_LEN: usize = 76; // bytes covered by the header checksum
+    const SLOT_DESC_LEN: usize = 28; // first_page,page_count,payload_len,checksum,generation
+
+    // Catalog page header: next_page(u32) + page_payload_len(u32).
+    const CATALOG_PAGE_HEADER: usize = 8;
 
     const MetadataValueTag = enum(u8) {
         Null = 0,
@@ -648,70 +945,6 @@ pub const StorageEngine = struct {
         };
     }
 
-    fn writeMetadataValue(buffer: []u8, offset: *usize, value: Value) !void {
-        switch (value) {
-            .Null => {
-                if (offset.* + 1 > buffer.len) return error.NoMetadataSpace;
-                buffer[offset.*] = @intFromEnum(MetadataValueTag.Null);
-                offset.* += 1;
-            },
-            .Integer => |int_value| {
-                if (offset.* + 9 > buffer.len) return error.NoMetadataSpace;
-                buffer[offset.*] = @intFromEnum(MetadataValueTag.Integer);
-                offset.* += 1;
-                std.mem.writeInt(i64, buffer[offset.*..][0..8], int_value, .little);
-                offset.* += 8;
-            },
-            .Text => |text| {
-                if (offset.* + 3 + text.len > buffer.len) return error.NoMetadataSpace;
-                buffer[offset.*] = @intFromEnum(MetadataValueTag.Text);
-                offset.* += 1;
-                std.mem.writeInt(u16, buffer[offset.*..][0..2], @intCast(text.len), .little);
-                offset.* += 2;
-                @memcpy(buffer[offset.*..][0..text.len], text);
-                offset.* += text.len;
-            },
-            .Real => |real_value| {
-                if (offset.* + 9 > buffer.len) return error.NoMetadataSpace;
-                buffer[offset.*] = @intFromEnum(MetadataValueTag.Real);
-                offset.* += 1;
-                std.mem.writeInt(u64, buffer[offset.*..][0..8], @bitCast(real_value), .little);
-                offset.* += 8;
-            },
-            .Boolean => |flag| {
-                if (offset.* + 2 > buffer.len) return error.NoMetadataSpace;
-                buffer[offset.*] = @intFromEnum(MetadataValueTag.Boolean);
-                offset.* += 1;
-                buffer[offset.*] = if (flag) 1 else 0;
-                offset.* += 1;
-            },
-            .SmallInt => |small| {
-                if (offset.* + 3 > buffer.len) return error.NoMetadataSpace;
-                buffer[offset.*] = @intFromEnum(MetadataValueTag.SmallInt);
-                offset.* += 1;
-                std.mem.writeInt(i16, buffer[offset.*..][0..2], small, .little);
-                offset.* += 2;
-            },
-            .BigInt => |big| {
-                if (offset.* + 9 > buffer.len) return error.NoMetadataSpace;
-                buffer[offset.*] = @intFromEnum(MetadataValueTag.BigInt);
-                offset.* += 1;
-                std.mem.writeInt(i64, buffer[offset.*..][0..8], big, .little);
-                offset.* += 8;
-            },
-            .Blob => |blob| {
-                if (offset.* + 3 + blob.len > buffer.len) return error.NoMetadataSpace;
-                buffer[offset.*] = @intFromEnum(MetadataValueTag.Blob);
-                offset.* += 1;
-                std.mem.writeInt(u16, buffer[offset.*..][0..2], @intCast(blob.len), .little);
-                offset.* += 2;
-                @memcpy(buffer[offset.*..][0..blob.len], blob);
-                offset.* += blob.len;
-            },
-            else => return error.UnsupportedMetadataValue,
-        }
-    }
-
     fn readMetadataValue(self: *Self, buffer: []const u8, offset: *usize) !Value {
         if (offset.* >= buffer.len) return error.InvalidMetadata;
         const tag: MetadataValueTag = @enumFromInt(buffer[offset.*]);
@@ -770,33 +1003,6 @@ pub const StorageEngine = struct {
         };
     }
 
-    fn writeFunctionArgument(buffer: []u8, offset: *usize, arg: Column.FunctionArgument) !void {
-        switch (arg) {
-            .Literal => |literal| {
-                if (offset.* + 1 > buffer.len) return error.NoMetadataSpace;
-                buffer[offset.*] = @intFromEnum(MetadataFunctionArgTag.Literal);
-                offset.* += 1;
-                try writeMetadataValue(buffer, offset, literal);
-            },
-            .Column => |column| {
-                if (offset.* + 3 + column.len > buffer.len) return error.NoMetadataSpace;
-                buffer[offset.*] = @intFromEnum(MetadataFunctionArgTag.Column);
-                offset.* += 1;
-                std.mem.writeInt(u16, buffer[offset.*..][0..2], @intCast(column.len), .little);
-                offset.* += 2;
-                @memcpy(buffer[offset.*..][0..column.len], column);
-                offset.* += column.len;
-            },
-            .Parameter => |param| {
-                if (offset.* + 5 > buffer.len) return error.NoMetadataSpace;
-                buffer[offset.*] = @intFromEnum(MetadataFunctionArgTag.Parameter);
-                offset.* += 1;
-                std.mem.writeInt(u32, buffer[offset.*..][0..4], param, .little);
-                offset.* += 4;
-            },
-        }
-    }
-
     fn readFunctionArgument(self: *Self, buffer: []const u8, offset: *usize) !Column.FunctionArgument {
         if (offset.* >= buffer.len) return error.InvalidMetadata;
         const tag: MetadataFunctionArgTag = @enumFromInt(buffer[offset.*]);
@@ -820,31 +1026,6 @@ pub const StorageEngine = struct {
                 break :blk Column.FunctionArgument{ .Parameter = param };
             },
         };
-    }
-
-    fn writeDefaultValue(buffer: []u8, offset: *usize, default_value: Column.DefaultValue) !void {
-        switch (default_value) {
-            .Literal => |literal| {
-                if (offset.* + 1 > buffer.len) return error.NoMetadataSpace;
-                buffer[offset.*] = @intFromEnum(MetadataDefaultTag.Literal);
-                offset.* += 1;
-                try writeMetadataValue(buffer, offset, literal);
-            },
-            .FunctionCall => |function_call| {
-                if (offset.* + 5 + function_call.name.len > buffer.len) return error.NoMetadataSpace;
-                buffer[offset.*] = @intFromEnum(MetadataDefaultTag.FunctionCall);
-                offset.* += 1;
-                std.mem.writeInt(u16, buffer[offset.*..][0..2], @intCast(function_call.name.len), .little);
-                offset.* += 2;
-                @memcpy(buffer[offset.*..][0..function_call.name.len], function_call.name);
-                offset.* += function_call.name.len;
-                std.mem.writeInt(u16, buffer[offset.*..][0..2], @intCast(function_call.arguments.len), .little);
-                offset.* += 2;
-                for (function_call.arguments) |arg| {
-                    try writeFunctionArgument(buffer, offset, arg);
-                }
-            },
-        }
     }
 
     fn readDefaultValue(self: *Self, buffer: []const u8, offset: *usize) !Column.DefaultValue {
@@ -887,6 +1068,178 @@ pub const StorageEngine = struct {
         };
     }
 
+    fn metadataValueToAst(self: *Self, value: Value) !ast.Value {
+        return switch (value) {
+            .Integer => |v| ast.Value{ .Integer = v },
+            .Text => |v| ast.Value{ .Text = try self.allocator.dupe(u8, v) },
+            .Real => |v| ast.Value{ .Real = v },
+            .Blob => |v| ast.Value{ .Blob = try self.allocator.dupe(u8, v) },
+            .Null => ast.Value.Null,
+            else => error.UnsupportedCheckConstraint,
+        };
+    }
+
+    fn readCheckExpression(self: *Self, buffer: []const u8, offset: *usize) !ast.Expression {
+        if (offset.* >= buffer.len) return error.InvalidMetadata;
+        const tag = buffer[offset.*];
+        offset.* += 1;
+
+        return switch (tag) {
+            1 => blk: {
+                if (offset.* + 2 > buffer.len) return error.InvalidMetadata;
+                const len = std.mem.readInt(u16, buffer[offset.*..][0..2], .little);
+                offset.* += 2;
+                if (offset.* + len > buffer.len) return error.InvalidMetadata;
+                const column = try self.allocator.dupe(u8, buffer[offset.*..][0..len]);
+                offset.* += len;
+                break :blk ast.Expression{ .Column = column };
+            },
+            2 => blk: {
+                const storage_value = try self.readMetadataValue(buffer, offset);
+                defer storage_value.deinit(self.allocator);
+                break :blk ast.Expression{ .Literal = try self.metadataValueToAst(storage_value) };
+            },
+            3 => blk: {
+                if (offset.* + 4 > buffer.len) return error.InvalidMetadata;
+                const param = std.mem.readInt(u32, buffer[offset.*..][0..4], .little);
+                offset.* += 4;
+                break :blk ast.Expression{ .Parameter = param };
+            },
+            4 => blk: {
+                if (offset.* >= buffer.len) return error.InvalidMetadata;
+                const op: ast.ArithmeticOp = @enumFromInt(buffer[offset.*]);
+                offset.* += 1;
+                const left = try self.allocator.create(ast.Expression);
+                errdefer self.allocator.destroy(left);
+                left.* = try self.readCheckExpression(buffer, offset);
+                errdefer left.deinit(self.allocator);
+
+                const right = try self.allocator.create(ast.Expression);
+                errdefer self.allocator.destroy(right);
+                right.* = try self.readCheckExpression(buffer, offset);
+                errdefer right.deinit(self.allocator);
+
+                break :blk ast.Expression{ .BinaryOp = .{
+                    .left = left,
+                    .op = op,
+                    .right = right,
+                } };
+            },
+            5 => blk: {
+                if (offset.* + 2 > buffer.len) return error.InvalidMetadata;
+                const count = std.mem.readInt(u16, buffer[offset.*..][0..2], .little);
+                offset.* += 2;
+                var list = try self.allocator.alloc(ast.Value, count);
+                var loaded: usize = 0;
+                errdefer {
+                    for (list[0..loaded]) |*value| value.deinit(self.allocator);
+                    self.allocator.free(list);
+                }
+                while (loaded < count) : (loaded += 1) {
+                    const storage_value = try self.readMetadataValue(buffer, offset);
+                    defer storage_value.deinit(self.allocator);
+                    list[loaded] = try self.metadataValueToAst(storage_value);
+                }
+                break :blk ast.Expression{ .InList = list };
+            },
+            else => error.InvalidMetadata,
+        };
+    }
+
+    fn readCheckCondition(self: *Self, buffer: []const u8, offset: *usize) !ast.Condition {
+        if (offset.* >= buffer.len) return error.InvalidMetadata;
+        const tag = buffer[offset.*];
+        offset.* += 1;
+
+        return switch (tag) {
+            1 => blk: {
+                if (offset.* >= buffer.len) return error.InvalidMetadata;
+                const op: ast.ComparisonOperator = @enumFromInt(buffer[offset.*]);
+                offset.* += 1;
+                var condition = ast.Condition{ .Comparison = .{
+                    .left = try self.readCheckExpression(buffer, offset),
+                    .operator = op,
+                    .right = try self.readCheckExpression(buffer, offset),
+                    .extra = null,
+                } };
+                errdefer condition.deinit(self.allocator);
+
+                if (offset.* >= buffer.len) return error.InvalidMetadata;
+                const has_extra = buffer[offset.*] != 0;
+                offset.* += 1;
+                if (has_extra) {
+                    condition.Comparison.extra = try self.readCheckExpression(buffer, offset);
+                }
+                break :blk condition;
+            },
+            2 => blk: {
+                if (offset.* >= buffer.len) return error.InvalidMetadata;
+                const op: ast.LogicalOperator = @enumFromInt(buffer[offset.*]);
+                offset.* += 1;
+                const left = try self.allocator.create(ast.Condition);
+                errdefer self.allocator.destroy(left);
+                left.* = try self.readCheckCondition(buffer, offset);
+                errdefer left.deinit(self.allocator);
+
+                const right = try self.allocator.create(ast.Condition);
+                errdefer self.allocator.destroy(right);
+                right.* = try self.readCheckCondition(buffer, offset);
+                errdefer right.deinit(self.allocator);
+
+                break :blk ast.Condition{ .Logical = .{
+                    .left = left,
+                    .operator = op,
+                    .right = right,
+                } };
+            },
+            else => error.InvalidMetadata,
+        };
+    }
+
+    fn readForeignKeyAction(self: *Self, buffer: []const u8, offset: *usize) !?ast.ForeignKeyAction {
+        _ = self;
+        if (offset.* >= buffer.len) return error.InvalidMetadata;
+        const has_action = buffer[offset.*] != 0;
+        offset.* += 1;
+        if (!has_action) return null;
+        if (offset.* >= buffer.len) return error.InvalidMetadata;
+        const action: ast.ForeignKeyAction = @enumFromInt(buffer[offset.*]);
+        offset.* += 1;
+        return action;
+    }
+
+    fn readForeignKey(self: *Self, buffer: []const u8, offset: *usize) !ast.ForeignKeyConstraint {
+        if (offset.* + 2 > buffer.len) return error.InvalidMetadata;
+        const column_len = std.mem.readInt(u16, buffer[offset.*..][0..2], .little);
+        offset.* += 2;
+        if (offset.* + column_len + 2 > buffer.len) return error.InvalidMetadata;
+        const column = try self.allocator.dupe(u8, buffer[offset.*..][0..column_len]);
+        offset.* += column_len;
+        errdefer self.allocator.free(column);
+
+        const ref_table_len = std.mem.readInt(u16, buffer[offset.*..][0..2], .little);
+        offset.* += 2;
+        if (offset.* + ref_table_len + 2 > buffer.len) return error.InvalidMetadata;
+        const ref_table = try self.allocator.dupe(u8, buffer[offset.*..][0..ref_table_len]);
+        offset.* += ref_table_len;
+        errdefer self.allocator.free(ref_table);
+
+        const ref_column_len = std.mem.readInt(u16, buffer[offset.*..][0..2], .little);
+        offset.* += 2;
+        if (offset.* + ref_column_len > buffer.len) return error.InvalidMetadata;
+        const ref_column = try self.allocator.dupe(u8, buffer[offset.*..][0..ref_column_len]);
+        offset.* += ref_column_len;
+        errdefer self.allocator.free(ref_column);
+
+        return .{
+            .column = column,
+            .reference_table = ref_table,
+            .reference_column = ref_column,
+            .on_delete = try self.readForeignKeyAction(buffer, offset),
+            .on_update = try self.readForeignKeyAction(buffer, offset),
+        };
+    }
+
     fn clearFTSIndex(self: *Self, fts_index: *FTSIndex) void {
         _ = self;
         var iter = fts_index.inverted_index.iterator();
@@ -919,11 +1272,380 @@ pub const StorageEngine = struct {
     }
 
     /// Load existing tables from storage
-    fn loadTables(self: *Self) !void {
+    /// Open the catalog, dispatching on the page-1 magic. I/O errors propagate
+    /// (never silently degrade to "empty database"); an unrecognized magic is a
+    /// genuinely new/empty file and leaves the catalog at its defaults.
+    fn loadCatalog(self: *Self) !void {
+        if (self.is_memory) return;
+
+        const page = try self.pager.getPage(SUPERBLOCK_PAGE_ID);
+        if (page.data.len < 8) return;
+        const magic = std.mem.readInt(u32, page.data[0..4], .little);
+
+        if (magic == SUPERBLOCK_MAGIC) {
+            try self.loadFromSuperblock(page.data);
+        } else if (magic == METADATA_MAGIC) {
+            // Legacy single-page catalog. Parse it now; it will be transparently
+            // migrated to the superblock format on the next metadata rewrite.
+            self.legacy_format = true;
+            try self.parseLegacyCatalog();
+        }
+        // else: new/empty database — leave self.catalog at defaults.
+    }
+
+    /// Parse the versioned superblock and load the active catalog chain.
+    fn loadFromSuperblock(self: *Self, sb: []const u8) !void {
+        if (sb.len < SB_OFF_HEADER_CHECKSUM + 4) return error.CorruptCatalog;
+
+        const stored_checksum = std.mem.readInt(u32, sb[SB_OFF_HEADER_CHECKSUM..][0..4], .little);
+        if (stored_checksum != std.hash.Crc32.hash(sb[0..SB_HEADER_LEN])) {
+            return error.CorruptCatalog;
+        }
+
+        const version = std.mem.readInt(u16, sb[SB_OFF_VERSION..][0..2], .little);
+        if (version > CATALOG_FORMAT_VERSION) return error.UnsupportedDatabaseFormat;
+
+        var state = CatalogState{};
+        state.active_slot = sb[SB_OFF_ACTIVE];
+        if (state.active_slot > 1) return error.CorruptCatalog;
+        state.generation = std.mem.readInt(u64, sb[SB_OFF_GENERATION..][0..8], .little);
+        state.slots[0] = readSlotDescriptor(sb[SB_OFF_SLOT_A..][0..SLOT_DESC_LEN]);
+        state.slots[1] = readSlotDescriptor(sb[SB_OFF_SLOT_B..][0..SLOT_DESC_LEN]);
+
+        self.catalog = state;
+        self.legacy_format = false;
+
+        const active = state.slots[state.active_slot];
+        if (active.first_page == 0 or active.payload_len == 0) return; // empty catalog
+
+        const payload = try self.readCatalogChain(active);
+        defer self.allocator.free(payload);
+
+        if (std.hash.Crc32.hash(payload) != active.checksum) return error.CorruptCatalog;
+        try self.deserializeCatalog(payload);
+    }
+
+    /// Reassemble a slot's payload by walking its page chain.
+    fn readCatalogChain(self: *Self, slot: SlotDescriptor) ![]u8 {
+        const payload_len: usize = @intCast(slot.payload_len);
+        const buf = try self.allocator.alloc(u8, payload_len);
+        errdefer self.allocator.free(buf);
+
+        const capacity: usize = self.pager.page_size - CATALOG_PAGE_HEADER;
+        var current = slot.first_page;
+        var read_total: usize = 0;
+        var pages_visited: u32 = 0;
+        while (current != 0 and read_total < payload_len) {
+            if (pages_visited >= slot.page_count) return error.CorruptCatalog;
+            const page = try self.pager.getPage(current);
+            if (page.data.len < CATALOG_PAGE_HEADER) return error.CorruptCatalog;
+            const next = std.mem.readInt(u32, page.data[0..4], .little);
+            const page_len = std.mem.readInt(u32, page.data[4..8], .little);
+            if (page_len > capacity) return error.CorruptCatalog;
+            if (read_total + page_len > payload_len) return error.CorruptCatalog;
+            @memcpy(buf[read_total..][0..page_len], page.data[CATALOG_PAGE_HEADER..][0..page_len]);
+            read_total += page_len;
+            current = next;
+            pages_visited += 1;
+        }
+        if (read_total != payload_len) return error.CorruptCatalog;
+        return buf;
+    }
+
+    /// Decode a serialized catalog payload into in-memory tables/indexes/FTS.
+    /// Because the payload checksum is verified before this runs, any structural
+    /// inconsistency is treated as corruption rather than silently truncated.
+    fn deserializeCatalog(self: *Self, payload: []const u8) !void {
+        var offset: usize = 0;
+
+        if (offset + 4 > payload.len) return error.CorruptCatalog;
+        const table_count = std.mem.readInt(u32, payload[offset..][0..4], .little);
+        offset += 4;
+
+        var tables_loaded: u32 = 0;
+        while (tables_loaded < table_count) : (tables_loaded += 1) {
+            if (offset + 2 > payload.len) return error.CorruptCatalog;
+            const name_len = std.mem.readInt(u16, payload[offset..][0..2], .little);
+            offset += 2;
+            if (offset + name_len > payload.len) return error.CorruptCatalog;
+            const table_name = try self.allocator.dupe(u8, payload[offset..][0..name_len]);
+            offset += name_len;
+            errdefer self.allocator.free(table_name);
+
+            if (offset + 16 > payload.len) return error.CorruptCatalog;
+            const root_page = std.mem.readInt(u32, payload[offset..][0..4], .little);
+            offset += 4;
+            const row_count = std.mem.readInt(u64, payload[offset..][0..8], .little);
+            offset += 8;
+            const deleted_count = std.mem.readInt(u32, payload[offset..][0..4], .little);
+            offset += 4;
+
+            var deleted_keys = std.AutoHashMap(u64, void).init(self.allocator);
+            errdefer deleted_keys.deinit();
+            var dk_idx: u32 = 0;
+            while (dk_idx < deleted_count) : (dk_idx += 1) {
+                if (offset + 8 > payload.len) return error.CorruptCatalog;
+                const key = std.mem.readInt(u64, payload[offset..][0..8], .little);
+                offset += 8;
+                try deleted_keys.put(key, {});
+            }
+
+            if (offset + 2 > payload.len) return error.CorruptCatalog;
+            const column_count = std.mem.readInt(u16, payload[offset..][0..2], .little);
+            offset += 2;
+
+            var columns = try self.allocator.alloc(Column, column_count);
+            var col_idx: usize = 0;
+            errdefer {
+                for (columns[0..col_idx]) |col| self.allocator.free(col.name);
+                self.allocator.free(columns);
+            }
+            while (col_idx < column_count) : (col_idx += 1) {
+                if (offset + 2 > payload.len) return error.CorruptCatalog;
+                const col_name_len = std.mem.readInt(u16, payload[offset..][0..2], .little);
+                offset += 2;
+                if (offset + col_name_len + 2 > payload.len) return error.CorruptCatalog;
+                columns[col_idx].name = try self.allocator.dupe(u8, payload[offset..][0..col_name_len]);
+                offset += col_name_len;
+                columns[col_idx].data_type = @enumFromInt(payload[offset]);
+                offset += 1;
+                const flags = payload[offset];
+                offset += 1;
+                columns[col_idx].is_primary_key = (flags & 0x01) != 0;
+                columns[col_idx].is_nullable = (flags & 0x02) != 0;
+                columns[col_idx].default_value = null;
+            }
+
+            const schema = TableSchema{ .columns = columns[0..col_idx] };
+            const table = try Table.loadWithDeletedKeys(self.allocator, self.pager, table_name, schema, root_page, row_count, deleted_keys);
+            // Ownership of table_name and deleted_keys transferred to the table.
+            for (columns[0..col_idx]) |col| self.allocator.free(col.name);
+            self.allocator.free(columns);
+            try self.tables.put(table_name, table);
+        }
+
+        if (offset + 4 > payload.len) return error.CorruptCatalog;
+        const index_count = std.mem.readInt(u32, payload[offset..][0..4], .little);
+        offset += 4;
+
+        var indexes_loaded: u32 = 0;
+        while (indexes_loaded < index_count) : (indexes_loaded += 1) {
+            if (offset + 2 > payload.len) return error.CorruptCatalog;
+            const index_name_len = std.mem.readInt(u16, payload[offset..][0..2], .little);
+            offset += 2;
+            if (offset + index_name_len > payload.len) return error.CorruptCatalog;
+            const index_name = payload[offset..][0..index_name_len];
+            offset += index_name_len;
+
+            if (offset + 2 > payload.len) return error.CorruptCatalog;
+            const table_name_len = std.mem.readInt(u16, payload[offset..][0..2], .little);
+            offset += 2;
+            if (offset + table_name_len > payload.len) return error.CorruptCatalog;
+            const table_name = payload[offset..][0..table_name_len];
+            offset += table_name_len;
+
+            if (offset + 3 > payload.len) return error.CorruptCatalog;
+            const flags = payload[offset];
+            offset += 1;
+            const is_unique = (flags & 0x01) != 0;
+            const idx_column_count = std.mem.readInt(u16, payload[offset..][0..2], .little);
+            offset += 2;
+
+            var column_names = try self.allocator.alloc([]const u8, idx_column_count);
+            var loaded_columns: usize = 0;
+            errdefer {
+                for (column_names[0..loaded_columns]) |cn| self.allocator.free(cn);
+                self.allocator.free(column_names);
+            }
+            while (loaded_columns < idx_column_count) : (loaded_columns += 1) {
+                if (offset + 2 > payload.len) return error.CorruptCatalog;
+                const cn_len = std.mem.readInt(u16, payload[offset..][0..2], .little);
+                offset += 2;
+                if (offset + cn_len > payload.len) return error.CorruptCatalog;
+                column_names[loaded_columns] = try self.allocator.dupe(u8, payload[offset..][0..cn_len]);
+                offset += cn_len;
+            }
+
+            const index = try self.registerIndex(index_name, table_name, column_names[0..loaded_columns], is_unique);
+            try self.rebuildIndex(index);
+
+            for (column_names[0..loaded_columns]) |cn| self.allocator.free(cn);
+            self.allocator.free(column_names);
+        }
+
+        // Table extensions: per-column default values.
+        if (offset + 4 > payload.len) return error.CorruptCatalog;
+        const table_extension_count = std.mem.readInt(u32, payload[offset..][0..4], .little);
+        offset += 4;
+
+        var table_extensions_loaded: u32 = 0;
+        while (table_extensions_loaded < table_extension_count) : (table_extensions_loaded += 1) {
+            if (offset + 2 > payload.len) return error.CorruptCatalog;
+            const table_name_len = std.mem.readInt(u16, payload[offset..][0..2], .little);
+            offset += 2;
+            if (offset + table_name_len + 2 > payload.len) return error.CorruptCatalog;
+            const table_name = payload[offset..][0..table_name_len];
+            offset += table_name_len;
+            const default_count = std.mem.readInt(u16, payload[offset..][0..2], .little);
+            offset += 2;
+
+            if (self.getTable(table_name)) |table| {
+                var defaults_loaded: u16 = 0;
+                while (defaults_loaded < default_count) : (defaults_loaded += 1) {
+                    if (offset + 2 > payload.len) return error.CorruptCatalog;
+                    const column_name_len = std.mem.readInt(u16, payload[offset..][0..2], .little);
+                    offset += 2;
+                    if (offset + column_name_len > payload.len) return error.CorruptCatalog;
+                    const column_name = payload[offset..][0..column_name_len];
+                    offset += column_name_len;
+
+                    const default_value = try self.readDefaultValue(payload, &offset);
+                    if (table.getColumnIndex(column_name)) |column_idx| {
+                        if (table.schema.columns[column_idx].default_value) |existing| {
+                            existing.deinit(self.allocator);
+                        }
+                        table.schema.columns[column_idx].default_value = default_value;
+                    } else {
+                        default_value.deinit(self.allocator);
+                    }
+                }
+            } else {
+                var defaults_skipped: u16 = 0;
+                while (defaults_skipped < default_count) : (defaults_skipped += 1) {
+                    if (offset + 2 > payload.len) return error.CorruptCatalog;
+                    const column_name_len = std.mem.readInt(u16, payload[offset..][0..2], .little);
+                    offset += 2;
+                    if (offset + column_name_len > payload.len) return error.CorruptCatalog;
+                    offset += column_name_len;
+                    var skipped_default = try self.readDefaultValue(payload, &offset);
+                    skipped_default.deinit(self.allocator);
+                }
+            }
+        }
+
+        // FTS indexes
+        if (offset + 4 > payload.len) return error.CorruptCatalog;
+        const fts_count = std.mem.readInt(u32, payload[offset..][0..4], .little);
+        offset += 4;
+
+        var fts_loaded: u32 = 0;
+        while (fts_loaded < fts_count) : (fts_loaded += 1) {
+            if (offset + 2 > payload.len) return error.CorruptCatalog;
+            const table_name_len = std.mem.readInt(u16, payload[offset..][0..2], .little);
+            offset += 2;
+            if (offset + table_name_len + 2 > payload.len) return error.CorruptCatalog;
+            const table_name = payload[offset..][0..table_name_len];
+            offset += table_name_len;
+            const fts_column_count = std.mem.readInt(u16, payload[offset..][0..2], .little);
+            offset += 2;
+
+            var column_names = try self.allocator.alloc([]const u8, fts_column_count);
+            var loaded_columns: usize = 0;
+            errdefer {
+                for (column_names[0..loaded_columns]) |cn| self.allocator.free(cn);
+                self.allocator.free(column_names);
+            }
+            while (loaded_columns < fts_column_count) : (loaded_columns += 1) {
+                if (offset + 2 > payload.len) return error.CorruptCatalog;
+                const cn_len = std.mem.readInt(u16, payload[offset..][0..2], .little);
+                offset += 2;
+                if (offset + cn_len > payload.len) return error.CorruptCatalog;
+                column_names[loaded_columns] = try self.allocator.dupe(u8, payload[offset..][0..cn_len]);
+                offset += cn_len;
+            }
+
+            try self.createFTSIndex(table_name, column_names[0..loaded_columns]);
+            if (self.getFTSIndex(table_name)) |fts_index| {
+                try self.rebuildFTSIndex(fts_index);
+            }
+
+            for (column_names[0..loaded_columns]) |cn| self.allocator.free(cn);
+            self.allocator.free(column_names);
+        }
+
+        // Optional CHECK constraint extension appended after the original
+        // catalog sections. Catalogs written before this extension end here.
+        if (offset == payload.len) return;
+        if (offset + 4 > payload.len) return error.CorruptCatalog;
+        const check_extension_count = std.mem.readInt(u32, payload[offset..][0..4], .little);
+        offset += 4;
+
+        var check_extensions_loaded: u32 = 0;
+        while (check_extensions_loaded < check_extension_count) : (check_extensions_loaded += 1) {
+            if (offset + 2 > payload.len) return error.CorruptCatalog;
+            const table_name_len = std.mem.readInt(u16, payload[offset..][0..2], .little);
+            offset += 2;
+            if (offset + table_name_len + 2 > payload.len) return error.CorruptCatalog;
+            const table_name = payload[offset..][0..table_name_len];
+            offset += table_name_len;
+            const check_count = std.mem.readInt(u16, payload[offset..][0..2], .little);
+            offset += 2;
+
+            var checks = try self.allocator.alloc(ast.Condition, check_count);
+            var checks_loaded: usize = 0;
+            errdefer {
+                for (checks[0..checks_loaded]) |*condition| condition.deinit(self.allocator);
+                self.allocator.free(checks);
+            }
+
+            while (checks_loaded < check_count) : (checks_loaded += 1) {
+                checks[checks_loaded] = try self.readCheckCondition(payload, &offset);
+            }
+
+            if (self.getTable(table_name)) |table| {
+                for (table.schema.check_constraints) |*condition| condition.deinit(self.allocator);
+                if (table.schema.check_constraints.len > 0) self.allocator.free(table.schema.check_constraints);
+                table.schema.check_constraints = checks;
+            } else {
+                for (checks[0..checks_loaded]) |*condition| condition.deinit(self.allocator);
+                self.allocator.free(checks);
+            }
+        }
+
+        if (offset == payload.len) return;
+        if (offset + 4 > payload.len) return error.CorruptCatalog;
+        const fk_extension_count = std.mem.readInt(u32, payload[offset..][0..4], .little);
+        offset += 4;
+
+        var fk_extensions_loaded: u32 = 0;
+        while (fk_extensions_loaded < fk_extension_count) : (fk_extensions_loaded += 1) {
+            if (offset + 2 > payload.len) return error.CorruptCatalog;
+            const table_name_len = std.mem.readInt(u16, payload[offset..][0..2], .little);
+            offset += 2;
+            if (offset + table_name_len + 2 > payload.len) return error.CorruptCatalog;
+            const table_name = payload[offset..][0..table_name_len];
+            offset += table_name_len;
+            const foreign_key_count = std.mem.readInt(u16, payload[offset..][0..2], .little);
+            offset += 2;
+
+            var foreign_keys = try self.allocator.alloc(ast.ForeignKeyConstraint, foreign_key_count);
+            var foreign_keys_loaded: usize = 0;
+            errdefer {
+                for (foreign_keys[0..foreign_keys_loaded]) |foreign_key| foreign_key.deinit(self.allocator);
+                self.allocator.free(foreign_keys);
+            }
+
+            while (foreign_keys_loaded < foreign_key_count) : (foreign_keys_loaded += 1) {
+                foreign_keys[foreign_keys_loaded] = try self.readForeignKey(payload, &offset);
+            }
+
+            if (self.getTable(table_name)) |table| {
+                for (table.schema.foreign_keys) |foreign_key| foreign_key.deinit(self.allocator);
+                if (table.schema.foreign_keys.len > 0) self.allocator.free(table.schema.foreign_keys);
+                table.schema.foreign_keys = foreign_keys;
+            } else {
+                for (foreign_keys[0..foreign_keys_loaded]) |foreign_key| foreign_key.deinit(self.allocator);
+                self.allocator.free(foreign_keys);
+            }
+        }
+    }
+
+    /// Parse the legacy single-page (page 1) catalog format. Retained so existing
+    /// databases keep opening; they are migrated on the next metadata rewrite.
+    fn parseLegacyCatalog(self: *Self) !void {
         if (self.is_memory) return; // No persistence for in-memory databases
 
-        // Try to read metadata page
-        const page = self.pager.getPage(METADATA_PAGE_ID) catch return;
+        const page = try self.pager.getPage(METADATA_PAGE_ID);
 
         // Check magic number
         if (page.data.len < 8) return;
@@ -1408,6 +2130,8 @@ pub const Table = struct {
 /// Table schema definition
 pub const TableSchema = struct {
     columns: []Column,
+    check_constraints: []ast.Condition = &.{},
+    foreign_keys: []ast.ForeignKeyConstraint = &.{},
 
     pub fn deinit(self: *TableSchema, allocator: std.mem.Allocator) void {
         // Clean up column names and default values
@@ -1418,6 +2142,14 @@ pub const TableSchema = struct {
             }
         }
         allocator.free(self.columns);
+        for (self.check_constraints) |*condition| {
+            condition.deinit(allocator);
+        }
+        if (self.check_constraints.len > 0) allocator.free(self.check_constraints);
+        for (self.foreign_keys) |foreign_key| {
+            foreign_key.deinit(allocator);
+        }
+        if (self.foreign_keys.len > 0) allocator.free(self.foreign_keys);
     }
 
     /// Deep clone schema with a new allocator (for ownership transfer)
@@ -1434,14 +2166,134 @@ pub const TableSchema = struct {
                     try default_val.clone(allocator)
                 else
                     null,
+                .is_unique = column.is_unique,
             };
+        }
+
+        var cloned_checks = try allocator.alloc(ast.Condition, self.check_constraints.len);
+        var checks_cloned: usize = 0;
+        errdefer {
+            for (cloned_checks[0..checks_cloned]) |*condition| {
+                condition.deinit(allocator);
+            }
+            allocator.free(cloned_checks);
+        }
+
+        for (self.check_constraints, 0..) |*condition, i| {
+            cloned_checks[i] = try cloneAstCondition(allocator, condition);
+            checks_cloned = i + 1;
+        }
+
+        var cloned_foreign_keys = try allocator.alloc(ast.ForeignKeyConstraint, self.foreign_keys.len);
+        var foreign_keys_cloned: usize = 0;
+        errdefer {
+            for (cloned_foreign_keys[0..foreign_keys_cloned]) |foreign_key| {
+                foreign_key.deinit(allocator);
+            }
+            allocator.free(cloned_foreign_keys);
+        }
+
+        for (self.foreign_keys, 0..) |foreign_key, i| {
+            cloned_foreign_keys[i] = try cloneAstForeignKey(allocator, foreign_key);
+            foreign_keys_cloned = i + 1;
         }
 
         return TableSchema{
             .columns = cloned_columns,
+            .check_constraints = cloned_checks,
+            .foreign_keys = cloned_foreign_keys,
         };
     }
 };
+
+fn cloneAstForeignKey(allocator: std.mem.Allocator, foreign_key: ast.ForeignKeyConstraint) CloneValueError!ast.ForeignKeyConstraint {
+    return .{
+        .column = if (foreign_key.column) |column| try allocator.dupe(u8, column) else null,
+        .reference_table = try allocator.dupe(u8, foreign_key.reference_table),
+        .reference_column = try allocator.dupe(u8, foreign_key.reference_column),
+        .on_delete = foreign_key.on_delete,
+        .on_update = foreign_key.on_update,
+    };
+}
+
+fn cloneAstValue(allocator: std.mem.Allocator, value: ast.Value) CloneValueError!ast.Value {
+    return switch (value) {
+        .Integer => |v| ast.Value{ .Integer = v },
+        .Text => |v| ast.Value{ .Text = try allocator.dupe(u8, v) },
+        .Real => |v| ast.Value{ .Real = v },
+        .Blob => |v| ast.Value{ .Blob = try allocator.dupe(u8, v) },
+        .Null => ast.Value.Null,
+        .Parameter => |v| ast.Value{ .Parameter = v },
+        .FunctionCall, .Case => error.SyntaxError,
+    };
+}
+
+fn cloneAstExpression(allocator: std.mem.Allocator, expr: ast.Expression) CloneValueError!ast.Expression {
+    return switch (expr) {
+        .Column => |column| ast.Expression{ .Column = try allocator.dupe(u8, column) },
+        .Literal => |value| ast.Expression{ .Literal = try cloneAstValue(allocator, value) },
+        .Parameter => |param| ast.Expression{ .Parameter = param },
+        .BinaryOp => |bin| blk: {
+            const left = try allocator.create(ast.Expression);
+            errdefer allocator.destroy(left);
+            left.* = try cloneAstExpression(allocator, bin.left.*);
+            errdefer left.deinit(allocator);
+
+            const right = try allocator.create(ast.Expression);
+            errdefer allocator.destroy(right);
+            right.* = try cloneAstExpression(allocator, bin.right.*);
+            errdefer right.deinit(allocator);
+
+            break :blk ast.Expression{ .BinaryOp = .{
+                .left = left,
+                .op = bin.op,
+                .right = right,
+            } };
+        },
+        .InList => |list| blk: {
+            var cloned = try allocator.alloc(ast.Value, list.len);
+            var cloned_count: usize = 0;
+            errdefer {
+                for (cloned[0..cloned_count]) |*value| value.deinit(allocator);
+                allocator.free(cloned);
+            }
+            for (list, 0..) |value, i| {
+                cloned[i] = try cloneAstValue(allocator, value);
+                cloned_count = i + 1;
+            }
+            break :blk ast.Expression{ .InList = cloned };
+        },
+        .Subquery => error.SyntaxError,
+    };
+}
+
+fn cloneAstCondition(allocator: std.mem.Allocator, condition: *const ast.Condition) CloneValueError!ast.Condition {
+    return switch (condition.*) {
+        .Comparison => |comp| ast.Condition{ .Comparison = .{
+            .left = try cloneAstExpression(allocator, comp.left),
+            .operator = comp.operator,
+            .right = try cloneAstExpression(allocator, comp.right),
+            .extra = if (comp.extra) |extra| try cloneAstExpression(allocator, extra) else null,
+        } },
+        .Logical => |logical| blk: {
+            const left = try allocator.create(ast.Condition);
+            errdefer allocator.destroy(left);
+            left.* = try cloneAstCondition(allocator, logical.left);
+            errdefer left.deinit(allocator);
+
+            const right = try allocator.create(ast.Condition);
+            errdefer allocator.destroy(right);
+            right.* = try cloneAstCondition(allocator, logical.right);
+            errdefer right.deinit(allocator);
+
+            break :blk ast.Condition{ .Logical = .{
+                .left = left,
+                .operator = logical.operator,
+                .right = right,
+            } };
+        },
+    };
+}
 
 /// Column definition
 pub const Column = struct {
@@ -1450,6 +2302,10 @@ pub const Column = struct {
     is_primary_key: bool,
     is_nullable: bool,
     default_value: ?DefaultValue,
+    /// Set when the column carries an inline UNIQUE constraint. Enforcement is
+    /// implemented by auto-creating a unique index at table creation, so this
+    /// flag only needs to survive planning; it is not part of the catalog format.
+    is_unique: bool = false,
 
     pub const DefaultValue = union(enum) {
         Literal: Value,

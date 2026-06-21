@@ -275,12 +275,14 @@ Caches query results for repeated SELECT statements.
 
 ### Enabling Features
 
-Experimental code is built through the normal project profiles and feature flags:
+Experimental code requires the experimental profile or explicit feature flags:
 
 ```bash
-zig build -Dprofile=full
+zig build -Dprofile=experimental
 zig build -Dcrypto=true -Dtransport=true -Dconcurrent=true
 ```
+
+`full` remains a compatibility alias for `experimental`, but new automation should use the explicit name.
 
 Current boolean feature flags exposed by the build are:
 

@@ -16,7 +16,7 @@ echo ""
 
 # Run tests - Zig's GeneralPurposeAllocator detects leaks automatically
 echo "Running tests with GPA leak detection..."
-if $ZIG build test -Dprofile=full --summary all 2>&1; then
+if $ZIG build test -Dprofile=experimental --summary all 2>&1; then
     echo ""
     echo "✓ No memory leaks detected"
 else

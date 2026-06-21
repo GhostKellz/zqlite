@@ -59,6 +59,11 @@ pub const Tokenizer = struct {
                 return try self.readString(allocator);
             }
 
+            // Named parameters (:name, @name, $name)
+            if (self.current_char.? == ':' or self.current_char.? == '@' or self.current_char.? == '$') {
+                return try self.readNamedParameter(allocator);
+            }
+
             // Operators and punctuation
             switch (self.current_char.?) {
                 '=' => {
@@ -267,6 +272,23 @@ pub const Tokenizer = struct {
         const owned_string = try allocator.dupe(u8, string_content);
         return Token{ .String = owned_string };
     }
+
+    fn readNamedParameter(self: *Self, allocator: std.mem.Allocator) !Token {
+        const start = self.position;
+        self.advance();
+
+        if (self.current_char == null or !(std.ascii.isAlphabetic(self.current_char.?) or self.current_char.? == '_')) {
+            return error.UnexpectedCharacter;
+        }
+
+        while (self.current_char != null and
+            (std.ascii.isAlphanumeric(self.current_char.?) or self.current_char.? == '_'))
+        {
+            self.advance();
+        }
+
+        return Token{ .NamedParameter = try allocator.dupe(u8, self.input[start..self.position]) };
+    }
 };
 
 /// SQL tokens
@@ -276,6 +298,7 @@ pub const Token = union(enum) {
     Real: f64,
     String: []const u8,
     Identifier: []const u8,
+    NamedParameter: []const u8,
 
     // Keywords
     Select,
@@ -301,6 +324,9 @@ pub const Token = union(enum) {
     Begin,
     Commit,
     Rollback,
+    Savepoint,
+    Release,
+    To,
     If,
     Exists,
     Limit,
@@ -434,6 +460,7 @@ pub const Token = union(enum) {
         switch (self) {
             .String => |str| allocator.free(str),
             .Identifier => |id| allocator.free(id),
+            .NamedParameter => |name| allocator.free(name),
             else => {},
         }
     }
@@ -488,6 +515,12 @@ fn getKeyword(identifier: []const u8) ?Token {
         .{ "commit", .Commit },
         .{ "ROLLBACK", .Rollback },
         .{ "rollback", .Rollback },
+        .{ "SAVEPOINT", .Savepoint },
+        .{ "savepoint", .Savepoint },
+        .{ "RELEASE", .Release },
+        .{ "release", .Release },
+        .{ "TO", .To },
+        .{ "to", .To },
         .{ "IF", .If },
         .{ "if", .If },
         .{ "EXISTS", .Exists },

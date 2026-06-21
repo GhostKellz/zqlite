@@ -2,6 +2,8 @@
 
 ZQLite is in beta. This document clarifies feature maturity.
 
+The default `advanced` build excludes crypto and transport scaffolding. See the [Stability and Compatibility Policy](../project/stability-policy.md) for the authoritative product boundary.
+
 ## Core Features (Stable API)
 
 These features have stable APIs and are the primary focus:
@@ -13,7 +15,7 @@ These features have stable APIs and are the primary focus:
 | Write-Ahead Log | Stable |
 | In-Memory Mode | Stable |
 | Prepared Statements | Stable |
-| Connection Pooling | Stable |
+| Connection Pooling | Partial |
 | Field Encryption | Experimental / internal building blocks only |
 | Full-Text Search | Stable with phrase, boolean, and file-backed reopen coverage |
 | ATTACH DATABASE | Stable |
@@ -32,6 +34,7 @@ These are proof-of-concept or incomplete:
 | Hot Standby | In-memory only |
 | Two-Phase Commit | Single-node simulation |
 | Window Functions | Partial, PARTITION BY present but advanced framing remains limited |
+| Query Cache | Partial, connection-local invalidation only |
 | Windows Platform | WAL/pager unsupported |
 
 ## Do Not Use Experimental Features For

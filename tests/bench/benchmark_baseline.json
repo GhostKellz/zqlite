@@ -19,5 +19,5 @@
       "description": "UPDATE operations"
     }
   },
-  "notes": "CI regression thresholds. Actual thresholds are in benchmark_validator.zig. Update this file when changing validator thresholds."
+  "notes": "Documented benchmark thresholds. The executable source of truth is the benchmarks array in benchmark_validator.zig; it uses monotonic timing, warmups, multiple samples, and median/p95 reporting."
 }

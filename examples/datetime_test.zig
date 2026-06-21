@@ -7,8 +7,8 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     // Initialize database
-    var db = try zqlite.Database.init(allocator, ":memory:");
-    defer db.deinit();
+    const db = try zqlite.openMemory(allocator);
+    defer db.close();
 
     std.log.info("Testing datetime function support...", .{});
 
@@ -36,7 +36,7 @@ pub fn main() !void {
     const select_sql = "SELECT * FROM test_table;";
 
     std.log.info("Querying data to check default value...", .{});
-    const result = try db.query(select_sql);
+    var result = try db.query(select_sql);
     defer result.deinit();
 
     if (result.rows.items.len > 0) {
@@ -75,7 +75,7 @@ pub fn main() !void {
 
     for (datetime_tests) |test_case| {
         std.log.info("Testing {s}...", .{test_case.name});
-        const test_result = db.query(test_case.sql) catch |err| {
+        var test_result = db.query(test_case.sql) catch |err| {
             std.log.err("✗ Failed to execute {s}: {}", .{ test_case.name, err });
             continue;
         };

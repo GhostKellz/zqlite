@@ -13,8 +13,8 @@ pub fn main() !void {
     std.debug.print("🛡️  ZQLite INSERT Memory Management Regression Test\n\n", .{});
 
     // Create in-memory database connection
-    var connection = try zqlite.openMemory();
-    // Note: Connection cleanup handled by process termination
+    const connection = try zqlite.openMemory(allocator);
+    defer connection.close();
 
     // Test Case 1: Basic table creation
     std.debug.print("✅ Test Case 1: Table creation...\n", .{});

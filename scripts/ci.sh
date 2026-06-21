@@ -27,7 +27,7 @@ echo ""
 
 # Step 2: Build all profiles
 echo "=== Step 2: Build All Profiles ==="
-for profile in core advanced full; do
+for profile in core advanced experimental; do
     echo "Building profile: $profile"
     if $ZIG build -Dprofile="$profile" 2>&1; then
         echo "  ✓ $profile build passed"
@@ -40,7 +40,7 @@ echo ""
 
 # Step 3: Run tests for all profiles
 echo "=== Step 3: Test All Profiles ==="
-for profile in core advanced full; do
+for profile in core advanced experimental; do
     echo "Testing profile: $profile"
     if $ZIG build test -Dprofile="$profile" --summary all 2>&1 | tail -5; then
         echo "  ✓ $profile tests passed"
@@ -53,7 +53,7 @@ echo ""
 
 # Step 4: Release build verification
 echo "=== Step 4: Release Build ==="
-if $ZIG build -Dprofile=full -Doptimize=ReleaseFast 2>&1; then
+if $ZIG build -Dprofile=experimental -Doptimize=ReleaseFast 2>&1; then
     echo "✓ Release build passed"
 else
     echo "✗ Release build FAILED"

@@ -3,7 +3,7 @@ const zqlite = @import("zqlite");
 
 fn getNanoTime() i128 {
     var ts: std.posix.timespec = undefined;
-    const result = std.posix.system.clock_gettime(.REALTIME, &ts);
+    const result = std.posix.system.clock_gettime(.MONOTONIC, &ts);
     if (std.posix.errno(result) == .SUCCESS) {
         return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
     }
@@ -15,7 +15,7 @@ fn getNanoTime() i128 {
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
-    std.debug.print("\n🚀 ZQLite Simple Benchmark Suite (v1.3.4)\n", .{});
+    std.debug.print("\n🚀 ZQLite Simple Benchmark Suite\n", .{});
     std.debug.print("================================================================================\n\n", .{});
 
     var conn = try zqlite.open(allocator, ":memory:");
