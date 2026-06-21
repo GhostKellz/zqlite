@@ -251,21 +251,29 @@ pub const Tokenizer = struct {
         const quote_char = self.current_char.?;
         self.advance(); // Skip opening quote
 
-        const start = self.position;
+        // Build the string content, collapsing SQL-standard escaped quotes
+        // (a doubled quote `''` inside the literal represents a single `'`).
+        var content: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer content.deinit(allocator);
 
-        while (self.current_char != null and self.current_char.? != quote_char) {
+        while (self.current_char) |c| {
+            if (c == quote_char) {
+                self.advance(); // consume the quote
+                // A doubled quote is an escaped literal quote, not the terminator.
+                if (self.current_char == quote_char) {
+                    try content.append(allocator, quote_char);
+                    self.advance();
+                    continue;
+                }
+                // Otherwise this was the closing quote.
+                const owned_string = try content.toOwnedSlice(allocator);
+                return Token{ .String = owned_string };
+            }
+            try content.append(allocator, c);
             self.advance();
         }
 
-        if (self.current_char == null) {
-            return error.UnterminatedString;
-        }
-
-        const string_content = self.input[start..self.position];
-        self.advance(); // Skip closing quote
-
-        const owned_string = try allocator.dupe(u8, string_content);
-        return Token{ .String = owned_string };
+        return error.UnterminatedString;
     }
 };
 
@@ -735,4 +743,31 @@ test "tokenizer numbers" {
     const token2 = try tokenizer.nextToken(allocator);
     defer token2.deinit(allocator);
     try std.testing.expectEqual(@as(f64, 3.14), token2.Real);
+}
+
+test "tokenizer escaped single quote" {
+    const allocator = std.testing.allocator;
+    var tokenizer = Tokenizer.init("'it''s a test'");
+
+    const token = try tokenizer.nextToken(allocator);
+    defer token.deinit(allocator);
+    try std.testing.expectEqualStrings("it's a test", token.String);
+}
+
+test "tokenizer trailing escaped quote" {
+    const allocator = std.testing.allocator;
+    var tokenizer = Tokenizer.init("'end''");
+
+    const token = try tokenizer.nextToken(allocator);
+    defer token.deinit(allocator);
+    try std.testing.expectEqualStrings("end'", token.String);
+}
+
+test "tokenizer empty string" {
+    const allocator = std.testing.allocator;
+    var tokenizer = Tokenizer.init("''");
+
+    const token = try tokenizer.nextToken(allocator);
+    defer token.deinit(allocator);
+    try std.testing.expectEqualStrings("", token.String);
 }

@@ -1363,3 +1363,41 @@ test "memory connection" {
     // Test will be implemented when storage engine is ready
     try std.testing.expect(true);
 }
+
+test "UPDATE SET binds parameters" {
+    const allocator = std.testing.allocator;
+    var conn = try Connection.openMemory(allocator);
+    defer conn.deinit();
+
+    try conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, n INTEGER)");
+    try conn.execute("INSERT INTO t (id, name, n) VALUES (1, 'orig', 10)");
+
+    var stmt = try conn.prepare("UPDATE t SET name = ?, n = ? WHERE id = ?");
+    defer stmt.deinit();
+    try stmt.bindParameter(0, storage.Value{ .Text = "updated" });
+    try stmt.bindParameter(1, storage.Value{ .Integer = 42 });
+    try stmt.bindParameter(2, storage.Value{ .Integer = 1 });
+    var update_result = try stmt.execute();
+    update_result.deinit();
+
+    var rows = try conn.query("SELECT name, n FROM t WHERE id = 1");
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRowReturned;
+    // Before the fix, the bound SET values serialized to NULL.
+    try std.testing.expectEqualStrings("updated", row.getText(0) orelse return error.NullName);
+    try std.testing.expectEqual(@as(i64, 42), row.getInt(1) orelse return error.NullN);
+}
+
+test "string literal preserves escaped single quotes" {
+    const allocator = std.testing.allocator;
+    var conn = try Connection.openMemory(allocator);
+    defer conn.deinit();
+
+    try conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, msg TEXT)");
+    try conn.execute("INSERT INTO t (id, msg) VALUES (1, 'it''s a test')");
+
+    var rows = try conn.query("SELECT msg FROM t WHERE id = 1");
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRowReturned;
+    try std.testing.expectEqualStrings("it's a test", row.getText(0) orelse return error.NullMsg);
+}
