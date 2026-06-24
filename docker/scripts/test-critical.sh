@@ -3,15 +3,15 @@
 set -e
 
 ZIG=/opt/zig-dev/zig
-cd /workspace/zqlite
+ROOT=/workspace/zqlite
+cd "$ROOT"
 
 echo "=== ZQLite Critical Path Tests ==="
 echo ""
 
-TESTDIR=/tmp/zqlite_critical_tests
-rm -rf "$TESTDIR"
-mkdir -p "$TESTDIR"
-rm -f /tmp/zqlite_*.db
+BIN_DIR="$ROOT/.zig-cache/docker-critical/bin"
+rm -rf "$BIN_DIR"
+mkdir -p "$BIN_DIR"
 
 run_test() {
     name=$1
@@ -21,12 +21,10 @@ run_test() {
         --dep zqlite \
         -Mroot="$src" \
         -Mzqlite=src/zqlite.zig \
-        -femit-bin="$TESTDIR/$name"
+        -femit-bin="$BIN_DIR/$name"
 
     echo "--- Running $name ---"
-    cd "$TESTDIR"
-    ./"$name"
-    cd /workspace/zqlite
+    "$BIN_DIR/$name"
     echo ""
 }
 
@@ -52,8 +50,7 @@ run_test "index_persistence" "tests/standalone/test_index_persistence.zig"
 run_test "filesystem_errors" "tests/standalone/test_filesystem_errors.zig"
 
 echo "--- Cleanup ---"
-rm -rf "$TESTDIR"
-rm -f /tmp/zqlite_*.db
+rm -rf "$BIN_DIR"
 
 echo ""
 echo "=== ALL CRITICAL PATH TESTS PASSED ==="

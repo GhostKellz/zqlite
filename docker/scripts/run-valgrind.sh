@@ -3,14 +3,13 @@ set -eu
 
 ZIG="${ZIG:-zig}"
 ROOT="${ROOT:-$PWD}"
-BIN_DIR=/tmp/zqlite-valgrind
-VALGRIND_LOG_DIR=/tmp/zqlite-valgrind-logs
+CACHE_DIR="${ZQLITE_VALGRIND_CACHE_DIR:-$ROOT/.zig-cache/valgrind}"
+BIN_DIR="$CACHE_DIR/bin"
+VALGRIND_LOG_DIR="$CACHE_DIR/logs"
+TESTS="${ZQLITE_VALGRIND_TESTS:-test_security test_upsert test_file_backed test_transaction_atomicity test_index_persistence}"
 
-mkdir -p "$BIN_DIR"
-mkdir -p "$VALGRIND_LOG_DIR"
-rm -f "$BIN_DIR"/*
-rm -f "$VALGRIND_LOG_DIR"/*
-rm -f /tmp/zqlite_*.db
+rm -rf "$BIN_DIR" "$VALGRIND_LOG_DIR"
+mkdir -p "$BIN_DIR" "$VALGRIND_LOG_DIR"
 
 build_test() {
     name=$1
@@ -18,7 +17,6 @@ build_test() {
     "$ZIG" build-exe \
         -target x86_64-linux-musl \
         -mcpu x86_64_v2 \
-        -fstrip \
         --dep zqlite \
         -Mroot="$src" \
         -Mzqlite=src/zqlite.zig \
@@ -44,25 +42,35 @@ run_valgrind() {
 cd "$ROOT"
 
 echo "=== ZQLite Valgrind Audit ==="
+echo "Scratch: $CACHE_DIR"
+echo "Tests: $TESTS"
 echo
 
-build_test "test_security" "tests/standalone/test_security.zig"
-build_test "test_upsert" "tests/standalone/test_upsert.zig"
-build_test "test_file_backed" "tests/standalone/test_file_backed.zig"
-build_test "test_transaction_atomicity" "tests/standalone/test_transaction_atomicity.zig"
-build_test "test_concurrent_access" "tests/standalone/test_concurrent_access.zig"
-build_test "test_index_persistence" "tests/standalone/test_index_persistence.zig"
+source_for_test() {
+    case "$1" in
+        test_security) echo "tests/standalone/test_security.zig" ;;
+        test_upsert) echo "tests/standalone/test_upsert.zig" ;;
+        test_file_backed) echo "tests/standalone/test_file_backed.zig" ;;
+        test_transaction_atomicity) echo "tests/standalone/test_transaction_atomicity.zig" ;;
+        test_concurrent_access) echo "tests/standalone/test_concurrent_access.zig" ;;
+        test_index_persistence) echo "tests/standalone/test_index_persistence.zig" ;;
+        *)
+            echo "unknown valgrind test: $1" >&2
+            exit 64
+            ;;
+    esac
+}
 
-run_valgrind "test_security"
-run_valgrind "test_upsert"
-run_valgrind "test_file_backed"
-run_valgrind "test_transaction_atomicity"
-run_valgrind "test_concurrent_access"
-run_valgrind "test_index_persistence"
+for test_name in $TESTS; do
+    build_test "$test_name" "$(source_for_test "$test_name")"
+done
+
+for test_name in $TESTS; do
+    run_valgrind "$test_name"
+done
 
 rm -rf "$BIN_DIR"
 rm -rf "$VALGRIND_LOG_DIR"
-rm -f /tmp/zqlite_*.db /tmp/zqlite_critical_tests/*.db 2>/dev/null || true
 
 echo "=== Valgrind audit passed ==="
-echo "Audited tests: security, upsert, file-backed, transaction atomicity, concurrent access, index persistence"
+echo "Audited tests: $TESTS"

@@ -4,33 +4,30 @@
 set -e
 
 ZIG=/opt/zig-dev/zig
-cd /workspace/zqlite
+ROOT=/workspace/zqlite
+cd "$ROOT"
 
 echo "=== File-Backed Storage Tests ==="
 echo ""
 
-# Create temp directory for test databases
-TESTDIR=/tmp/zqlite_file_tests
-rm -rf "$TESTDIR"
-mkdir -p "$TESTDIR"
-rm -f /tmp/zqlite_*.db
+BIN_DIR="$ROOT/.zig-cache/docker-file-storage/bin"
+rm -rf "$BIN_DIR"
+mkdir -p "$BIN_DIR"
 
 echo "--- Building file storage test ---"
 $ZIG build-exe \
     --dep zqlite \
     -Mroot=tests/standalone/test_file_backed.zig \
     -Mzqlite=src/zqlite.zig \
-    -femit-bin="$TESTDIR/test_file_backed"
+    -femit-bin="$BIN_DIR/test_file_backed"
 
 echo ""
 echo "--- Running file storage tests ---"
-cd "$TESTDIR"
-./test_file_backed
+"$BIN_DIR/test_file_backed"
 
 echo ""
 echo "--- Cleanup ---"
-rm -rf "$TESTDIR"
-rm -f /tmp/zqlite_*.db
+rm -rf "$BIN_DIR"
 
 echo ""
 echo "=== FILE STORAGE TESTS PASSED ==="

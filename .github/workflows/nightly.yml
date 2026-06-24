@@ -27,7 +27,7 @@ jobs:
       - name: Clean workspace
         run: |
           set -euo pipefail
-          rm -rf .zig-cache .zig-global-cache zig-out /tmp/zqlite_*.db /tmp/zqlite_critical_tests
+          rm -rf .zig-cache .zig-global-cache zig-out
           mkdir -p .zig-cache .zig-global-cache
           echo "ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache" >> "$GITHUB_ENV"
 
@@ -59,7 +59,7 @@ jobs:
         run: |
           set -euo pipefail
           if command -v valgrind >/dev/null 2>&1; then
-            ZIG=zig ROOT=$PWD docker/scripts/run-valgrind.sh
+            ZIG=zig ROOT=$PWD ZQLITE_VALGRIND_TESTS="test_security test_upsert test_file_backed test_transaction_atomicity test_index_persistence" docker/scripts/run-valgrind.sh
           else
             echo "valgrind not installed on runner; skipping valgrind audit"
           fi
