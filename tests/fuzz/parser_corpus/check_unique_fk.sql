@@ -1,0 +1,1 @@
+CREATE TABLE books (id INTEGER PRIMARY KEY, author_id INTEGER REFERENCES authors(id), title TEXT UNIQUE, CHECK(id > 0));

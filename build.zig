@@ -20,6 +20,12 @@ pub fn build(b: *std.Build) void {
     // Individual feature flags (can override profile defaults)
     const enable_crypto = b.option(bool, "crypto", "Enable post-quantum crypto") orelse
         is_experimental;
+    const enable_liboqs = b.option(bool, "liboqs", "Enable experimental liboqs PQC backend placeholder") orelse
+        false;
+    const liboqs_include_path = b.option([]const u8, "liboqs-include-path", "Diagnostic-only liboqs include path; does not link liboqs yet") orelse
+        "";
+    const liboqs_library_path = b.option([]const u8, "liboqs-library-path", "Diagnostic-only liboqs library path; does not link liboqs yet") orelse
+        "";
     const enable_transport = b.option(bool, "transport", "Enable PQ-QUIC transport") orelse
         is_experimental;
     const enable_json = b.option(bool, "json", "Enable JSON support") orelse
@@ -37,6 +43,9 @@ pub fn build(b: *std.Build) void {
     // Add feature flags to build options
     build_options.addOption([]const u8, "profile", profile);
     build_options.addOption(bool, "enable_crypto", enable_crypto);
+    build_options.addOption(bool, "enable_liboqs", enable_liboqs);
+    build_options.addOption([]const u8, "liboqs_include_path", liboqs_include_path);
+    build_options.addOption([]const u8, "liboqs_library_path", liboqs_library_path);
     build_options.addOption(bool, "enable_transport", enable_transport);
     build_options.addOption(bool, "enable_json", enable_json);
     build_options.addOption(bool, "enable_performance", enable_performance);
@@ -107,6 +116,7 @@ pub fn build(b: *std.Build) void {
 
     // The installed C header is part of the supported C ABI contract.
     b.getInstallStep().dependOn(&b.addInstallHeaderFile(b.path("include/zqlite.h"), "zqlite.h").step);
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(b.path("include/zqlite_c.symbols"), .header, "zqlite_c.symbols").step);
 
     // Export the zqlite module for use by other packages
     const zqlite_module = b.addModule("zqlite", .{
@@ -191,6 +201,21 @@ pub fn build(b: *std.Build) void {
     const comprehensive_test_step = b.step("test-comprehensive", "Run comprehensive test suite");
     comprehensive_test_step.dependOn(&run_test_runner.step);
 
+    const sql_conformance_test = b.addExecutable(.{
+        .name = "test_sql_conformance",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/standalone/test_sql_conformance.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    sql_conformance_test.root_module.addImport("zqlite", lib.root_module);
+    sql_conformance_test.root_module.addOptions("build_options", build_options);
+    const run_sql_conformance_test = b.addRunArtifact(sql_conformance_test);
+    const sql_conformance_step = b.step("test-sql-conformance", "Run statement-level SQL conformance tests");
+    sql_conformance_step.dependOn(&run_sql_conformance_test.step);
+    comprehensive_test_step.dependOn(&run_sql_conformance_test.step);
+
     // Add quick validation test
     const validation_test = b.addExecutable(.{
         .name = "test_validation",
@@ -208,6 +233,100 @@ pub fn build(b: *std.Build) void {
 
     const validation_step = b.step("test-quick", "Run quick validation test");
     validation_step.dependOn(&run_validation_test.step);
+
+    const feature_availability_test = b.addExecutable(.{
+        .name = "test_feature_availability",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/standalone/test_feature_availability.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    feature_availability_test.root_module.addImport("zqlite", lib.root_module);
+    feature_availability_test.root_module.addOptions("build_options", build_options);
+    const run_feature_availability_test = b.addRunArtifact(feature_availability_test);
+    const feature_availability_step = b.step("test-feature-availability", "Run feature availability contract tests");
+    feature_availability_step.dependOn(&run_feature_availability_test.step);
+    validation_step.dependOn(&run_feature_availability_test.step);
+
+    const pqc_capability_test = b.addExecutable(.{
+        .name = "test_pqc_capability",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/standalone/test_pqc_capability.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    pqc_capability_test.root_module.addImport("zqlite", lib.root_module);
+    const pqc_c_api_module = b.createModule(.{
+        .root_source_file = b.path("src/ffi/c_api.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pqc_c_api_module.addImport("zqlite", lib.root_module);
+    pqc_capability_test.root_module.addImport("c_api", pqc_c_api_module);
+    pqc_capability_test.root_module.addOptions("build_options", build_options);
+    const run_pqc_capability_test = b.addRunArtifact(pqc_capability_test);
+    const pqc_test_step = b.step("test-pqc", "Run deterministic PQC capability, fallback, and negative-path tests");
+    pqc_test_step.dependOn(&run_pqc_capability_test.step);
+
+    const pqc_kat_generator = b.addExecutable(.{
+        .name = "generate_pqc_regression_kats",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/generate-pqc-regression-kats.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    pqc_kat_generator.root_module.addImport("zqlite", lib.root_module);
+    pqc_kat_generator.root_module.addOptions("build_options", build_options);
+    const run_pqc_kat_generator = b.addRunArtifact(pqc_kat_generator);
+    const generate_pqc_kats_step = b.step("generate-pqc-regression-kats", "Generate deterministic ZQLite PQC regression KAT fixtures");
+    generate_pqc_kats_step.dependOn(&run_pqc_kat_generator.step);
+
+    const pqc_generated_kats_test = b.addExecutable(.{
+        .name = "test_pqc_generated_kats",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/standalone/test_pqc_generated_kats.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    pqc_generated_kats_test.root_module.addImport("zqlite", lib.root_module);
+    pqc_generated_kats_test.root_module.addOptions("build_options", build_options);
+    const run_pqc_generated_kats_test = b.addRunArtifact(pqc_generated_kats_test);
+    const pqc_generated_kats_step = b.step("test-pqc-generated-kats", "Run generated ZQLite stdlib PQC regression KAT fixtures");
+    pqc_generated_kats_step.dependOn(&run_pqc_generated_kats_test.step);
+
+    const validate_pqc_fixtures = b.addSystemCommand(&.{"./scripts/validate-pqc-fixtures.sh"});
+    const validate_pqc_fixtures_step = b.step("validate-pqc-fixtures", "Validate PQC fixture fields and classifications");
+    validate_pqc_fixtures_step.dependOn(&validate_pqc_fixtures.step);
+
+    const liboqs_kat_converter = b.addExecutable(.{
+        .name = "convert_liboqs_kat_output",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/convert-liboqs-kat-output.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const install_liboqs_kat_converter = b.addInstallArtifact(liboqs_kat_converter, .{});
+    const liboqs_kat_converter_step = b.step("build-liboqs-kat-converter", "Compile the liboqs KAT output converter");
+    liboqs_kat_converter_step.dependOn(&install_liboqs_kat_converter.step);
+
+    const pqc_official_kats_test = b.addExecutable(.{
+        .name = "test_pqc_official_kats",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/standalone/test_pqc_official_kats.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    pqc_official_kats_test.root_module.addImport("zqlite", lib.root_module);
+    pqc_official_kats_test.root_module.addOptions("build_options", build_options);
+    const run_pqc_official_kats_test = b.addRunArtifact(pqc_official_kats_test);
+    const pqc_official_kats_step = b.step("test-pqc-official-kats", "Run imported official ML-KEM/ML-DSA KAT vectors when present");
+    pqc_official_kats_step.dependOn(&run_pqc_official_kats_test.step);
 
     const memory_test_step = b.step("test-memory", "Run primary memory leak detection suite");
 
@@ -418,6 +537,50 @@ pub fn build(b: *std.Build) void {
     durability_error_step.dependOn(&run_durability_error_test.step);
     storage_step.dependOn(&run_durability_error_test.step);
 
+    const storage_property_test = b.addExecutable(.{
+        .name = "test_storage_properties",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/standalone/test_storage_properties.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    storage_property_test.root_module.addImport("zqlite", lib.root_module);
+    storage_property_test.root_module.addOptions("build_options", build_options);
+    const run_storage_property_test = b.addRunArtifact(storage_property_test);
+    const storage_property_step = b.step("test-storage-properties", "Run deterministic storage property tests");
+    storage_property_step.dependOn(&run_storage_property_test.step);
+    storage_step.dependOn(&run_storage_property_test.step);
+
+    const storage_stress_test = b.addExecutable(.{
+        .name = "test_storage_stress",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/standalone/test_storage_stress.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    storage_stress_test.root_module.addImport("zqlite", lib.root_module);
+    storage_stress_test.root_module.addOptions("build_options", build_options);
+    const run_storage_stress_test = b.addRunArtifact(storage_stress_test);
+    const storage_stress_step = b.step("test-storage-stress", "Run deterministic reopen/checkpoint/rollback storage stress tests");
+    storage_stress_step.dependOn(&run_storage_stress_test.step);
+
+    const concurrent_access_test = b.addExecutable(.{
+        .name = "test_concurrent_access",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/standalone/test_concurrent_access.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    concurrent_access_test.root_module.addImport("zqlite", lib.root_module);
+    concurrent_access_test.root_module.addOptions("build_options", build_options);
+    const run_concurrent_access_test = b.addRunArtifact(concurrent_access_test);
+    const concurrent_access_step = b.step("test-concurrent-access", "Run deterministic multi-connection access tests");
+    concurrent_access_step.dependOn(&run_concurrent_access_test.step);
+    storage_step.dependOn(&run_concurrent_access_test.step);
+
     const wal_recovery_test = b.addExecutable(.{
         .name = "test_wal_recovery",
         .root_module = b.createModule(.{
@@ -447,6 +610,21 @@ pub fn build(b: *std.Build) void {
     const catalog_format_step = b.step("test-catalog-format", "Run catalog format, corruption, and migration tests");
     catalog_format_step.dependOn(&run_catalog_format_test.step);
     storage_step.dependOn(&run_catalog_format_test.step);
+
+    const filesystem_error_test = b.addExecutable(.{
+        .name = "test_filesystem_errors",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/standalone/test_filesystem_errors.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    filesystem_error_test.root_module.addImport("zqlite", lib.root_module);
+    filesystem_error_test.root_module.addOptions("build_options", build_options);
+    const run_filesystem_error_test = b.addRunArtifact(filesystem_error_test);
+    const filesystem_error_step = b.step("test-filesystem-errors", "Run filesystem error handling tests");
+    filesystem_error_step.dependOn(&run_filesystem_error_test.step);
+    storage_step.dependOn(&run_filesystem_error_test.step);
 
     const sqlite_diff_test = b.addExecutable(.{
         .name = "test_sqlite_diff",
@@ -498,6 +676,19 @@ pub fn build(b: *std.Build) void {
     const benchmark_step = b.step("bench", "Run simple performance benchmark");
     benchmark_step.dependOn(&run_benchmark_suite.step);
 
+    const operational_benchmark = b.addExecutable(.{
+        .name = "operational_benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/bench/operational_benchmark.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    operational_benchmark.root_module.addImport("zqlite", lib.root_module);
+    const run_operational_benchmark = b.addRunArtifact(operational_benchmark);
+    const operational_benchmark_step = b.step("bench-operational", "Run operational performance evidence benchmarks");
+    operational_benchmark_step.dependOn(&run_operational_benchmark.step);
+
     // Add benchmark validator for CI regression detection
     const benchmark_validator = b.addExecutable(.{
         .name = "benchmark_validator",
@@ -539,6 +730,7 @@ pub fn build(b: *std.Build) void {
         "powerdns_example",
         "cipher_dns",
         "simple_api_test",
+        "secure_by_default_app",
         "improved_api_demo",
         "insert_memory_regression_test",
         "datetime_test",
@@ -561,6 +753,7 @@ pub fn build(b: *std.Build) void {
 
     const check_c_api_cmd = b.addSystemCommand(&.{ "bash", "scripts/check-c-api.sh" });
     const check_c_api_step = b.step("check-c-api", "Verify that the C header matches implementation exports and constants");
+    check_c_api_cmd.step.dependOn(b.getInstallStep());
     check_c_api_step.dependOn(&check_c_api_cmd.step);
 
     const release_smoke_cmd = b.addSystemCommand(&.{ "bash", "scripts/test-release-package.sh" });
@@ -570,6 +763,14 @@ pub fn build(b: *std.Build) void {
     const release_validation_cmd = b.addSystemCommand(&.{ "bash", "scripts/test-release.sh" });
     const check_step = b.step("check", "Run the authoritative stable release validation gate");
     check_step.dependOn(&release_validation_cmd.step);
+
+    const stable_profiles_cmd = b.addSystemCommand(&.{ "bash", "scripts/test-stable-profiles.sh" });
+    const stable_profiles_step = b.step("test-stable-profiles", "Run unit tests across supported profiles and optimized modes");
+    stable_profiles_step.dependOn(&stable_profiles_cmd.step);
+
+    const install_smoke_cmd = b.addSystemCommand(&.{ "bash", "scripts/test-install.sh" });
+    const install_smoke_step = b.step("test-install", "Test release archive and local source install paths");
+    install_smoke_step.dependOn(&install_smoke_cmd.step);
 }
 
 fn createBasicExample(b: *std.Build, examples_step: *std.Build.Step, name: []const u8, lib: *std.Build.Step.Compile, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options) void {

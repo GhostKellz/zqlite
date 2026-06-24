@@ -9,6 +9,7 @@ const planner = @import("../executor/planner.zig");
 const vm = @import("../executor/vm.zig");
 const cache_manager = @import("../performance/cache_manager.zig");
 const query_cache = @import("../performance/query_cache.zig");
+const runtime_compat = @import("../runtime/compat/thread.zig");
 const posix = std.posix;
 
 /// Context for WAL page write callback during transactions
@@ -124,13 +125,31 @@ pub const AttachPathPolicy = struct {
 
 /// Connection options for security and behavior configuration
 pub const ConnectionOptions = struct {
+    pub const AccessMode = enum {
+        read_write,
+        read_only,
+        immutable,
+    };
+
     /// Enable secure mode: uses SECURE_DEFAULT attach policy, stricter validation
     secure_mode: bool = false,
     /// Custom attach path policy (overrides secure_mode if set)
     attach_policy: ?AttachPathPolicy = null,
+    /// File access mode. Read-only and immutable connections do not open WAL,
+    /// do not replay WAL, and reject mutating statements.
+    access_mode: AccessMode = .read_write,
+    /// Optional per-operation timeout in milliseconds. Applies to parse, plan,
+    /// and VM execution for connection-level and prepared-statement execution.
+    busy_timeout_ms: ?u64 = null,
+    resource_limits: ResourceLimits = .{},
+    progress_callback: ?ProgressCallback = null,
+    progress_context: ?*anyopaque = null,
+    plan_cache_entries: usize = 100,
 
     pub const DEFAULT = ConnectionOptions{};
     pub const SECURE = ConnectionOptions{ .secure_mode = true };
+    pub const READ_ONLY = ConnectionOptions{ .access_mode = .read_only };
+    pub const IMMUTABLE = ConnectionOptions{ .access_mode = .immutable };
 };
 
 /// Undo log entry for transaction rollback
@@ -162,6 +181,47 @@ pub const SavepointEntry = struct {
     }
 };
 
+pub const ScalarFunction = *const fn (allocator: std.mem.Allocator, arguments: []const storage.Value) anyerror!storage.Value;
+pub const AggregateFunction = *const fn (allocator: std.mem.Allocator, values: []const storage.Value) anyerror!storage.Value;
+
+pub const ResourceLimits = struct {
+    max_scanned_rows: ?u64 = null,
+    max_result_rows: ?usize = null,
+    max_affected_rows: ?u64 = null,
+    max_vm_steps: ?u64 = null,
+    max_statement_bytes: ?usize = null,
+    max_page_count: ?u32 = null,
+    max_cache_pages: ?u32 = null,
+    max_memory_bytes: ?usize = null,
+    progress_interval_ops: ?u64 = null,
+
+    pub const UNLIMITED = ResourceLimits{};
+};
+
+pub const ProgressEvent = struct {
+    vm_steps: u64,
+    scanned_rows: u64,
+    result_rows: usize,
+    affected_rows: u64,
+    work_units: u64,
+    estimated_memory_bytes: usize,
+};
+
+pub const ProgressCallback = *const fn (context: ?*anyopaque, event: ProgressEvent) bool;
+
+const ResourceUsage = struct {
+    vm_steps: u64 = 0,
+    scanned_rows: u64 = 0,
+    result_rows: usize = 0,
+    affected_rows: u64 = 0,
+    work_units: u64 = 0,
+    estimated_memory_bytes: usize = 0,
+    next_progress_units: u64 = 0,
+};
+
+pub const PlannerTableStats = planner.PlannerTableStats;
+pub const PlannerIndexStats = planner.PlannerIndexStats;
+
 /// Database connection handle
 pub const Connection = struct {
     allocator: std.mem.Allocator,
@@ -178,6 +238,19 @@ pub const Connection = struct {
     attached_databases: std.StringHashMap(*Self), // ATTACH DATABASE schema_name -> connection
     /// SECURITY: Path policy for ATTACH operations (default allows all for backwards compatibility)
     attach_path_policy: AttachPathPolicy,
+    access_mode: ConnectionOptions.AccessMode,
+    busy_timeout_ms: ?u64,
+    operation_deadline_ns: ?i128,
+    interrupted: std.atomic.Value(bool),
+    resource_limits: ResourceLimits,
+    resource_usage: ResourceUsage,
+    progress_callback: ?ProgressCallback,
+    progress_context: ?*anyopaque,
+    scalar_functions: std.StringHashMap(ScalarFunction),
+    aggregate_functions: std.StringHashMap(AggregateFunction),
+    aggregate_function_names: std.StringHashMap(void),
+    planner_table_stats: std.ArrayListUnmanaged(PlannerTableStats),
+    planner_index_stats: std.ArrayListUnmanaged(PlannerIndexStats),
     /// WAL callback context for transaction page logging
     wal_callback_ctx: ?*WalCallbackContext,
 
@@ -194,10 +267,13 @@ pub const Connection = struct {
         errdefer allocator.destroy(conn);
 
         conn.allocator = allocator;
-        conn.storage_engine = try storage.StorageEngine.init(allocator, path);
+        const pager_mode: @import("pager.zig").Pager.OpenMode = if (options.access_mode == .read_write) .read_write else .read_only;
+        conn.storage_engine = try storage.StorageEngine.initWithMode(allocator, path, pager_mode);
         errdefer conn.storage_engine.deinit();
+        try conn.storage_engine.pager.setMaxPageCount(options.resource_limits.max_page_count);
+        conn.storage_engine.pager.setCachePageLimit(options.resource_limits.max_cache_pages);
 
-        conn.wal = try wal.WriteAheadLog.init(allocator, path);
+        conn.wal = if (options.access_mode == .read_write) try wal.WriteAheadLog.init(allocator, path) else null;
         errdefer if (conn.wal) |w| w.deinit();
 
         conn.is_memory = false;
@@ -208,12 +284,28 @@ pub const Connection = struct {
         conn.in_transaction = false;
         conn.undo_log = .empty;
         conn.savepoints = .empty;
-        conn.plan_cache = try cache_manager.QueryPlanCache.init(allocator, 100);
+        conn.plan_cache = if (options.plan_cache_entries == 0)
+            null
+        else
+            try cache_manager.QueryPlanCache.init(allocator, options.plan_cache_entries);
         errdefer if (conn.plan_cache) |*cache| cache.deinit();
 
         conn.result_cache = null; // Caller can set via setResultCache()
         conn.attached_databases = std.StringHashMap(*Self).init(allocator);
         conn.wal_callback_ctx = null;
+        conn.access_mode = options.access_mode;
+        conn.busy_timeout_ms = options.busy_timeout_ms;
+        conn.operation_deadline_ns = null;
+        conn.interrupted = std.atomic.Value(bool).init(false);
+        conn.resource_limits = options.resource_limits;
+        conn.resource_usage = .{};
+        conn.progress_callback = options.progress_callback;
+        conn.progress_context = options.progress_context;
+        conn.scalar_functions = std.StringHashMap(ScalarFunction).init(allocator);
+        conn.aggregate_functions = std.StringHashMap(AggregateFunction).init(allocator);
+        conn.aggregate_function_names = std.StringHashMap(void).init(allocator);
+        conn.planner_table_stats = .empty;
+        conn.planner_index_stats = .empty;
 
         // Apply security options
         if (options.attach_policy) |policy| {
@@ -242,6 +334,8 @@ pub const Connection = struct {
         var conn = try allocator.create(Self);
         conn.allocator = allocator;
         conn.storage_engine = try storage.StorageEngine.initMemory(allocator);
+        try conn.storage_engine.pager.setMaxPageCount(options.resource_limits.max_page_count);
+        conn.storage_engine.pager.setCachePageLimit(options.resource_limits.max_cache_pages);
         conn.wal = null; // No WAL for in-memory databases
         conn.is_memory = true;
         conn.path = null;
@@ -249,10 +343,26 @@ pub const Connection = struct {
         conn.in_transaction = false;
         conn.undo_log = .empty;
         conn.savepoints = .empty;
-        conn.plan_cache = try cache_manager.QueryPlanCache.init(allocator, 100);
+        conn.plan_cache = if (options.plan_cache_entries == 0)
+            null
+        else
+            try cache_manager.QueryPlanCache.init(allocator, options.plan_cache_entries);
         conn.result_cache = null;
         conn.attached_databases = std.StringHashMap(*Self).init(allocator);
         conn.wal_callback_ctx = null;
+        conn.access_mode = options.access_mode;
+        conn.busy_timeout_ms = options.busy_timeout_ms;
+        conn.operation_deadline_ns = null;
+        conn.interrupted = std.atomic.Value(bool).init(false);
+        conn.resource_limits = options.resource_limits;
+        conn.resource_usage = .{};
+        conn.progress_callback = options.progress_callback;
+        conn.progress_context = options.progress_context;
+        conn.scalar_functions = std.StringHashMap(ScalarFunction).init(allocator);
+        conn.aggregate_functions = std.StringHashMap(AggregateFunction).init(allocator);
+        conn.aggregate_function_names = std.StringHashMap(void).init(allocator);
+        conn.planner_table_stats = .empty;
+        conn.planner_index_stats = .empty;
 
         // Apply security options
         if (options.attach_policy) |policy| {
@@ -276,6 +386,8 @@ pub const Connection = struct {
         var conn = try allocator.create(Self);
         conn.allocator = allocator;
         conn.storage_engine = shared_storage;
+        try conn.storage_engine.pager.setMaxPageCount(options.resource_limits.max_page_count);
+        conn.storage_engine.pager.setCachePageLimit(options.resource_limits.max_cache_pages);
         conn.wal = null; // Shared connections don't manage WAL independently
         conn.is_memory = true; // Assume shared storage is memory-based for simplicity
         conn.path = null;
@@ -283,10 +395,26 @@ pub const Connection = struct {
         conn.in_transaction = false;
         conn.undo_log = .empty;
         conn.savepoints = .empty;
-        conn.plan_cache = try cache_manager.QueryPlanCache.init(allocator, 100);
+        conn.plan_cache = if (options.plan_cache_entries == 0)
+            null
+        else
+            try cache_manager.QueryPlanCache.init(allocator, options.plan_cache_entries);
         conn.result_cache = null;
         conn.attached_databases = std.StringHashMap(*Self).init(allocator);
         conn.wal_callback_ctx = null;
+        conn.access_mode = options.access_mode;
+        conn.busy_timeout_ms = options.busy_timeout_ms;
+        conn.operation_deadline_ns = null;
+        conn.interrupted = std.atomic.Value(bool).init(false);
+        conn.resource_limits = options.resource_limits;
+        conn.resource_usage = .{};
+        conn.progress_callback = options.progress_callback;
+        conn.progress_context = options.progress_context;
+        conn.scalar_functions = std.StringHashMap(ScalarFunction).init(allocator);
+        conn.aggregate_functions = std.StringHashMap(AggregateFunction).init(allocator);
+        conn.aggregate_function_names = std.StringHashMap(void).init(allocator);
+        conn.planner_table_stats = .empty;
+        conn.planner_index_stats = .empty;
 
         // Apply security options
         if (options.attach_policy) |policy| {
@@ -302,19 +430,388 @@ pub const Connection = struct {
 
     /// Execute a SQL statement
     pub fn execute(self: *Self, sql: []const u8) !void {
+        self.beginOperation();
+        defer self.endOperation();
+        try self.checkStatementSize(sql);
+        try self.checkOperation();
+
         // Parse the SQL
         var parsed = try parser.parse(self.allocator, sql);
         defer parsed.deinit();
+        try self.checkOperation();
+        try self.ensureStatementAllowed(&parsed.statement);
 
         // Execute via virtual machine
         try vm.execute(self, &parsed.statement);
     }
 
+    pub fn isReadOnly(self: *const Self) bool {
+        return self.access_mode != .read_write;
+    }
+
+    pub fn isImmutable(self: *const Self) bool {
+        return self.access_mode == .immutable;
+    }
+
+    pub fn ensureWritable(self: *const Self) !void {
+        if (self.isReadOnly()) return error.ReadOnlyDatabase;
+    }
+
+    pub fn registerScalarFunction(self: *Self, name: []const u8, callback: ScalarFunction) !void {
+        const normalized = try normalizeFunctionName(self.allocator, name);
+        errdefer self.allocator.free(normalized);
+
+        if (self.scalar_functions.fetchRemove(normalized)) |entry| {
+            self.allocator.free(entry.key);
+        }
+        try self.scalar_functions.put(normalized, callback);
+    }
+
+    pub fn registerAggregateFunction(self: *Self, name: []const u8, callback: AggregateFunction) !void {
+        const normalized = try normalizeFunctionName(self.allocator, name);
+        errdefer self.allocator.free(normalized);
+
+        if (self.aggregate_functions.fetchRemove(normalized)) |entry| {
+            self.allocator.free(entry.key);
+        }
+        const name_for_set = try self.allocator.dupe(u8, normalized);
+        errdefer self.allocator.free(name_for_set);
+
+        if (self.aggregate_function_names.fetchRemove(normalized)) |entry| {
+            self.allocator.free(entry.key);
+        }
+
+        try self.aggregate_functions.put(normalized, callback);
+        try self.aggregate_function_names.put(name_for_set, {});
+
+        if (self.plan_cache) |*cache| {
+            cache.deinit();
+            self.plan_cache = null;
+            self.plan_cache = try cache_manager.QueryPlanCache.init(self.allocator, 100);
+        }
+    }
+
+    pub fn getScalarFunction(self: *Self, name: []const u8) ?ScalarFunction {
+        const normalized = std.ascii.allocLowerString(self.allocator, name) catch return null;
+        defer self.allocator.free(normalized);
+        return self.scalar_functions.get(normalized);
+    }
+
+    pub fn getAggregateFunction(self: *Self, name: []const u8) ?AggregateFunction {
+        const normalized = std.ascii.allocLowerString(self.allocator, name) catch return null;
+        defer self.allocator.free(normalized);
+        return self.aggregate_functions.get(normalized);
+    }
+
+    pub fn hasAggregateFunction(self: *Self, name: []const u8) bool {
+        return self.getAggregateFunction(name) != null;
+    }
+
+    pub fn analyze(self: *Self, table_name: ?[]const u8) !void {
+        self.clearPlannerStats();
+
+        if (table_name) |name| {
+            const table = self.storage_engine.getTable(name) orelse return error.TableNotFound;
+            try self.collectTableStats(table);
+            try self.collectIndexStatsForTable(table.name);
+        } else {
+            var table_iter = self.storage_engine.tables.iterator();
+            while (table_iter.next()) |entry| {
+                const table = entry.value_ptr.*;
+                try self.collectTableStats(table);
+                try self.collectIndexStatsForTable(table.name);
+            }
+        }
+
+        if (self.plan_cache) |*cache| {
+            cache.deinit();
+            self.plan_cache = null;
+            self.plan_cache = try cache_manager.QueryPlanCache.init(self.allocator, 100);
+        }
+    }
+
+    fn collectTableStats(self: *Self, table: *storage.Table) !void {
+        const live_rows = table.selectWithKeys(self.allocator) catch |err| return err;
+        defer {
+            for (live_rows) |item| {
+                for (item.row.values) |value| value.deinit(self.allocator);
+                self.allocator.free(item.row.values);
+            }
+            self.allocator.free(live_rows);
+        }
+
+        try self.planner_table_stats.append(self.allocator, .{
+            .table_name = try self.allocator.dupe(u8, table.name),
+            .row_count = table.row_count,
+            .live_rows = @intCast(live_rows.len),
+            .deleted_rows = @intCast(table.deleted_keys.count()),
+            .column_count = @intCast(table.schema.columns.len),
+        });
+    }
+
+    fn collectIndexStatsForTable(self: *Self, table_name: []const u8) !void {
+        const table = self.storage_engine.getTable(table_name) orelse return error.TableNotFound;
+        const rows = try table.selectWithKeys(self.allocator);
+        defer {
+            for (rows) |item| {
+                for (item.row.values) |value| value.deinit(self.allocator);
+                self.allocator.free(item.row.values);
+            }
+            self.allocator.free(rows);
+        }
+
+        var index_iter = self.storage_engine.indexes.iterator();
+        while (index_iter.next()) |entry| {
+            const index = entry.value_ptr.*;
+            if (!std.mem.eql(u8, index.table_name, table_name)) continue;
+
+            const column_name = if (index.column_names.len > 0) index.column_names[0] else "<expr>";
+            const column_idx = if (!std.mem.eql(u8, column_name, "<expr>")) table.getColumnIndex(column_name) else null;
+
+            var distinct = std.StringHashMap(void).init(self.allocator);
+            defer {
+                var distinct_iter = distinct.iterator();
+                while (distinct_iter.next()) |distinct_entry| {
+                    self.allocator.free(distinct_entry.key_ptr.*);
+                }
+                distinct.deinit();
+            }
+
+            var indexed_rows: u64 = 0;
+            if (column_idx) |idx| {
+                for (rows) |item| {
+                    if (idx >= item.row.values.len) continue;
+                    indexed_rows += 1;
+
+                    var key_buf: std.ArrayListUnmanaged(u8) = .empty;
+                    defer key_buf.deinit(self.allocator);
+                    try appendPlannerStatsValueKey(self.allocator, &key_buf, item.row.values[idx]);
+                    const key = try self.allocator.dupe(u8, key_buf.items);
+                    const gop = try distinct.getOrPut(key);
+                    if (gop.found_existing) self.allocator.free(key);
+                }
+            }
+
+            try self.planner_index_stats.append(self.allocator, .{
+                .index_name = try self.allocator.dupe(u8, index.name),
+                .table_name = try self.allocator.dupe(u8, index.table_name),
+                .column_name = try self.allocator.dupe(u8, column_name),
+                .indexed_rows = indexed_rows,
+                .distinct_values = @intCast(distinct.count()),
+                .is_unique = index.is_unique,
+                .is_partial = index.where_clause != null,
+                .is_expression = std.mem.eql(u8, column_name, "<expr>"),
+            });
+        }
+    }
+
+    fn appendPlannerStatsValueKey(allocator: std.mem.Allocator, output: *std.ArrayListUnmanaged(u8), value: storage.Value) !void {
+        switch (value) {
+            .Null => try output.appendSlice(allocator, "null:"),
+            .Integer => |v| try appendPlannerStatsFmt(allocator, output, "i:{d}", .{v}),
+            .Real => |v| try appendPlannerStatsFmt(allocator, output, "r:{d}", .{v}),
+            .Text => |v| {
+                try output.appendSlice(allocator, "t:");
+                try output.appendSlice(allocator, v);
+            },
+            .Boolean => |v| try output.appendSlice(allocator, if (v) "b:1" else "b:0"),
+            .SmallInt => |v| try appendPlannerStatsFmt(allocator, output, "s:{d}", .{v}),
+            .BigInt => |v| try appendPlannerStatsFmt(allocator, output, "bi:{d}", .{v}),
+            else => try output.appendSlice(allocator, "other:"),
+        }
+    }
+
+    fn appendPlannerStatsFmt(allocator: std.mem.Allocator, output: *std.ArrayListUnmanaged(u8), comptime fmt: []const u8, args: anytype) !void {
+        const text = try std.fmt.allocPrint(allocator, fmt, args);
+        defer allocator.free(text);
+        try output.appendSlice(allocator, text);
+    }
+
+    fn clearPlannerStats(self: *Self) void {
+        for (self.planner_table_stats.items) |stats| stats.deinit(self.allocator);
+        self.planner_table_stats.clearRetainingCapacity();
+
+        for (self.planner_index_stats.items) |stats| stats.deinit(self.allocator);
+        self.planner_index_stats.clearRetainingCapacity();
+    }
+
+    fn normalizeFunctionName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+        if (name.len == 0) return error.InvalidFunctionName;
+        return std.ascii.allocLowerString(allocator, name);
+    }
+
+    /// Configure a per-operation timeout in milliseconds. A value of zero
+    /// disables timeout checks. The timeout is checked cooperatively while
+    /// parsing/planning and during VM step and row loops.
+    pub fn setBusyTimeout(self: *Self, timeout_ms: u64) void {
+        self.busy_timeout_ms = if (timeout_ms == 0) null else timeout_ms;
+    }
+
+    pub fn getBusyTimeout(self: *const Self) ?u64 {
+        return self.busy_timeout_ms;
+    }
+
+    pub fn setResourceLimits(self: *Self, limits: ResourceLimits) void {
+        self.resource_limits = limits;
+        self.storage_engine.pager.setCachePageLimit(limits.max_cache_pages);
+    }
+
+    pub fn configureResourceLimits(self: *Self, limits: ResourceLimits) !void {
+        try self.storage_engine.pager.setMaxPageCount(limits.max_page_count);
+        self.storage_engine.pager.setCachePageLimit(limits.max_cache_pages);
+        self.resource_limits = limits;
+    }
+
+    pub fn getResourceLimits(self: *const Self) ResourceLimits {
+        return self.resource_limits;
+    }
+
+    pub fn setPlanCacheCapacity(self: *Self, entries: usize) !void {
+        if (self.plan_cache) |*cache| {
+            cache.deinit();
+            self.plan_cache = null;
+        }
+        if (entries > 0) {
+            self.plan_cache = try cache_manager.QueryPlanCache.init(self.allocator, entries);
+        }
+    }
+
+    fn checkStatementSize(self: *const Self, sql: []const u8) !void {
+        if (self.resource_limits.max_statement_bytes) |limit| {
+            if (sql.len > limit) return error.ResourceLimitExceeded;
+        }
+    }
+
+    pub fn setProgressHandler(self: *Self, interval_ops: u64, callback: ?ProgressCallback, context: ?*anyopaque) void {
+        self.resource_limits.progress_interval_ops = if (interval_ops == 0) null else interval_ops;
+        self.progress_callback = callback;
+        self.progress_context = context;
+    }
+
+    pub fn clearProgressHandler(self: *Self) void {
+        self.progress_callback = null;
+        self.progress_context = null;
+        self.resource_limits.progress_interval_ops = null;
+    }
+
+    pub fn currentProgressEvent(self: *const Self) ProgressEvent {
+        return .{
+            .vm_steps = self.resource_usage.vm_steps,
+            .scanned_rows = self.resource_usage.scanned_rows,
+            .result_rows = self.resource_usage.result_rows,
+            .affected_rows = self.resource_usage.affected_rows,
+            .work_units = self.resource_usage.work_units,
+            .estimated_memory_bytes = self.resource_usage.estimated_memory_bytes,
+        };
+    }
+
+    /// Request cancellation for the current or next operation on this connection.
+    /// The VM checks this flag cooperatively between plan steps and row loops.
+    pub fn interrupt(self: *Self) void {
+        self.interrupted.store(true, .release);
+    }
+
+    pub fn clearInterrupt(self: *Self) void {
+        self.interrupted.store(false, .release);
+    }
+
+    pub fn isInterrupted(self: *const Self) bool {
+        return self.interrupted.load(.acquire);
+    }
+
+    pub fn beginOperation(self: *Self) void {
+        self.operation_deadline_ns = if (self.busy_timeout_ms) |timeout_ms|
+            (runtime_compat.Instant.now() catch unreachable).timestamp + @as(i128, timeout_ms) * std.time.ns_per_ms
+        else
+            null;
+        self.resource_usage = .{
+            .next_progress_units = self.resource_limits.progress_interval_ops orelse 0,
+        };
+    }
+
+    pub fn endOperation(self: *Self) void {
+        self.operation_deadline_ns = null;
+    }
+
+    pub fn checkOperation(self: *const Self) !void {
+        if (self.interrupted.load(.acquire)) return error.Interrupted;
+        if (self.operation_deadline_ns) |deadline| {
+            if ((runtime_compat.Instant.now() catch unreachable).timestamp >= deadline) return error.OperationTimedOut;
+        }
+    }
+
+    pub fn recordVmStep(self: *Self) !void {
+        self.resource_usage.vm_steps += 1;
+        if (self.resource_limits.max_vm_steps) |limit| {
+            if (self.resource_usage.vm_steps > limit) return error.ResourceLimitExceeded;
+        }
+        try self.recordWork(1);
+    }
+
+    pub fn recordRowsScanned(self: *Self, count: u64) !void {
+        self.resource_usage.scanned_rows += count;
+        if (self.resource_limits.max_scanned_rows) |limit| {
+            if (self.resource_usage.scanned_rows > limit) return error.ResourceLimitExceeded;
+        }
+        try self.recordWork(count);
+    }
+
+    pub fn recordResultRows(self: *Self, count: usize) !void {
+        self.resource_usage.result_rows = count;
+        if (self.resource_limits.max_result_rows) |limit| {
+            if (count > limit) return error.ResourceLimitExceeded;
+        }
+        if (self.resource_limits.max_memory_bytes) |limit| {
+            const per_row_estimate = @sizeOf(storage.Row) + (@sizeOf(storage.Value) * 4);
+            self.resource_usage.estimated_memory_bytes = count * per_row_estimate;
+            if (self.resource_usage.estimated_memory_bytes > limit) return error.ResourceLimitExceeded;
+        }
+    }
+
+    pub fn recordAffectedRows(self: *Self, count: u64) !void {
+        self.resource_usage.affected_rows = count;
+        if (self.resource_limits.max_affected_rows) |limit| {
+            if (count > limit) return error.ResourceLimitExceeded;
+        }
+    }
+
+    fn recordWork(self: *Self, count: u64) !void {
+        self.resource_usage.work_units += count;
+        try self.checkOperation();
+
+        const interval = self.resource_limits.progress_interval_ops orelse return;
+        if (interval == 0 or self.progress_callback == null) return;
+
+        while (self.resource_usage.work_units >= self.resource_usage.next_progress_units) {
+            const keep_going = self.progress_callback.?(self.progress_context, self.currentProgressEvent());
+            if (!keep_going) {
+                self.interrupt();
+                return error.Interrupted;
+            }
+            self.resource_usage.next_progress_units += interval;
+        }
+    }
+
+    fn ensureStatementAllowed(self: *const Self, statement: *const ast.Statement) !void {
+        if (!self.isReadOnly()) return;
+        if (!statementIsReadOnly(statement.*)) return error.ReadOnlyDatabase;
+    }
+
+    fn statementIsReadOnly(statement: ast.Statement) bool {
+        return switch (statement) {
+            .Select, .With, .CompoundSelect, .Explain, .Pragma, .Analyze => true,
+            else => false,
+        };
+    }
+
     /// Begin a transaction
     pub fn beginTransaction(self: *Self) !void {
+        try self.ensureWritable();
         if (self.in_transaction) return error.TransactionAlreadyActive;
         if (self.wal) |w| {
             try w.beginTransaction();
+            self.storage_engine.pager.beginTransaction();
+            errdefer self.storage_engine.pager.endTransactionForRollback();
 
             // Set up WAL callback context for btree page logging
             const ctx = try self.allocator.create(WalCallbackContext);
@@ -352,11 +849,14 @@ pub const Connection = struct {
 
     /// Commit a transaction
     pub fn commitTransaction(self: *Self) !void {
+        try self.ensureWritable();
+
         // Clear btree callbacks first
         self.clearTransactionCallbacks();
 
         if (self.wal) |w| {
             try w.commit();
+            self.storage_engine.pager.endTransactionForCommit();
             // Once the WAL commit record passes its durability barrier, the
             // transaction is committed even if a later checkpoint fails.
             self.in_transaction = false;
@@ -388,6 +888,7 @@ pub const Connection = struct {
     /// Flush is rejected while a transaction is active; commit or rollback it first.
     pub fn flush(self: *Self) !void {
         if (self.in_transaction) return error.TransactionActive;
+        if (self.isReadOnly()) return;
 
         if (self.wal) |w| {
             try w.checkpointToPager(self.storage_engine.pager);
@@ -400,21 +901,93 @@ pub const Connection = struct {
         }
     }
 
+    pub fn getUserVersion(self: *const Self) u32 {
+        return self.storage_engine.getUserVersion();
+    }
+
+    pub fn setUserVersion(self: *Self, version: u32) !void {
+        try self.ensureWritable();
+        if (self.in_transaction) return error.TransactionActive;
+        try self.storage_engine.setUserVersion(version);
+        if (self.owns_storage and !self.is_memory) {
+            try self.storage_engine.pager.flush();
+        }
+    }
+
+    pub fn getSchemaVersion(self: *const Self) u32 {
+        return self.storage_engine.getSchemaVersion();
+    }
+
+    pub fn integrityCheck(self: *Self) !storage.IntegrityCheckResult {
+        return self.storage_engine.validateIntegrity(self.allocator);
+    }
+
+    pub fn vacuum(self: *Self) !storage.IntegrityCheckResult {
+        try self.ensureWritable();
+        if (self.in_transaction) return error.TransactionActive;
+
+        try self.flush();
+        var index_iter = self.storage_engine.indexes.iterator();
+        while (index_iter.next()) |entry| {
+            try self.storage_engine.refreshIndexesForTable(entry.value_ptr.*.table_name);
+        }
+        try self.storage_engine.saveAllMetadata();
+        try self.storage_engine.pager.flush();
+        return self.integrityCheck();
+    }
+
+    /// Run storage maintenance and write a flushed compact backup copy.
+    /// This provides a VACUUM INTO-style API while keeping SQL path handling
+    /// behind explicit embedder path policy decisions.
+    pub fn vacuumInto(self: *Self, io: std.Io, dest_path: []const u8) !storage.IntegrityCheckResult {
+        const check = try self.vacuum();
+        if (!check.ok) return error.IntegrityCheckFailed;
+        try self.backupToFile(io, dest_path);
+        return check;
+    }
+
+    /// Explicitly checkpoint the WAL into the main database file and flush
+    /// database metadata. This is rejected while a transaction is active.
+    pub fn checkpoint(self: *Self) !void {
+        try self.flush();
+    }
+
+    /// Return current WAL statistics for file-backed connections.
+    pub fn getWalStats(self: *Self) !?wal.WriteAheadLog.Stats {
+        if (self.wal) |w| {
+            return try w.getStats();
+        }
+        return null;
+    }
+
+    /// Create a consistent file-level backup after checkpointing/flushing.
+    /// In-memory databases cannot be backed up through this file-copy API.
+    pub fn backupToFile(self: *Self, io: std.Io, dest_path: []const u8) !void {
+        if (self.is_memory or self.path == null) return error.BackupRequiresFileDatabase;
+        if (!self.isReadOnly()) try self.flush();
+        const cwd = std.Io.Dir.cwd();
+        if (std.fs.path.isAbsolute(self.path.?) and std.fs.path.isAbsolute(dest_path)) {
+            try std.Io.Dir.copyFileAbsolute(self.path.?, dest_path, io, .{});
+        } else {
+            try std.Io.Dir.copyFile(cwd, self.path.?, cwd, dest_path, io, .{});
+        }
+    }
+
     /// Rollback a transaction
     pub fn rollbackTransaction(self: *Self) !void {
+        try self.ensureWritable();
+
         // Clear btree callbacks first
         self.clearTransactionCallbacks();
 
         // Use WAL-based physical page restoration for file-backed storage
         if (self.wal) |w| {
+            self.storage_engine.pager.endTransactionForRollback();
             // Restore original page data from WAL old_data entries
             try w.rollbackWithPager(self.storage_engine.pager);
 
-            // Also clear any logical deletes from this transaction
-            var table_iter = self.storage_engine.tables.iterator();
-            while (table_iter.next()) |entry| {
-                entry.value_ptr.*.deleted_keys.clearRetainingCapacity();
-            }
+            // Restore in-memory logical row state for inserts/deletes/updates.
+            try self.rollbackUndoTo(0);
         } else {
             // In-memory: use logical delete mechanism (undo log)
             while (self.undo_log.items.len > 0) {
@@ -434,6 +1007,7 @@ pub const Connection = struct {
         }
         self.undo_log.clearRetainingCapacity();
         self.clearSavepoints();
+        try self.refreshAllIndexesAndCaches();
         self.in_transaction = false;
     }
 
@@ -458,6 +1032,8 @@ pub const Connection = struct {
     }
 
     pub fn createSavepoint(self: *Self, name: []const u8) !void {
+        try self.ensureWritable();
+
         const started_transaction = !self.in_transaction;
         if (started_transaction) {
             try self.beginTransaction();
@@ -473,6 +1049,8 @@ pub const Connection = struct {
     }
 
     pub fn releaseSavepoint(self: *Self, name: []const u8) !void {
+        try self.ensureWritable();
+
         const index = self.findSavepointIndex(name) orelse return error.SavepointNotFound;
         const commits_outer_savepoint = index == 0 and self.savepoints.items[index].started_transaction;
 
@@ -487,6 +1065,8 @@ pub const Connection = struct {
     }
 
     pub fn rollbackToSavepoint(self: *Self, name: []const u8) !void {
+        try self.ensureWritable();
+
         const index = self.findSavepointIndex(name) orelse return error.SavepointNotFound;
         const undo_len = self.savepoints.items[index].undo_len;
 
@@ -600,6 +1180,7 @@ pub const Connection = struct {
 
     /// Prepare a SQL statement
     pub fn prepare(self: *Self, sql: []const u8) !*PreparedStatement {
+        try self.checkStatementSize(sql);
         return PreparedStatement.prepare(self.allocator, self, sql);
     }
 
@@ -607,6 +1188,11 @@ pub const Connection = struct {
 
     /// Execute SQL and return structured results (SQLite-style)
     pub fn query(self: *Self, sql: []const u8) !ResultSet {
+        self.beginOperation();
+        defer self.endOperation();
+        try self.checkStatementSize(sql);
+        try self.checkOperation();
+
         if (self.result_cache) |cache| {
             const sql_hash = query_cache.QueryHasher.hashQuery(sql);
             if (cache.get(sql_hash)) |cached_result| {
@@ -623,6 +1209,8 @@ pub const Connection = struct {
         // Parse the SQL
         var parsed = try parser.parse(self.allocator, sql);
         defer parsed.deinit();
+        try self.checkOperation();
+        try self.ensureStatementAllowed(&parsed.statement);
 
         // Try to get cached plan first
         var plan_ptr: *planner.ExecutionPlan = undefined;
@@ -633,7 +1221,7 @@ pub const Connection = struct {
                 plan_ptr = cached_plan;
             } else {
                 // Cache miss - create new plan and cache it
-                var query_planner = planner.Planner.init(self.allocator);
+                var query_planner = planner.Planner.initWithContext(self.allocator, &self.aggregate_function_names, self.planner_table_stats.items, self.planner_index_stats.items);
                 const new_plan = try query_planner.plan(&parsed.statement);
                 try cache.put(sql, new_plan);
                 // Get pointer from cache (cache now owns the plan)
@@ -641,7 +1229,7 @@ pub const Connection = struct {
             }
         } else {
             // No cache - create plan that we own
-            var query_planner = planner.Planner.init(self.allocator);
+            var query_planner = planner.Planner.initWithContext(self.allocator, &self.aggregate_function_names, self.planner_table_stats.items, self.planner_index_stats.items);
             const owned_plan = try self.allocator.create(planner.ExecutionPlan);
             owned_plan.* = try query_planner.plan(&parsed.statement);
             plan_ptr = owned_plan;
@@ -688,14 +1276,190 @@ pub const Connection = struct {
         return result_set.next();
     }
 
+    pub fn openCursor(self: *Self, sql: []const u8) !Cursor {
+        try self.checkStatementSize(sql);
+        var parsed = try parser.parse(self.allocator, sql);
+        defer parsed.deinit();
+        try self.ensureStatementAllowed(&parsed.statement);
+
+        if (try self.openSimpleTableCursor(&parsed.statement, null)) |cursor| {
+            return cursor;
+        }
+
+        return Cursor{
+            .mode = .{ .materialized = try self.query(sql) },
+        };
+    }
+
+    fn openSimpleTableCursor(self: *Self, statement: *const ast.Statement, parameters: ?[]const storage.Value) !?Cursor {
+        const select = switch (statement.*) {
+            .Select => |select| select,
+            else => return null,
+        };
+        if (select.table == null or select.joins.len != 0 or select.group_by != null or select.having != null or select.order_by != null or select.limit != null or select.offset != null or select.distinct) {
+            return null;
+        }
+        const table_name = select.table.?;
+        const table = self.storage_engine.getTable(table_name) orelse return error.TableNotFound;
+        const projection = try self.buildSimpleCursorProjection(table, select.columns);
+        errdefer projection.deinit(self.allocator);
+        var predicate = self.buildSimpleCursorPredicate(table, select.where_clause, parameters) catch |err| switch (err) {
+            error.UnsupportedCursorQuery => return null,
+            else => return err,
+        };
+        errdefer if (predicate) |*pred| pred.deinit(self.allocator);
+
+        var column_names = try self.allocator.alloc([]const u8, projection.column_indices.len);
+        var column_names_loaded: usize = 0;
+        errdefer {
+            for (column_names[0..column_names_loaded]) |name| self.allocator.free(name);
+            self.allocator.free(column_names);
+        }
+        for (projection.column_indices, 0..) |column_index, i| {
+            column_names[i] = try self.allocator.dupe(u8, table.schema.columns[column_index].name);
+            column_names_loaded = i + 1;
+        }
+
+        const owned_table_name = try self.allocator.dupe(u8, table_name);
+        errdefer self.allocator.free(owned_table_name);
+
+        return Cursor{
+            .mode = .{ .simple_table_scan = .{
+                .allocator = self.allocator,
+                .connection = self,
+                .table_name = owned_table_name,
+                .column_names = column_names,
+                .column_indices = projection.column_indices,
+                .predicate = predicate,
+                .next_key = 0,
+                .row_count_snapshot = table.row_count,
+                .rows_seen = 0,
+            } },
+        };
+    }
+
+    const CursorProjection = struct {
+        column_indices: []usize,
+
+        fn deinit(self: CursorProjection, allocator: std.mem.Allocator) void {
+            allocator.free(self.column_indices);
+        }
+    };
+
+    fn buildSimpleCursorProjection(self: *Self, table: *storage.Table, columns: []const ast.Column) !CursorProjection {
+        if (columns.len == 1 and std.mem.eql(u8, columns[0].name, "*")) {
+            const indices = try self.allocator.alloc(usize, table.schema.columns.len);
+            for (indices, 0..) |*index, i| index.* = i;
+            return .{ .column_indices = indices };
+        }
+
+        var indices = try self.allocator.alloc(usize, columns.len);
+        errdefer self.allocator.free(indices);
+        for (columns, 0..) |column, i| {
+            const name = switch (column.expression) {
+                .Simple => |simple| simple,
+                else => return error.UnsupportedCursorQuery,
+            };
+            indices[i] = table.getColumnIndex(name) orelse return error.ColumnNotFound;
+        }
+        return .{ .column_indices = indices };
+    }
+
+    const SimpleCursorPredicate = struct {
+        column_index: usize,
+        operator: ast.ComparisonOperator,
+        value: storage.Value,
+
+        fn deinit(self: *SimpleCursorPredicate, allocator: std.mem.Allocator) void {
+            self.value.deinit(allocator);
+        }
+    };
+
+    fn buildSimpleCursorPredicate(self: *Self, table: *storage.Table, maybe_where: ?ast.WhereClause, parameters: ?[]const storage.Value) !?SimpleCursorPredicate {
+        const where_clause = maybe_where orelse return null;
+        const comparison = switch (where_clause.condition) {
+            .Comparison => |comparison| comparison,
+            else => return error.UnsupportedCursorQuery,
+        };
+        return try self.buildComparisonCursorPredicate(table, comparison, parameters);
+    }
+
+    fn buildComparisonCursorPredicate(self: *Self, table: *storage.Table, comparison: ast.ComparisonCondition, parameters: ?[]const storage.Value) !SimpleCursorPredicate {
+        if (comparison.extra != null) return error.UnsupportedCursorQuery;
+        const operator = switch (comparison.operator) {
+            .Equal, .NotEqual, .LessThan, .LessThanOrEqual, .GreaterThan, .GreaterThanOrEqual => comparison.operator,
+            else => return error.UnsupportedCursorQuery,
+        };
+
+        if (comparison.left == .Column) {
+            const column_index = table.getColumnIndex(comparison.left.Column) orelse return error.ColumnNotFound;
+            return .{
+                .column_index = column_index,
+                .operator = operator,
+                .value = try self.cursorPredicateValue(comparison.right, parameters),
+            };
+        }
+
+        if (comparison.right == .Column) {
+            const column_index = table.getColumnIndex(comparison.right.Column) orelse return error.ColumnNotFound;
+            return .{
+                .column_index = column_index,
+                .operator = invertComparisonOperator(operator),
+                .value = try self.cursorPredicateValue(comparison.left, parameters),
+            };
+        }
+
+        return error.UnsupportedCursorQuery;
+    }
+
+    fn cursorPredicateValue(self: *Self, expression: ast.Expression, parameters: ?[]const storage.Value) !storage.Value {
+        return switch (expression) {
+            .Literal => |literal| try self.storageValueFromAstValue(literal),
+            .Parameter => |index| blk: {
+                const params = parameters orelse return error.UnsupportedCursorQuery;
+                if (index >= params.len) return error.InvalidParameterIndex;
+                break :blk try params[index].clone(self.allocator);
+            },
+            else => error.UnsupportedCursorQuery,
+        };
+    }
+
+    fn storageValueFromAstValue(self: *Self, value: ast.Value) !storage.Value {
+        return switch (value) {
+            .Integer => |v| storage.Value{ .Integer = v },
+            .Text => |v| storage.Value{ .Text = try self.allocator.dupe(u8, v) },
+            .Real => |v| storage.Value{ .Real = v },
+            .Blob => |v| storage.Value{ .Blob = try self.allocator.dupe(u8, v) },
+            .Null => storage.Value.Null,
+            else => error.UnsupportedCursorQuery,
+        };
+    }
+
+    fn invertComparisonOperator(operator: ast.ComparisonOperator) ast.ComparisonOperator {
+        return switch (operator) {
+            .LessThan => .GreaterThan,
+            .LessThanOrEqual => .GreaterThanOrEqual,
+            .GreaterThan => .LessThan,
+            .GreaterThanOrEqual => .LessThanOrEqual,
+            else => operator,
+        };
+    }
+
     /// Execute SQL statement and return affected row count
     pub fn exec(self: *Self, sql: []const u8) !u32 {
+        self.beginOperation();
+        defer self.endOperation();
+        try self.checkStatementSize(sql);
+        try self.checkOperation();
+
         // Parse the SQL
         var parsed = try parser.parse(self.allocator, sql);
         defer parsed.deinit();
+        try self.checkOperation();
+        try self.ensureStatementAllowed(&parsed.statement);
 
         // Create execution plan
-        var query_planner = planner.Planner.init(self.allocator);
+        var query_planner = planner.Planner.initWithContext(self.allocator, &self.aggregate_function_names, self.planner_table_stats.items, self.planner_index_stats.items);
         var plan = try query_planner.plan(&parsed.statement);
         defer plan.deinit();
 
@@ -777,6 +1541,24 @@ pub const Connection = struct {
                     return try self.extractReturningColumnNames(delete.table, ret.columns);
                 }
                 return try self.allocator.alloc([]const u8, 0);
+            },
+            .Pragma => |pragma| {
+                var names = try self.allocator.alloc([]const u8, 1);
+                if (std.ascii.eqlIgnoreCase(pragma.name, "integrity_check")) {
+                    names[0] = try self.allocator.dupe(u8, "integrity_check");
+                } else if (std.ascii.eqlIgnoreCase(pragma.name, "user_version")) {
+                    names[0] = try self.allocator.dupe(u8, "user_version");
+                } else if (std.ascii.eqlIgnoreCase(pragma.name, "schema_version")) {
+                    names[0] = try self.allocator.dupe(u8, "schema_version");
+                } else {
+                    names[0] = try self.allocator.dupe(u8, pragma.name);
+                }
+                return names;
+            },
+            .Vacuum => {
+                var names = try self.allocator.alloc([]const u8, 1);
+                names[0] = try self.allocator.dupe(u8, "vacuum");
+                return names;
             },
             else => {
                 // Non-SELECT statements have no columns
@@ -877,6 +1659,10 @@ pub const Connection = struct {
         if (self.plan_cache) |*cache| {
             cache.deinit();
         }
+        self.clearPlannerStats();
+        self.planner_table_stats.deinit(self.allocator);
+        self.planner_index_stats.deinit(self.allocator);
+        self.deinitFunctionRegistries();
 
         // Roll back an unfinished transaction before attempting a checkpoint.
         // This must happen before the undo log is freed because rollback consumes
@@ -909,7 +1695,7 @@ pub const Connection = struct {
         // Persist table metadata on close so non-transaction file-backed writes
         // keep the latest row counts and B-tree root pages after splits.
         if (self.owns_storage) {
-            if (!self.is_memory) {
+            if (!self.is_memory and !self.isReadOnly()) {
                 self.storage_engine.saveAllMetadata() catch |err| {
                     if (first_error == null) first_error = err;
                 };
@@ -934,6 +1720,26 @@ pub const Connection = struct {
         self.closeFallible() catch |err| {
             std.log.err("database close persistence failure: {s}", .{@errorName(err)});
         };
+    }
+
+    fn deinitFunctionRegistries(self: *Self) void {
+        var scalar_iter = self.scalar_functions.iterator();
+        while (scalar_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.scalar_functions.deinit();
+
+        var aggregate_iter = self.aggregate_functions.iterator();
+        while (aggregate_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.aggregate_functions.deinit();
+
+        var aggregate_name_iter = self.aggregate_function_names.iterator();
+        while (aggregate_name_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.aggregate_function_names.deinit();
     }
 
     /// Get database info
@@ -961,6 +1767,9 @@ pub const Connection = struct {
     /// Attach an external database file with a schema name
     /// SECURITY: Path is validated against the connection's attach_path_policy
     pub fn attachDatabase(self: *Self, file_path: []const u8, schema_name: []const u8) !void {
+        try self.ensureWritable();
+        try self.checkOperation();
+
         // Check if schema name is already in use
         if (self.attached_databases.get(schema_name) != null) {
             return error.SchemaAlreadyAttached;
@@ -1002,6 +1811,8 @@ pub const Connection = struct {
 
     /// Detach a previously attached database
     pub fn detachDatabase(self: *Self, schema_name: []const u8) !void {
+        try self.ensureWritable();
+
         // Check if schema exists
         if (self.attached_databases.fetchRemove(schema_name)) |kv| {
             // Free the schema name key
@@ -1131,6 +1942,182 @@ pub const ResultSet = struct {
         self.rows.deinit(self.allocator);
     }
 };
+
+pub const Cursor = struct {
+    mode: union(enum) {
+        materialized: ResultSet,
+        simple_table_scan: SimpleTableScanCursor,
+    },
+
+    const Self = @This();
+
+    pub fn next(self: *Self) ?Row {
+        return switch (self.mode) {
+            .materialized => |*result_set| result_set.next(),
+            .simple_table_scan => |*scan| scan.next(),
+        };
+    }
+
+    pub fn reset(self: *Self) void {
+        switch (self.mode) {
+            .materialized => |*result_set| result_set.reset(),
+            .simple_table_scan => |*scan| scan.reset(),
+        }
+    }
+
+    pub fn columnCount(self: *Self) usize {
+        return switch (self.mode) {
+            .materialized => |*result_set| result_set.columnCount(),
+            .simple_table_scan => |*scan| scan.column_names.len,
+        };
+    }
+
+    pub fn columnName(self: *Self, index: usize) ?[]const u8 {
+        return switch (self.mode) {
+            .materialized => |*result_set| result_set.columnName(index),
+            .simple_table_scan => |*scan| if (index < scan.column_names.len) scan.column_names[index] else null,
+        };
+    }
+
+    pub fn rowsSeen(self: *const Self) usize {
+        return switch (self.mode) {
+            .materialized => |*result_set| result_set.current_index,
+            .simple_table_scan => |*scan| scan.rows_seen,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        switch (self.mode) {
+            .materialized => |*result_set| result_set.deinit(),
+            .simple_table_scan => |*scan| scan.deinit(),
+        }
+    }
+};
+
+const SimpleTableScanCursor = struct {
+    allocator: std.mem.Allocator,
+    connection: *Connection,
+    table_name: []const u8,
+    column_names: [][]const u8,
+    column_indices: []usize,
+    predicate: ?Connection.SimpleCursorPredicate,
+    next_key: u64,
+    row_count_snapshot: u64,
+    rows_seen: usize,
+
+    fn next(self: *SimpleTableScanCursor) ?Row {
+        const table = self.connection.storage_engine.getTable(self.table_name) orelse return null;
+        while (self.next_key < self.row_count_snapshot) {
+            const key = self.next_key;
+            self.next_key += 1;
+            const storage_row = table.getRow(@intCast(key)) catch return null;
+            if (storage_row) |row| {
+                defer {
+                    for (row.values) |value| value.deinit(self.allocator);
+                    self.allocator.free(row.values);
+                }
+
+                if (!self.rowMatchesPredicate(row.values)) continue;
+
+                const names = self.cloneColumnNames() catch {
+                    return null;
+                };
+                const values = self.cloneProjectedValues(row.values) catch {
+                    for (names) |name| self.allocator.free(name);
+                    self.allocator.free(names);
+                    return null;
+                };
+                self.rows_seen += 1;
+                return Row{
+                    .allocator = self.allocator,
+                    .values = values,
+                    .column_names = names,
+                };
+            }
+        }
+        return null;
+    }
+
+    fn reset(self: *SimpleTableScanCursor) void {
+        self.next_key = 0;
+        self.rows_seen = 0;
+    }
+
+    fn cloneColumnNames(self: *SimpleTableScanCursor) ![][]const u8 {
+        var names = try self.allocator.alloc([]const u8, self.column_names.len);
+        var loaded: usize = 0;
+        errdefer {
+            for (names[0..loaded]) |name| self.allocator.free(name);
+            self.allocator.free(names);
+        }
+        for (self.column_names, 0..) |name, i| {
+            names[i] = try self.allocator.dupe(u8, name);
+            loaded = i + 1;
+        }
+        return names;
+    }
+
+    fn cloneProjectedValues(self: *SimpleTableScanCursor, source_values: []const storage.Value) ![]storage.Value {
+        var values = try self.allocator.alloc(storage.Value, self.column_indices.len);
+        var loaded: usize = 0;
+        errdefer {
+            for (values[0..loaded]) |value| value.deinit(self.allocator);
+            self.allocator.free(values);
+        }
+        for (self.column_indices, 0..) |column_index, i| {
+            values[i] = try source_values[column_index].clone(self.allocator);
+            loaded = i + 1;
+        }
+        return values;
+    }
+
+    fn rowMatchesPredicate(self: *SimpleTableScanCursor, values: []const storage.Value) bool {
+        const predicate = self.predicate orelse return true;
+        if (predicate.column_index >= values.len) return false;
+        const order = compareCursorValues(values[predicate.column_index], predicate.value);
+        return switch (predicate.operator) {
+            .Equal => order == .eq,
+            .NotEqual => order != .eq,
+            .LessThan => order == .lt,
+            .LessThanOrEqual => order == .lt or order == .eq,
+            .GreaterThan => order == .gt,
+            .GreaterThanOrEqual => order == .gt or order == .eq,
+            else => false,
+        };
+    }
+
+    fn deinit(self: *SimpleTableScanCursor) void {
+        self.allocator.free(self.table_name);
+        for (self.column_names) |name| self.allocator.free(name);
+        self.allocator.free(self.column_names);
+        self.allocator.free(self.column_indices);
+        if (self.predicate) |*predicate| predicate.deinit(self.allocator);
+    }
+};
+
+fn compareCursorValues(left: storage.Value, right: storage.Value) std.math.Order {
+    return switch (left) {
+        .Integer => |l| switch (right) {
+            .Integer => |r| std.math.order(l, r),
+            .Real => |r| std.math.order(@as(f64, @floatFromInt(l)), r),
+            else => .gt,
+        },
+        .Real => |l| switch (right) {
+            .Integer => |r| std.math.order(l, @as(f64, @floatFromInt(r))),
+            .Real => |r| std.math.order(l, r),
+            else => .gt,
+        },
+        .Text => |l| switch (right) {
+            .Text => |r| std.mem.order(u8, l, r),
+            else => .gt,
+        },
+        .Null => switch (right) {
+            .Null => .eq,
+            else => .lt,
+        },
+        else => .gt,
+    };
+}
 
 /// Single row with type-safe value access
 pub const Row = struct {
@@ -1319,11 +2306,17 @@ pub const PreparedStatement = struct {
     parameter_count: u32,
     parameter_names: []?[]const u8,
     parameters: []storage.Value,
+    schema_version_at_prepare: u32,
 
     const Self = @This();
 
     /// Prepare a SQL statement
     pub fn prepare(allocator: std.mem.Allocator, connection: *Connection, sql: []const u8) !*Self {
+        connection.beginOperation();
+        defer connection.endOperation();
+        try connection.checkStatementSize(sql);
+        try connection.checkOperation();
+
         var stmt = try allocator.create(Self);
         stmt.allocator = allocator;
         stmt.connection = connection;
@@ -1333,10 +2326,19 @@ pub const PreparedStatement = struct {
         var parsed_result = try parser.parse(allocator, sql);
         stmt.parsed_statement = parsed_result.statement;
         parsed_result.parser.deinit(); // Clean up parser resources
+        try connection.checkOperation();
+        connection.ensureStatementAllowed(&stmt.parsed_statement) catch |err| {
+            stmt.parsed_statement.deinit(allocator);
+            allocator.free(stmt.sql);
+            allocator.destroy(stmt);
+            return err;
+        };
 
         // Create execution plan
-        var query_planner = planner.Planner.init(allocator);
+        var query_planner = planner.Planner.initWithContext(allocator, &connection.aggregate_function_names, connection.planner_table_stats.items, connection.planner_index_stats.items);
         stmt.execution_plan = try query_planner.plan(&stmt.parsed_statement);
+        try connection.checkOperation();
+        stmt.schema_version_at_prepare = connection.getSchemaVersion();
 
         stmt.parameter_names = try collectParameterNames(allocator, sql);
         stmt.parameter_count = @intCast(stmt.parameter_names.len);
@@ -1391,6 +2393,11 @@ pub const PreparedStatement = struct {
 
     /// Execute the prepared statement
     pub fn execute(self: *Self) !vm.ExecutionResult {
+        self.connection.beginOperation();
+        defer self.connection.endOperation();
+        try self.connection.checkOperation();
+        try self.connection.ensureStatementAllowed(&self.parsed_statement);
+        try self.ensureSchemaCurrent(self.connection);
         var virtual_machine = vm.VirtualMachine.init(self.connection.allocator, self.connection);
         defer virtual_machine.deinitVM();
         return virtual_machine.executeWithParameters(&self.execution_plan, self.parameters);
@@ -1398,9 +2405,53 @@ pub const PreparedStatement = struct {
 
     /// Execute the prepared statement with explicit connection (for backwards compatibility)
     pub fn executeWithConnection(self: *Self, connection: *Connection) !vm.ExecutionResult {
+        connection.beginOperation();
+        defer connection.endOperation();
+        try connection.checkOperation();
+        try connection.ensureStatementAllowed(&self.parsed_statement);
+        try self.ensureSchemaCurrent(connection);
         var virtual_machine = vm.VirtualMachine.init(connection.allocator, connection);
         defer virtual_machine.deinitVM();
         return virtual_machine.executeWithParameters(&self.execution_plan, self.parameters);
+    }
+
+    pub fn openCursor(self: *Self) !Cursor {
+        self.connection.beginOperation();
+        defer self.connection.endOperation();
+        try self.connection.checkOperation();
+        try self.connection.ensureStatementAllowed(&self.parsed_statement);
+        try self.ensureSchemaCurrent(self.connection);
+
+        if (try self.connection.openSimpleTableCursor(&self.parsed_statement, self.parameters)) |cursor| {
+            return cursor;
+        }
+
+        var virtual_machine = vm.VirtualMachine.init(self.connection.allocator, self.connection);
+        defer virtual_machine.deinitVM();
+        var result = try virtual_machine.executeWithParameters(&self.execution_plan, self.parameters);
+        defer result.deinit();
+
+        var result_set = ResultSet{
+            .allocator = self.connection.allocator,
+            .connection = self.connection,
+            .rows = .empty,
+            .current_index = 0,
+            .column_names = try self.connection.extractColumnNames(&self.parsed_statement),
+        };
+        result_set.rows = result.rows;
+        result.rows = .empty;
+
+        return Cursor{ .mode = .{ .materialized = result_set } };
+    }
+
+    pub fn isExpired(self: *const Self) bool {
+        return self.connection.getSchemaVersion() != self.schema_version_at_prepare;
+    }
+
+    fn ensureSchemaCurrent(self: *const Self, connection: *Connection) !void {
+        if (connection.getSchemaVersion() != self.schema_version_at_prepare) {
+            return error.PreparedStatementExpired;
+        }
     }
 
     /// Reset parameters
@@ -1579,6 +2630,128 @@ test "UPDATE SET resolves positional prepared parameters" {
     const row = rows.next() orelse return error.NoRowReturned;
     try std.testing.expectEqualStrings("updated", row.getText(0) orelse return error.NullName);
     try std.testing.expectEqual(@as(i64, 42), row.getInt(1) orelse return error.NullN);
+}
+
+test "prepared statement expires after schema change" {
+    const allocator = std.testing.allocator;
+    var conn = try Connection.openMemory(allocator);
+    defer conn.deinit();
+
+    try conn.execute("CREATE TABLE prep_expire (id INTEGER)");
+    var stmt = try conn.prepare("SELECT * FROM prep_expire");
+    defer stmt.deinit();
+
+    try std.testing.expect(!stmt.isExpired());
+    try conn.execute("CREATE TABLE prep_expire_other (id INTEGER)");
+    try std.testing.expect(stmt.isExpired());
+    try std.testing.expectError(error.PreparedStatementExpired, stmt.execute());
+}
+
+test "cursor iterates query results" {
+    const allocator = std.testing.allocator;
+    var conn = try Connection.openMemory(allocator);
+    defer conn.deinit();
+
+    try conn.execute("CREATE TABLE cursor_items (id INTEGER, name TEXT)");
+    try conn.execute("INSERT INTO cursor_items VALUES (1, 'one')");
+    try conn.execute("INSERT INTO cursor_items VALUES (2, 'two')");
+
+    var cursor = try conn.openCursor("SELECT id, name FROM cursor_items ORDER BY id");
+    defer cursor.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), cursor.columnCount());
+    try std.testing.expectEqualStrings("id", cursor.columnName(0).?);
+
+    var first = cursor.next().?;
+    defer first.deinit();
+    try std.testing.expectEqual(@as(i64, 1), first.getInt(0).?);
+
+    var second = cursor.next().?;
+    defer second.deinit();
+    try std.testing.expectEqualStrings("two", second.getText(1).?);
+    try std.testing.expect(cursor.next() == null);
+}
+
+test "cursor incrementally scans projected simple columns" {
+    const allocator = std.testing.allocator;
+    var conn = try Connection.openMemory(allocator);
+    defer conn.deinit();
+
+    try conn.execute("CREATE TABLE cursor_projected (id INTEGER, name TEXT, ignored TEXT)");
+    try conn.execute("INSERT INTO cursor_projected VALUES (1, 'one', 'x')");
+    try conn.execute("INSERT INTO cursor_projected VALUES (2, 'two', 'y')");
+
+    var cursor = try conn.openCursor("SELECT name, id FROM cursor_projected");
+    defer cursor.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), cursor.columnCount());
+    try std.testing.expectEqualStrings("name", cursor.columnName(0).?);
+    try std.testing.expectEqualStrings("id", cursor.columnName(1).?);
+
+    var first = cursor.next().?;
+    defer first.deinit();
+    try std.testing.expectEqualStrings("one", first.getText(0).?);
+    try std.testing.expectEqual(@as(i64, 1), first.getInt(1).?);
+
+    var second = cursor.next().?;
+    defer second.deinit();
+    try std.testing.expectEqualStrings("two", second.getText(0).?);
+    try std.testing.expectEqual(@as(i64, 2), second.getInt(1).?);
+    try std.testing.expect(cursor.next() == null);
+    try std.testing.expectEqual(@as(usize, 2), cursor.rowsSeen());
+}
+
+test "cursor incrementally scans simple where predicate" {
+    const allocator = std.testing.allocator;
+    var conn = try Connection.openMemory(allocator);
+    defer conn.deinit();
+
+    try conn.execute("CREATE TABLE cursor_filtered (id INTEGER, name TEXT)");
+    try conn.execute("INSERT INTO cursor_filtered VALUES (1, 'one')");
+    try conn.execute("INSERT INTO cursor_filtered VALUES (2, 'two')");
+    try conn.execute("INSERT INTO cursor_filtered VALUES (3, 'three')");
+
+    var cursor = try conn.openCursor("SELECT name FROM cursor_filtered WHERE id >= 2");
+    defer cursor.deinit();
+
+    var first = cursor.next().?;
+    defer first.deinit();
+    try std.testing.expectEqualStrings("two", first.getText(0).?);
+
+    var second = cursor.next().?;
+    defer second.deinit();
+    try std.testing.expectEqualStrings("three", second.getText(0).?);
+    try std.testing.expect(cursor.next() == null);
+    try std.testing.expectEqual(@as(usize, 2), cursor.rowsSeen());
+}
+
+test "prepared statement opens bound cursor" {
+    const allocator = std.testing.allocator;
+    var conn = try Connection.openMemory(allocator);
+    defer conn.deinit();
+
+    try conn.execute("CREATE TABLE prepared_cursor_items (id INTEGER, name TEXT)");
+    try conn.execute("INSERT INTO prepared_cursor_items VALUES (1, 'one')");
+    try conn.execute("INSERT INTO prepared_cursor_items VALUES (2, 'two')");
+    try conn.execute("INSERT INTO prepared_cursor_items VALUES (3, 'three')");
+
+    var stmt = try conn.prepare("SELECT name, id FROM prepared_cursor_items WHERE id > ?");
+    defer stmt.deinit();
+    try stmt.bind(0, @as(i64, 1));
+
+    var cursor = try stmt.openCursor();
+    defer cursor.deinit();
+
+    var first = cursor.next().?;
+    defer first.deinit();
+    try std.testing.expectEqualStrings("two", first.getText(0).?);
+    try std.testing.expectEqual(@as(i64, 2), first.getInt(1).?);
+
+    var second = cursor.next().?;
+    defer second.deinit();
+    try std.testing.expectEqualStrings("three", second.getText(0).?);
+    try std.testing.expectEqual(@as(i64, 3), second.getInt(1).?);
+    try std.testing.expect(cursor.next() == null);
 }
 
 test "UPDATE SET resolves named prepared parameters" {

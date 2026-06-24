@@ -37,7 +37,10 @@ pub const StorageEngine = struct {
     indexes: std.StringHashMap(*Index),
     fts_indexes: std.StringHashMap(*FTSIndex), // Full-text search indexes
     is_memory: bool,
+    read_only: bool,
     catalog: CatalogState,
+    user_version: u32,
+    schema_version: u32,
     /// True when the database was opened in the legacy single-page catalog
     /// format and has not yet been migrated to the superblock format.
     legacy_format: bool,
@@ -46,11 +49,16 @@ pub const StorageEngine = struct {
 
     /// Initialize storage engine with file backing
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !*Self {
+        return initWithMode(allocator, path, .read_write);
+    }
+
+    /// Initialize storage engine with file backing and explicit access mode.
+    pub fn initWithMode(allocator: std.mem.Allocator, path: []const u8, mode: pager.Pager.OpenMode) !*Self {
         var engine = try allocator.create(Self);
         errdefer allocator.destroy(engine);
 
         engine.allocator = allocator;
-        engine.pager = try pager.Pager.init(allocator, path);
+        engine.pager = try pager.Pager.initWithMode(allocator, path, mode);
         errdefer engine.pager.deinit();
 
         engine.memory_pool = memory_pool.MemoryPool.init(allocator);
@@ -59,7 +67,10 @@ pub const StorageEngine = struct {
         engine.indexes = std.StringHashMap(*Index).init(allocator);
         engine.fts_indexes = std.StringHashMap(*FTSIndex).init(allocator);
         engine.is_memory = false;
+        engine.read_only = mode == .read_only;
         engine.catalog = .{};
+        engine.user_version = 0;
+        engine.schema_version = 0;
         engine.legacy_format = false;
 
         // If opening the catalog fails (I/O error, corruption, or an unsupported
@@ -108,7 +119,10 @@ pub const StorageEngine = struct {
         engine.indexes = std.StringHashMap(*Index).init(allocator);
         engine.fts_indexes = std.StringHashMap(*FTSIndex).init(allocator);
         engine.is_memory = true;
+        engine.read_only = false;
         engine.catalog = .{};
+        engine.user_version = 0;
+        engine.schema_version = 0;
         engine.legacy_format = false;
 
         return engine;
@@ -131,6 +145,8 @@ pub const StorageEngine = struct {
 
     /// Create a new table
     pub fn createTable(self: *Self, name: []const u8, schema: TableSchema) !void {
+        try self.ensureWritable();
+
         // Check if table already exists
         if (self.tables.contains(name)) {
             return error.TableAlreadyExists;
@@ -143,9 +159,10 @@ pub const StorageEngine = struct {
         errdefer self.allocator.free(duped_name);
 
         try self.tables.put(duped_name, table);
+        self.bumpSchemaVersion();
 
         // Persist table metadata if not in-memory
-        if (!self.is_memory) {
+        if (self.shouldPersistCatalogNow()) {
             try self.saveTableMetadata(table);
         }
     }
@@ -171,12 +188,15 @@ pub const StorageEngine = struct {
 
     /// Drop a table
     pub fn dropTable(self: *Self, name: []const u8) !void {
+        try self.ensureWritable();
+
         if (self.tables.fetchRemove(name)) |entry| {
             entry.value.deinit();
             self.allocator.free(entry.key);
+            self.bumpSchemaVersion();
 
             // Rewrite metadata page atomically after drop
-            if (!self.is_memory) {
+            if (self.shouldPersistCatalogNow()) {
                 try self.rewriteAllMetadata();
             }
         }
@@ -190,7 +210,8 @@ pub const StorageEngine = struct {
     /// durable catalog intact, and the serialized buffer cannot silently truncate
     /// records the way the old single-page writer could.
     fn rewriteAllMetadata(self: *Self) !void {
-        if (self.is_memory) return;
+        if (!self.shouldPersistCatalogNow()) return;
+        try self.ensureWritable();
 
         const payload = try self.serializeCatalog();
         defer self.allocator.free(payload);
@@ -225,7 +246,37 @@ pub const StorageEngine = struct {
 
     /// Save metadata for all tables (public wrapper for commits)
     pub fn saveAllMetadata(self: *Self) !void {
+        try self.ensureWritable();
         try self.rewriteAllMetadata();
+    }
+
+    pub fn getUserVersion(self: *const Self) u32 {
+        return self.user_version;
+    }
+
+    pub fn setUserVersion(self: *Self, version: u32) !void {
+        try self.ensureWritable();
+        self.user_version = version;
+        if (self.shouldPersistCatalogNow()) {
+            try self.rewriteAllMetadata();
+        }
+    }
+
+    pub fn getSchemaVersion(self: *const Self) u32 {
+        return self.schema_version;
+    }
+
+    fn bumpSchemaVersion(self: *Self) void {
+        self.schema_version +%= 1;
+        if (self.schema_version == 0) self.schema_version = 1;
+    }
+
+    fn ensureWritable(self: *const Self) !void {
+        if (self.read_only) return error.ReadOnlyDatabase;
+    }
+
+    fn shouldPersistCatalogNow(self: *const Self) bool {
+        return !self.is_memory and !self.pager.in_transaction;
     }
 
     fn appendInt(self: *Self, buf: *std.ArrayListUnmanaged(u8), comptime T: type, value: T) !void {
@@ -537,6 +588,12 @@ pub const StorageEngine = struct {
             }
         }
 
+        // Database metadata: application/user version and schema version. This
+        // optional tail section keeps older catalog payloads readable.
+        try self.appendInt(&buf, u32, 1);
+        try self.appendInt(&buf, u32, self.user_version);
+        try self.appendInt(&buf, u32, self.schema_version);
+
         return buf.toOwnedSlice(self.allocator);
     }
 
@@ -637,7 +694,24 @@ pub const StorageEngine = struct {
 
     /// Create an index
     pub fn createIndex(self: *Self, name: []const u8, table_name: []const u8, column_names: [][]const u8, is_unique: bool) !void {
-        const index = try self.registerIndex(name, table_name, column_names, is_unique);
+        try self.createIndexEx(name, table_name, column_names, &.{}, null, is_unique);
+    }
+
+    pub fn createIndexEx(
+        self: *Self,
+        name: []const u8,
+        table_name: []const u8,
+        column_names: [][]const u8,
+        expressions: []const ast.Expression,
+        where_clause: ?ast.Condition,
+        is_unique: bool,
+    ) !void {
+        try self.ensureWritable();
+        if (!self.is_memory and isAdvancedIndexDefinition(column_names, expressions, where_clause)) {
+            return error.UnsupportedPersistentAdvancedIndex;
+        }
+
+        const index = try self.registerIndexEx(name, table_name, column_names, expressions, where_clause, is_unique);
         errdefer {
             if (self.indexes.fetchRemove(name)) |entry| {
                 entry.value.deinit(self.allocator);
@@ -646,14 +720,44 @@ pub const StorageEngine = struct {
         }
 
         try self.rebuildIndex(index);
+        self.bumpSchemaVersion();
 
-        if (!self.is_memory) {
+        if (self.shouldPersistCatalogNow()) {
             try self.rewriteAllMetadata();
         }
     }
 
     fn registerIndex(self: *Self, name: []const u8, table_name: []const u8, column_names: [][]const u8, is_unique: bool) !*Index {
-        const index = try Index.create(self.allocator, self.pager, name, table_name, column_names, is_unique);
+        return self.registerIndexEx(name, table_name, column_names, &.{}, null, is_unique);
+    }
+
+    fn isAdvancedIndexDefinition(column_names: []const []const u8, expressions: []const ast.Expression, where_clause: ?ast.Condition) bool {
+        if (where_clause != null) return true;
+        if (expressions.len == 0) return false;
+        if (expressions.len != column_names.len) return true;
+
+        for (expressions, column_names) |expression, column_name| {
+            switch (expression) {
+                .Column => |name| {
+                    if (!std.mem.eql(u8, name, column_name)) return true;
+                },
+                else => return true,
+            }
+        }
+
+        return false;
+    }
+
+    fn registerIndexEx(
+        self: *Self,
+        name: []const u8,
+        table_name: []const u8,
+        column_names: [][]const u8,
+        expressions: []const ast.Expression,
+        where_clause: ?ast.Condition,
+        is_unique: bool,
+    ) !*Index {
+        const index = try Index.createEx(self.allocator, self.pager, name, table_name, column_names, expressions, where_clause, is_unique);
         errdefer index.deinit(self.allocator);
 
         const duped_name = try self.allocator.dupe(u8, name);
@@ -670,17 +774,22 @@ pub const StorageEngine = struct {
 
     /// Drop an index
     pub fn dropIndex(self: *Self, name: []const u8) !void {
+        try self.ensureWritable();
+
         if (self.indexes.fetchRemove(name)) |entry| {
             entry.value.deinit(self.allocator);
             self.allocator.free(entry.key);
+            self.bumpSchemaVersion();
 
-            if (!self.is_memory) {
+            if (self.shouldPersistCatalogNow()) {
                 try self.rewriteAllMetadata();
             }
         }
     }
 
     pub fn refreshIndexesForTable(self: *Self, table_name: []const u8) !void {
+        try self.ensureWritable();
+
         var index_iter = self.indexes.iterator();
         while (index_iter.next()) |entry| {
             const index = entry.value_ptr.*;
@@ -691,13 +800,15 @@ pub const StorageEngine = struct {
             try self.rebuildIndex(index);
         }
 
-        if (!self.is_memory) {
+        if (self.shouldPersistCatalogNow()) {
             try self.rewriteAllMetadata();
         }
     }
 
     /// Create an FTS (Full-Text Search) index for a virtual table
     pub fn createFTSIndex(self: *Self, table_name: []const u8, columns: []const []const u8) !void {
+        try self.ensureWritable();
+
         var fts_index = try FTSIndex.create(self.allocator, table_name, columns);
         errdefer fts_index.deinit(self.allocator);
 
@@ -705,6 +816,7 @@ pub const StorageEngine = struct {
         errdefer self.allocator.free(duped_name);
 
         try self.fts_indexes.put(duped_name, fts_index);
+        self.bumpSchemaVersion();
     }
 
     /// Get an FTS index by table name
@@ -731,13 +843,16 @@ pub const StorageEngine = struct {
     }
 
     fn rowMatchesUniqueIndex(table: *Table, index: *Index, existing_values: []const Value, candidate_values: []const Value) bool {
-        for (index.column_names) |column_name| {
-            const column_idx = table.getColumnIndex(column_name) orelse return false;
-            if (column_idx >= existing_values.len or column_idx >= candidate_values.len) return false;
+        if (!rowMatchesPartialPredicate(table, index, existing_values)) return false;
+        if (!rowMatchesPartialPredicate(table, index, candidate_values)) return false;
+
+        for (0..index.keyPartCount()) |part_idx| {
+            const existing = evaluateIndexPart(table, index, part_idx, existing_values) orelse return false;
+            const candidate = evaluateIndexPart(table, index, part_idx, candidate_values) orelse return false;
             // SQL treats NULLs as distinct for uniqueness: a row with a NULL in any
             // indexed column never conflicts, so multiple NULLs are permitted.
-            if (existing_values[column_idx] == .Null or candidate_values[column_idx] == .Null) return false;
-            if (!valueEquals(existing_values[column_idx], candidate_values[column_idx])) return false;
+            if (existing == .Null or candidate == .Null) return false;
+            if (!valueEquals(existing, candidate)) return false;
         }
         return true;
     }
@@ -792,34 +907,154 @@ pub const StorageEngine = struct {
         }
 
         for (rows) |item| {
+            if (!rowMatchesPartialPredicate(table, index, item.row.values)) continue;
             const key = computeIndexKey(table, index, item.row.values) orelse continue;
             try index.insert(key, @intCast(item.key));
         }
     }
 
     fn computeIndexKey(table: *Table, index: *Index, values: []const Value) ?u64 {
-        if (index.column_names.len == 0) return null;
+        const part_count = index.keyPartCount();
+        if (part_count == 0) return null;
 
-        if (index.column_names.len == 1) {
-            const column_idx = table.getColumnIndex(index.column_names[0]) orelse return null;
-            if (column_idx >= values.len) return null;
+        if (part_count == 1) {
+            const value = evaluateIndexPart(table, index, 0, values) orelse return null;
             // SQL treats NULLs as distinct, so a NULL-bearing row is not indexed and
             // never participates in uniqueness checks. Callers skip a null key.
-            if (values[column_idx] == .Null) return null;
-            return valueToIndexKey(values[column_idx]);
+            if (value == .Null) return null;
+            return valueToIndexKey(value);
         }
 
         var combined: u64 = 0xcbf29ce484222325;
-        for (index.column_names) |column_name| {
-            const column_idx = table.getColumnIndex(column_name) orelse return null;
-            if (column_idx >= values.len) return null;
-            if (values[column_idx] == .Null) return null;
+        for (0..part_count) |part_idx| {
+            const value = evaluateIndexPart(table, index, part_idx, values) orelse return null;
+            if (value == .Null) return null;
 
-            const component = valueToIndexKey(values[column_idx]);
+            const component = valueToIndexKey(value);
             combined = (combined ^ component) *% 0x100000001b3;
         }
 
         return combined;
+    }
+
+    fn rowMatchesPartialPredicate(table: *Table, index: *Index, values: []const Value) bool {
+        const condition = index.where_clause orelse return true;
+        return evaluateIndexCondition(table, &condition, values);
+    }
+
+    fn evaluateIndexPart(table: *Table, index: *Index, part_idx: usize, values: []const Value) ?Value {
+        if (index.expressions.len > part_idx) {
+            return evaluateIndexExpression(table, &index.expressions[part_idx], values);
+        }
+        if (index.column_names.len <= part_idx) return null;
+        const column_idx = table.getColumnIndex(index.column_names[part_idx]) orelse return null;
+        if (column_idx >= values.len) return null;
+        return values[column_idx];
+    }
+
+    fn evaluateIndexExpression(table: *Table, expression: *const ast.Expression, values: []const Value) ?Value {
+        return switch (expression.*) {
+            .Column => |name| blk: {
+                const idx = table.getColumnIndex(name) orelse return null;
+                if (idx >= values.len) return null;
+                break :blk values[idx];
+            },
+            .Literal => |value| astValueToStorageValue(value),
+            .BinaryOp => |bin| blk: {
+                const left = evaluateIndexExpression(table, bin.left, values) orelse return null;
+                const right = evaluateIndexExpression(table, bin.right, values) orelse return null;
+                break :blk evaluateIndexArithmetic(left, bin.op, right);
+            },
+            else => null,
+        };
+    }
+
+    fn evaluateIndexCondition(table: *Table, condition: *const ast.Condition, values: []const Value) bool {
+        return switch (condition.*) {
+            .Comparison => |comparison| evaluateIndexComparison(table, &comparison, values),
+            .Logical => |logical| switch (logical.operator) {
+                .And => evaluateIndexCondition(table, logical.left, values) and evaluateIndexCondition(table, logical.right, values),
+                .Or => evaluateIndexCondition(table, logical.left, values) or evaluateIndexCondition(table, logical.right, values),
+            },
+        };
+    }
+
+    fn evaluateIndexComparison(table: *Table, comparison: *const ast.ComparisonCondition, values: []const Value) bool {
+        const left = evaluateIndexExpression(table, &comparison.left, values) orelse Value.Null;
+        if (comparison.operator == .IsNull) return left == .Null;
+        if (comparison.operator == .IsNotNull) return left != .Null;
+
+        const right = evaluateIndexExpression(table, &comparison.right, values) orelse Value.Null;
+        if (left == .Null or right == .Null) return false;
+
+        const order = compareIndexValues(left, right);
+        return switch (comparison.operator) {
+            .Equal => order == .eq,
+            .NotEqual => order != .eq,
+            .LessThan => order == .lt,
+            .LessThanOrEqual => order == .lt or order == .eq,
+            .GreaterThan => order == .gt,
+            .GreaterThanOrEqual => order == .gt or order == .eq,
+            else => false,
+        };
+    }
+
+    fn astValueToStorageValue(value: ast.Value) ?Value {
+        return switch (value) {
+            .Integer => |v| Value{ .Integer = v },
+            .Real => |v| Value{ .Real = v },
+            .Text => |v| Value{ .Text = v },
+            .Blob => |v| Value{ .Blob = v },
+            .Null => Value.Null,
+            else => null,
+        };
+    }
+
+    fn evaluateIndexArithmetic(left: Value, op: ast.ArithmeticOp, right: Value) ?Value {
+        const left_num: f64 = switch (left) {
+            .Integer => |v| @floatFromInt(v),
+            .Real => |v| v,
+            .SmallInt => |v| @floatFromInt(v),
+            .BigInt => |v| @floatFromInt(v),
+            else => return null,
+        };
+        const right_num: f64 = switch (right) {
+            .Integer => |v| @floatFromInt(v),
+            .Real => |v| v,
+            .SmallInt => |v| @floatFromInt(v),
+            .BigInt => |v| @floatFromInt(v),
+            else => return null,
+        };
+
+        const result = switch (op) {
+            .Add => left_num + right_num,
+            .Subtract => left_num - right_num,
+            .Multiply => left_num * right_num,
+            .Divide => if (right_num == 0) return null else left_num / right_num,
+            .Modulo => if (right_num == 0) return null else @mod(left_num, right_num),
+        };
+        if (@floor(result) == result) return Value{ .Integer = @intFromFloat(result) };
+        return Value{ .Real = result };
+    }
+
+    fn compareIndexValues(a: Value, b: Value) std.math.Order {
+        return switch (a) {
+            .Integer => |x| switch (b) {
+                .Integer => |y| std.math.order(x, y),
+                .Real => |y| std.math.order(@as(f64, @floatFromInt(x)), y),
+                else => .gt,
+            },
+            .Real => |x| switch (b) {
+                .Integer => |y| std.math.order(x, @as(f64, @floatFromInt(y))),
+                .Real => |y| std.math.order(x, y),
+                else => .gt,
+            },
+            .Text => |x| switch (b) {
+                .Text => |y| std.mem.order(u8, x, y),
+                else => .gt,
+            },
+            else => if (valueEquals(a, b)) .eq else .gt,
+        };
     }
 
     fn valueToIndexKey(value: Value) u64 {
@@ -1414,6 +1649,7 @@ pub const StorageEngine = struct {
                 columns[col_idx].is_primary_key = (flags & 0x01) != 0;
                 columns[col_idx].is_nullable = (flags & 0x02) != 0;
                 columns[col_idx].default_value = null;
+                columns[col_idx].generated = null;
             }
 
             const schema = TableSchema{ .columns = columns[0..col_idx] };
@@ -1638,6 +1874,18 @@ pub const StorageEngine = struct {
                 self.allocator.free(foreign_keys);
             }
         }
+
+        if (offset == payload.len) return;
+        if (offset + 4 > payload.len) return error.CorruptCatalog;
+        const metadata_count = std.mem.readInt(u32, payload[offset..][0..4], .little);
+        offset += 4;
+        if (metadata_count > 0) {
+            if (offset + 8 > payload.len) return error.CorruptCatalog;
+            self.user_version = std.mem.readInt(u32, payload[offset..][0..4], .little);
+            offset += 4;
+            self.schema_version = std.mem.readInt(u32, payload[offset..][0..4], .little);
+            offset += 4;
+        }
     }
 
     /// Parse the legacy single-page (page 1) catalog format. Retained so existing
@@ -1727,6 +1975,7 @@ pub const StorageEngine = struct {
                 columns[col_idx].is_primary_key = (flags & 0x01) != 0;
                 columns[col_idx].is_nullable = (flags & 0x02) != 0;
                 columns[col_idx].default_value = null;
+                columns[col_idx].generated = null;
 
                 col_idx += 1;
             }
@@ -1957,6 +2206,133 @@ pub const StorageEngine = struct {
             .cached_pages = cache_stats.cached_pages,
         };
     }
+
+    pub fn validateIntegrity(self: *Self, allocator: std.mem.Allocator) !IntegrityCheckResult {
+        var result = IntegrityCheckResult{};
+
+        var table_iter = self.tables.iterator();
+        while (table_iter.next()) |entry| {
+            const table_name = entry.key_ptr.*;
+            const table = entry.value_ptr.*;
+            result.table_count += 1;
+            result.deleted_rows += table.deleted_keys.count();
+
+            var deleted_iter = table.deleted_keys.keyIterator();
+            while (deleted_iter.next()) |key| {
+                if (key.* >= table.row_count) {
+                    try result.addIssue(allocator, "deleted row key exceeds table row count");
+                }
+            }
+
+            const all_rows = table.btree.selectAllWithKeys(allocator) catch |err| {
+                try result.addIssue(allocator, "table scan failed during integrity check");
+                return err;
+            };
+            defer {
+                for (all_rows) |item| {
+                    for (item.row.values) |value| value.deinit(allocator);
+                    allocator.free(item.row.values);
+                }
+                allocator.free(all_rows);
+            }
+
+            var live_rows: usize = 0;
+            var deleted_existing_rows: usize = 0;
+            for (all_rows) |item| {
+                if (table.deleted_keys.contains(item.key)) {
+                    deleted_existing_rows += 1;
+                } else {
+                    live_rows += 1;
+                }
+            }
+
+            result.live_rows += live_rows;
+            if (table.deleted_keys.count() != deleted_existing_rows) {
+                try result.addIssue(allocator, "deleted row metadata references missing rows");
+            }
+            const expected_live = all_rows.len - deleted_existing_rows;
+            if (live_rows != expected_live) {
+                try result.addIssue(allocator, "table live row count does not match catalog metadata");
+            }
+
+            for (all_rows) |item| {
+                if (!table.deleted_keys.contains(item.key) and item.row.values.len != table.schema.columns.len) {
+                    try result.addIssue(allocator, "row column count does not match table schema");
+                }
+            }
+
+            _ = table_name;
+        }
+
+        var index_iter = self.indexes.iterator();
+        while (index_iter.next()) |entry| {
+            const index = entry.value_ptr.*;
+            result.index_count += 1;
+
+            const table = self.getTable(index.table_name) orelse {
+                try result.addIssue(allocator, "index references missing table");
+                continue;
+            };
+
+            for (index.column_names) |column_name| {
+                if (table.getColumnIndex(column_name) == null and index.expressions.len == 0) {
+                    try result.addIssue(allocator, "index references missing column");
+                }
+            }
+
+            const index_rows = index.btree.selectAllWithKeys(allocator) catch |err| {
+                try result.addIssue(allocator, "index scan failed during integrity check");
+                return err;
+            };
+            defer {
+                for (index_rows) |item| {
+                    for (item.row.values) |value| value.deinit(allocator);
+                    allocator.free(item.row.values);
+                }
+                allocator.free(index_rows);
+            }
+
+            var indexed_row_ids = std.AutoHashMap(i64, void).init(allocator);
+            defer indexed_row_ids.deinit();
+            for (index_rows) |item| {
+                if (item.row.values.len == 0) continue;
+                switch (item.row.values[0]) {
+                    .Integer => |row_id| try indexed_row_ids.put(row_id, {}),
+                    else => {},
+                }
+            }
+            result.index_entries += indexed_row_ids.count();
+
+            const rows = table.selectWithKeys(allocator) catch |err| {
+                try result.addIssue(allocator, "table scan for index validation failed");
+                return err;
+            };
+            defer {
+                for (rows) |item| {
+                    for (item.row.values) |value| value.deinit(allocator);
+                    allocator.free(item.row.values);
+                }
+                allocator.free(rows);
+            }
+
+            var expected_indexed_rows: usize = 0;
+            for (rows) |item| {
+                if (!rowMatchesPartialPredicate(table, index, item.row.values)) continue;
+                if (computeIndexKey(table, index, item.row.values) == null) continue;
+                expected_indexed_rows += 1;
+                if (!indexed_row_ids.contains(item.key)) {
+                    try result.addIssue(allocator, "index missing expected table row");
+                }
+            }
+
+            if (indexed_row_ids.count() != expected_indexed_rows) {
+                try result.addIssue(allocator, "index entry count does not match table rows");
+            }
+        }
+
+        result.ok = result.issue_count == 0;
+        return result;
+    }
 };
 
 /// Table representation
@@ -1973,10 +2349,13 @@ pub const Table = struct {
     /// Create a new table
     pub fn create(allocator: std.mem.Allocator, page_manager: *pager.Pager, name: []const u8, schema: TableSchema) !*Self {
         var table = try allocator.create(Self);
+        errdefer allocator.destroy(table);
         table.allocator = allocator;
         table.name = try allocator.dupe(u8, name);
+        errdefer allocator.free(table.name);
         // Deep clone schema to ensure ownership with storage engine's allocator
         table.schema = try schema.clone(allocator);
+        errdefer table.schema.deinit(allocator);
         table.btree = try btree.BTree.init(allocator, page_manager);
         table.row_count = 0;
         table.deleted_keys = std.AutoHashMap(u64, void).init(allocator);
@@ -2027,7 +2406,9 @@ pub const Table = struct {
 
     /// Delete a row by its key (logical delete)
     pub fn delete(self: *Self, alloc: std.mem.Allocator, row_id: i64) !void {
-        _ = alloc;
+        const row = try self.btree.search(@intCast(row_id)) orelse return;
+        for (row.values) |value| value.deinit(alloc);
+        alloc.free(row.values);
         try self.deleted_keys.put(@intCast(row_id), {});
     }
 
@@ -2140,6 +2521,9 @@ pub const TableSchema = struct {
             if (column.default_value) |default_value| {
                 default_value.deinit(allocator);
             }
+            if (column.generated) |generated| {
+                generated.deinit(allocator);
+            }
         }
         allocator.free(self.columns);
         for (self.check_constraints) |*condition| {
@@ -2164,6 +2548,10 @@ pub const TableSchema = struct {
                 .is_nullable = column.is_nullable,
                 .default_value = if (column.default_value) |default_val|
                     try default_val.clone(allocator)
+                else
+                    null,
+                .generated = if (column.generated) |generated|
+                    try generated.clone(allocator)
                 else
                     null,
                 .is_unique = column.is_unique,
@@ -2302,10 +2690,28 @@ pub const Column = struct {
     is_primary_key: bool,
     is_nullable: bool,
     default_value: ?DefaultValue,
+    generated: ?GeneratedColumn = null,
     /// Set when the column carries an inline UNIQUE constraint. Enforcement is
     /// implemented by auto-creating a unique index at table creation, so this
     /// flag only needs to survive planning; it is not part of the catalog format.
     is_unique: bool = false,
+
+    pub const GeneratedColumn = struct {
+        expression: ast.Expression,
+        stored: bool,
+
+        pub fn deinit(self: GeneratedColumn, allocator: std.mem.Allocator) void {
+            var expression = self.expression;
+            expression.deinit(allocator);
+        }
+
+        pub fn clone(self: GeneratedColumn, allocator: std.mem.Allocator) CloneValueError!GeneratedColumn {
+            return GeneratedColumn{
+                .expression = try cloneAstExpression(allocator, self.expression),
+                .stored = self.stored,
+            };
+        }
+    };
 
     pub const DefaultValue = union(enum) {
         Literal: Value,
@@ -2790,11 +3196,37 @@ pub const StorageStats = struct {
     cached_pages: u32,
 };
 
+pub const IntegrityCheckResult = struct {
+    ok: bool = true,
+    table_count: usize = 0,
+    index_count: usize = 0,
+    live_rows: usize = 0,
+    deleted_rows: usize = 0,
+    index_entries: usize = 0,
+    issue_count: usize = 0,
+    first_issue: ?[]const u8 = null,
+
+    pub fn deinit(self: *IntegrityCheckResult, allocator: std.mem.Allocator) void {
+        if (self.first_issue) |issue| allocator.free(issue);
+        self.first_issue = null;
+    }
+
+    fn addIssue(self: *IntegrityCheckResult, allocator: std.mem.Allocator, message: []const u8) !void {
+        self.ok = false;
+        self.issue_count += 1;
+        if (self.first_issue == null) {
+            self.first_issue = try allocator.dupe(u8, message);
+        }
+    }
+};
+
 /// Index definition
 pub const Index = struct {
     name: []const u8,
     table_name: []const u8,
     column_names: [][]const u8,
+    expressions: []ast.Expression,
+    where_clause: ?ast.Condition,
     btree: *btree.BTree,
     is_unique: bool,
 
@@ -2802,6 +3234,19 @@ pub const Index = struct {
 
     /// Create a new index
     pub fn create(allocator: std.mem.Allocator, page_manager: *pager.Pager, name: []const u8, table_name: []const u8, column_names: [][]const u8, is_unique: bool) !*Self {
+        return createEx(allocator, page_manager, name, table_name, column_names, &.{}, null, is_unique);
+    }
+
+    pub fn createEx(
+        allocator: std.mem.Allocator,
+        page_manager: *pager.Pager,
+        name: []const u8,
+        table_name: []const u8,
+        column_names: [][]const u8,
+        expressions: []const ast.Expression,
+        where_clause: ?ast.Condition,
+        is_unique: bool,
+    ) !*Self {
         var index = try allocator.create(Self);
         index.name = try allocator.dupe(u8, name);
         index.table_name = try allocator.dupe(u8, table_name);
@@ -2812,10 +3257,20 @@ pub const Index = struct {
             index.column_names[i] = try allocator.dupe(u8, col_name);
         }
 
+        index.expressions = try allocator.alloc(ast.Expression, expressions.len);
+        for (expressions, 0..) |expression, i| {
+            index.expressions[i] = try cloneAstExpression(allocator, expression);
+        }
+
+        index.where_clause = if (where_clause) |condition| try cloneAstCondition(allocator, &condition) else null;
         index.btree = try btree.BTree.init(allocator, page_manager);
         index.is_unique = is_unique;
 
         return index;
+    }
+
+    pub fn keyPartCount(self: *const Self) usize {
+        return if (self.expressions.len > 0) self.expressions.len else self.column_names.len;
     }
 
     /// Insert a key into the index
@@ -2863,6 +3318,13 @@ pub const Index = struct {
             allocator.free(col_name);
         }
         allocator.free(self.column_names);
+        for (self.expressions) |*expression| {
+            expression.deinit(allocator);
+        }
+        allocator.free(self.expressions);
+        if (self.where_clause) |*condition| {
+            condition.deinit(allocator);
+        }
         self.btree.deinit();
         allocator.destroy(self);
     }

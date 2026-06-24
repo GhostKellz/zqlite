@@ -131,15 +131,16 @@ docker-compose -f docker/docker-compose.yml run --rm zqlite-full
 
 ## Documentation
 
-- [Installation](docs/getting-started/installation.md)
-- [Quickstart](docs/getting-started/quickstart.md)
-- [Zig API](docs/api/zig-api.md)
-- [C API](docs/api/c-api.md)
-- [Transactions](docs/guides/transactions.md)
-- [Encryption](docs/guides/encryption.md)
-- [Secure Mode](docs/guides/secure-mode.md)
-- [SQLite Compatibility](docs/compatibility/sqlite.md)
-- [PostgreSQL Features](docs/compatibility/postgresql.md)
+- [Documentation Index](docs/README.md) - Full docs map, Mermaid flows, release validation links
+- [Architecture](docs/internals/architecture.md) - Query flow, storage flow, build profiles, and security/PQC boundaries
+- [Installation](docs/getting-started/installation.md) - Build from source and consume from Zig
+- [Quickstart](docs/getting-started/quickstart.md) - Basic database operations
+- [Zig API](docs/api/zig-api.md) - Core API, ownership, and error handling
+- [C API](docs/api/c-api.md) - FFI bindings and ABI policy
+- [SQLite Compatibility](docs/compatibility/sqlite.md) - Supported subset and migration notes
+- [PostgreSQL-Style Features](docs/compatibility/postgresql.md) - PostgreSQL-inspired syntax and explicit non-goals
+- [Security Policy](SECURITY.md) - Vulnerability reporting and security/PQC posture
+- [Stable vs Experimental](docs/security/stable-vs-experimental.md) - Production boundaries and experimental surfaces
 
 ## Project Status
 

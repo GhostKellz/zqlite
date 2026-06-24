@@ -5,6 +5,108 @@ All notable changes to ZQLite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-06-24
+
+### Added
+- **Release documentation and packaging discipline** - reorganized docs around supported claims, release workflows, install paths, compatibility matrices, and stable/experimental boundaries.
+- **Storage and durability APIs** - added explicit checkpoint/WAL statistics, backup/snapshot support, read-only and immutable open modes, busy timeout controls, and cooperative operation interruption.
+- **Resource limits and progress callbacks** - added connection-level scanned-row, result-row, affected-row, VM-step, statement-size, pager page-count, pager cache-page, and query-materialization memory limits plus cooperative progress callbacks for cancellable embedded execution.
+- **Integrity checking and recovery hardening** - added `Connection.integrityCheck()`, `PRAGMA integrity_check`, table/index metadata validation, and torn-WAL commit coverage so interrupted WAL records do not replay as committed data.
+- **Cursor-style query API** - added `Connection.openCursor()` / `Cursor` for row-by-row query iteration semantics, including an incremental simple-table scan path for `SELECT * FROM table` and materialized fallback for richer SQL.
+- **VACUUM maintenance and compact copy-out** - added a conservative `VACUUM` implementation plus `Connection.vacuumInto(...)` for maintenance, integrity validation, and flushed compact backup copies.
+- **Application schema-version and migration primitives** - added persistent `user_version`/`schema_version` metadata, `PRAGMA user_version`, `PRAGMA schema_version`, Zig getters/setters, and a `user_version`-backed migration manager with rollback coverage.
+- **Prepared statement schema invalidation** - prepared statements now capture `schema_version`, expose expiration checks, and fail with `error.PreparedStatementExpired` after schema-changing DDL instead of running a stale plan.
+- **SQLite-class correctness coverage** - expanded tests for WAL recovery, catalog format recovery, read-only behavior, deterministic parser fuzzing, B-tree/storage properties, randomized concurrent access, and statement-level SQL conformance.
+- **PostgreSQL-style SQL subset** - added tested support for generated columns, partial indexes, expression indexes, richer JSON helpers, timestamp/date arithmetic, user-defined scalar functions, and user-defined aggregate functions.
+- **Planner statistics and planning visibility** - added `ANALYZE`, connection-local planner table/index statistics, `PRAGMA planner_stats`, analyzed unique equality-index selection, and `EXPLAIN QUERY PLAN` output that shows real plan steps with index scan row/cost estimates.
+- **Schema-qualified attached database SQL** - added execution coverage for `schema.table` DDL/DML against attached databases, including `CREATE TABLE`, `CREATE INDEX`, `DROP INDEX`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, and `DROP TABLE`.
+- **Security and experimental-boundary cleanup** - made secure-mode behavior, ATTACH policy, experimental crypto/transport positioning, and PQC capability claims more explicit and testable.
+- **PQC verification model** - added explicit unavailable, classical fallback, simulated, hybrid-active, and PQC-active states plus a focused `zig build test-pqc` target for deterministic capability and negative-path tests.
+- **Machine-readable PQC diagnostics** - added JSON diagnostics through Zig, C, and CLI surfaces so release tooling can inspect requested mode, selected state/backend, provider name, fallback reason, production readiness, and algorithm availability.
+- **Experimental stdlib PQC backend** - added a direct Zig stdlib-backed ML-KEM-768 / ML-DSA-65 provider with deterministic key generation, encapsulation/decapsulation, signing/verification, malformed-input checks, and `CryptoInterface` integration when `-Dcrypto=true` and PQC/hybrid mode is requested.
+- **PQC backend interface and fixture harness** - added a provider-shaped `PQCBackend` interface, backend-agnostic deterministic/KAT fixture runners, and a gated liboqs placeholder provider for future optional integration without linking liboqs by default.
+- **liboqs provider-selection diagnostics** - added explicit `auto`/`stdlib`/`liboqs` provider preference plumbing, fail-closed liboqs requests, `configured_but_unlinked` diagnostics for `-Dliboqs=true`, and C API visibility through `zqlite_pq_liboqs_status()`.
+- **PQC verification hardening** - added fixture-file KAT loading, checked-in PQC fixture-format directories, provider lifecycle/status helpers, algorithm policy validation, and zeroization of owned secret-key/shared-secret buffers.
+- **Official PQC vector import lane** - added `tests/standalone/fixtures/pqc/official/`, a manifest, provenance rules, and `scripts/import-pqc-kats.sh` so real ML-KEM/ML-DSA KAT vectors can be imported without changing backend test logic.
+- **liboqs build diagnostics** - added diagnostic-only `-Dliboqs-include-path` and `-Dliboqs-library-path` options for future liboqs detection/linkage without linking liboqs in this release.
+- **Generated PQC regression KAT lane** - added `zig build generate-pqc-regression-kats`, checked-in generated stdlib ML-KEM/ML-DSA regression fixtures, and `zig build test-pqc-generated-kats` so backend behavior can be locked down separately from official NIST vectors.
+- **PQC fixture tooling** - added `zig build validate-pqc-fixtures` for fixture manifest/field checks and `zig build build-liboqs-kat-converter` as a compile-checked scaffold for normalizing future liboqs KAT output into ZQLite fixture files.
+- **PQC release-package diagnostics** - packaged Zig and C consumers now verify PQC availability, backend, provider, liboqs status, and diagnostics JSON from the release archive.
+- **Self-hosted coverage reporting** - added stable-core coverage scope documentation, `scripts/coverage-report.sh`, and a self-hosted CI artifact job for the stable database-core coverage workload.
+- **Operational benchmark evidence** - added `zig build bench-operational` for append-heavy, indexed lookup, materialized scan, cursor scan, and resource-limit abort timing evidence outside correctness gates.
+- **Long-running storage stress target** - added `zig build test-storage-stress` for deterministic reopen/checkpoint/rollback/integrity cursor stress coverage.
+- **Release artifacts with integrity metadata** - added release artifact generation for source packages, SBOM output, checksum manifests, and optional minisign/GPG detached signatures.
+- **Release artifact verification** - added `scripts/verify-release-artifacts.sh` to validate checksums, archive contents, SBOM contents, and optional detached signatures.
+- **Official PQC KAT execution target** - added `zig build test-pqc-official-kats`, which runs imported official ML-KEM/ML-DSA `.kat` files and skips cleanly when no official vectors are present.
+- **PQC review notes** - added explicit PQC claim mapping, validation commands, non-claims, and promotion blockers for the experimental crypto layer.
+- **C/Zig consumer validation** - added or strengthened C99/C++ package consumer tests, ABI/header checks, stable profile checks, and release archive/install-script validation helpers.
+- **C ABI symbol governance** - added `include/zqlite_c.symbols`, manifest/header/implementation/shared-library export checks, and a previous-release ABI compatibility harness.
+- **Packaged C ABI manifest checks** - release package validation now installs and verifies the public C symbol manifest alongside `zqlite.h`, `libzqlite_c.a`, and `libzqlite_c.so`.
+
+### Changed
+- **PostgreSQL positioning** - documented ZQLite as a selective PostgreSQL-inspired embedded SQL engine, not a PostgreSQL wire-compatible server, catalog clone, or extension-compatible runtime.
+- **PQC and transport messaging** - moved placeholder or simulated cryptography claims behind experimental language; the stdlib ML-KEM/ML-DSA adapter is real but remains experimental until official vectors, review notes, and release-package evidence are present.
+- **Performance baseline metadata** - refreshed benchmark baseline metadata for 1.7.0 while keeping correctness gates separate from low-noise benchmark validation.
+- **Planner behavior** - SELECT planning now receives connection-local `ANALYZE` stats and can choose a cheaper analyzed unique index lookup for equality predicates while preserving a filter step for SQL semantics.
+- **Secure-by-default example** - the stable secure example now combines prepared statements, resource limits, secure ATTACH policy checks, schema-qualified attached database SQL, transaction helpers, and durable flush behavior.
+- **Configurable plan cache** - `ConnectionOptions.plan_cache_entries` and `setPlanCacheCapacity()` now allow applications to size or disable the per-connection plan cache.
+- **Transaction isolation contract** - documented the file-backed isolation contract: uncommitted writes are hidden from other connections, and committed changes are visible after opening or reopening a reader.
+- **Transactional pager flushing** - file-backed pager flush behavior now treats active transactions as a hard boundary, preventing dirty page eviction/flush before commit or rollback.
+- **Repo-local scratch defaults** - standalone storage tests and release/install helper scripts now default isolated scratch work to the project's normal `.zig-cache` instead of the system temp tree.
+
+### Fixed
+- **Generated column execution** - generated values are computed on INSERT/UPDATE, direct writes to generated columns are rejected, and generated columns interact with default values and projection consistently.
+- **Advanced index enforcement** - partial unique indexes enforce only rows matching the predicate, and expression unique indexes enforce deterministic same-row expression keys for the supported subset.
+- **JSON/date function evaluation** - row-context function calls now handle supported JSON extraction/type/length/object helpers and UTC Gregorian date/time arithmetic more accurately.
+- **Grouped aggregate coverage** - added SQL conformance coverage for grouped `COUNT`/`SUM` ordering behavior.
+- **C API misuse coverage** - added tests for null handles, invalid result access, invalid bind indexes, reset/finalize null handling, and blob misuse return codes.
+- **C ABI handle registry** - C handles are tracked through a live-handle registry so repeated finalize/free and stale-handle access return misuse/null results instead of blindly dereferencing finalized pointers.
+- **SQLite differential expansion** - expanded opt-in SQLite differential coverage for transaction rollback/commit behavior, DESC pagination ordering, multi-column `ORDER BY`, and JSON/date literal round-trips.
+- **Cursor projection and predicate scans** - simple cursor scans now incrementally handle projected columns and simple `WHERE` comparisons against literals or bound prepared-statement parameters.
+- **Prepared statement cursor iteration** - prepared statements now expose `openCursor()` with the same incremental simple-scan path and materialized fallback as connection-level cursors.
+- **File-backed dirty-read isolation** - transactional dirty database pages are no longer flushed before commit, and catalog/index metadata rewrites are deferred to the commit boundary so other file-backed connections cannot read uncommitted rows.
+- **Transactional metadata persistence** - file-backed catalog/index metadata rewrites now defer during active transactions and persist at commit, preserving rollback behavior and preventing mid-transaction catalog flushes.
+- **C PQC availability predicate** - `zqlite_pq_available()` now reports the same strict production-readiness predicate as `PQCapability.isAvailable()`.
+- **C API ownership and misuse hardening** - added coverage for returned string ownership, blob bind/result ownership, stale connection/result/statement handles, invalid column access, double finalize/free-style misuse, and allocation-failure paths.
+- **Index scan ownership** - fixed an intermediate-row cleanup leak exposed by planner-selected index scans.
+- **Resource-limit abort cleanup** - partial VM results are now cleaned up when execution stops early due to limits, timeouts, interrupts, or progress-callback cancellation.
+- **Attached schema routing** - qualified table references now route storage operations to the selected attached database instead of only resolving tables on the main connection.
+- **`EXPLAIN QUERY PLAN` parsing** - parser now accepts the tokenizer's dedicated `QUERY` and `PLAN` tokens instead of treating them as generic identifiers.
+
+### Verified
+- `zig build test-sql-conformance --summary all`
+- `zig build test-sqlite-diff --summary all`
+- `zig build test-comprehensive --summary all`
+- `zig build test-storage --summary all`
+- `zig build test-transaction --summary all`
+- `zig build test-file-backed --summary all`
+- `zig build test-storage-properties --summary all`
+- `zig build test --summary all`
+- `zig build examples --summary all`
+- `./zig-out/bin/secure_by_default_app`
+- `zig build test-c-api --summary all`
+- `zig build check-c-api --summary all`
+- `./scripts/check-c-api.sh`
+- `zig build test-pqc --summary all`
+- `zig build -Dcrypto=true test-pqc --summary all`
+- `zig build -Dliboqs=true test-pqc --summary all`
+- `zig build -Dcrypto=true -Dliboqs=true test-pqc --summary all`
+- `zig build -Dliboqs=true -Dliboqs-include-path=/opt/oqs/include -Dliboqs-library-path=/opt/oqs/lib test-pqc --summary all`
+- `zig build generate-pqc-regression-kats --summary all`
+- `zig build test-pqc-generated-kats --summary all`
+- `zig build validate-pqc-fixtures --summary all`
+- `zig build build-liboqs-kat-converter --summary all`
+- `zig build bench-operational --summary all`
+- `zig build -Dliboqs=true test-c-api --summary all`
+- `zig build -Dcrypto=true -Dliboqs=true test-c-api --summary all`
+- `zig build test-release-package --summary all`
+- `zig build bench-validate --summary all`
+- `./scripts/build-release-artifacts.sh`
+- `./scripts/check-abi-compat.sh zig-out/release/zqlite-source-package.tar.gz`
+- `./scripts/verify-release-artifacts.sh`
+- `./scripts/coverage-report.sh`
+- `git diff --check`
+
 ## [1.6.9] - 2026-06-21
 
 ### Fixed
@@ -44,7 +146,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **C ABI metadata and row access** - added explicit ABI version exports, symbol visibility controls, prepared-statement row stepping, typed column access, column names, blob binding, and package-consumer coverage for C99/C++ modes.
 
 ### Changed
-- **Standalone file-backed tests now use per-run temp directories** - replaced hardcoded `/tmp/zqlite_test_*.db` paths and brittle cleanup lists with a unique temp-directory harness and single tree cleanup.
+- **Standalone file-backed tests now use repo-local cache scratch** - replaced hardcoded system temp paths and brittle cleanup lists with unique per-run directories under the project-local Zig cache and single tree cleanup.
 - **Benchmark validation is less noisy and more defensible** - benchmark validation now uses a monotonic clock, warmups, five samples, median/p95 reporting, isolated UPDATE measurements, and one in-source threshold table.
 - **Public API ownership docs** - documented result/row/value ownership and borrowing rules for the Zig API.
 - **C API docs** - documented prepared-statement stepping, borrowed/caller-freed ownership, named binding functions, ABI versioning, and error categories.

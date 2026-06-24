@@ -10,6 +10,9 @@ ZQLite reports persistence failures through fallible transaction, flush, and clo
 | `commit()` | The WAL commit record passed its durability barrier, committed pages were checkpointed, metadata was saved, and the database file passed its durability barrier |
 | `rollback()` | Modified pages were restored and flushed, and rollback WAL state was cleared |
 | `flush()` | Pending WAL, database pages, and metadata were written and synchronized; rejected during an active transaction |
+| `checkpoint()` | Alias for the public checkpoint/flush durability boundary; rejected during an active transaction |
+| `backupToFile()` | Checkpoints and flushes the source database, then copies the main database file to the destination |
+| `vacuumInto()` | Runs storage maintenance, validates integrity, and writes a flushed compact backup copy |
 | `closeFallible()` | Performs cleanup and returns the first checkpoint, metadata, or synchronization failure after cleanup completes |
 | `close()` | Convenience cleanup for `defer`; logs persistence failures but cannot return them |
 
@@ -22,6 +25,15 @@ errdefer conn.close();
 try conn.execute("CREATE TABLE events (id INTEGER, body TEXT)");
 try conn.flush();
 
+if (try conn.getWalStats()) |stats| {
+    std.debug.print("WAL size: {}\n", .{stats.size_bytes});
+}
+
+try conn.backupToFile(io, "application.backup.db");
+
+var check = try conn.vacuumInto(io, "application.compacted.db");
+defer check.deinit(allocator);
+
 // At final ownership handoff, use the fallible close when the result matters.
 try conn.closeFallible();
 ```
@@ -33,6 +45,21 @@ Do not call both `close()` and `closeFallible()` on the same connection. Both co
 - A WAL synchronization failure leaves the transaction active and returns an error. The caller may retry or roll back.
 - After the WAL commit record is durable, a later checkpoint or database synchronization error is returned, but the transaction remains logically committed. Recovery retries committed WAL work when possible.
 - Callers must not report success to upstream systems until `commit()`, `flush()`, or `closeFallible()` returns successfully at the durability boundary they require.
+- File backups should be created with `backupToFile()` instead of copying a live database file directly; it checkpoints first and refuses in-memory databases.
+- Compact copy-out workflows should use `vacuumInto()` so maintenance and integrity validation happen before the backup file is written.
+
+## Read-Only and Immutable Opens
+
+`zqlite.openWithOptions(..., zqlite.OpenOptions.READ_ONLY)` opens the main
+database file read-only, does not create missing files, does not open or replay
+WAL, and rejects mutating SQL/API paths with `error.ReadOnlyDatabase`.
+
+`zqlite.OpenOptions.IMMUTABLE` has the same write rejection behavior and is
+intended for snapshot-style inspection of a database file that the application
+knows will not change while open.
+
+For both modes, checkpoint before opening if your application needs the latest
+committed WAL state reflected in the main database file.
 
 ## Metadata Catalog Format
 

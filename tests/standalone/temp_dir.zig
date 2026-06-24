@@ -1,10 +1,9 @@
 const std = @import("std");
 
-/// One temporary directory for a standalone test executable.
+/// One repo-local scratch directory for a standalone test executable.
 ///
-/// The database code under test takes path strings, so tests still pass absolute
-/// paths to zqlite. The isolation boundary is this per-run directory, not a
-/// hand-maintained list of files under /tmp.
+/// The database code under test takes path strings, so tests use a per-run
+/// directory under Zig's normal repo-local cache instead of the system temp tree.
 pub const TempDir = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -13,6 +12,8 @@ pub const TempDir = struct {
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, prefix: []const u8) !TempDir {
         var cwd = std.Io.Dir.cwd();
+        try cwd.createDirPath(io, ".zig-cache");
+
         var random_bytes: [12]u8 = undefined;
         var encoded: [std.base64.url_safe.Encoder.calcSize(random_bytes.len)]u8 = undefined;
 
@@ -21,7 +22,7 @@ pub const TempDir = struct {
             io.random(&random_bytes);
             _ = std.base64.url_safe.Encoder.encode(&encoded, &random_bytes);
 
-            const path = try std.fmt.allocPrint(allocator, "/tmp/{s}-{s}", .{ prefix, encoded });
+            const path = try std.fmt.allocPrint(allocator, ".zig-cache/{s}-{s}", .{ prefix, encoded });
             errdefer allocator.free(path);
 
             cwd.createDir(io, path, .default_dir) catch |err| switch (err) {

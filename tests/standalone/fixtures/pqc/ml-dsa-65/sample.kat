@@ -1,0 +1,3 @@
+# Deterministic loader smoke fixture. Official vectors can replace/add files here.
+seed = 404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f
+message = zqlite pqc kat fixture message

@@ -18,6 +18,7 @@ pub fn main(init: std.process.Init) !void {
     try testMultipleReaders(allocator);
     try testReaderWriter(allocator);
     try testSequentialConnections(allocator);
+    try testRepeatedRandomizedConnectionInterleaving(allocator);
 
     std.log.info("=== ALL CONCURRENT ACCESS TESTS PASSED ===", .{});
 }
@@ -101,20 +102,19 @@ fn testReaderWriter(allocator: std.mem.Allocator) !void {
     var writer = try zqlite.open(allocator, path);
     defer writer.close();
 
-    // Reader connection
-    var reader = try zqlite.open(allocator, path);
-    defer reader.close();
-
     // Writer increments
     try writer.execute("UPDATE counter SET count = count + 1 WHERE id = 1");
     try writer.execute("UPDATE counter SET count = count + 1 WHERE id = 1");
     try writer.execute("UPDATE counter SET count = count + 1 WHERE id = 1");
 
-    // Reader reads
+    // A fresh reader observes the writer's persisted changes.
+    var reader = try zqlite.open(allocator, path);
+    defer reader.close();
     var result = try reader.query("SELECT count FROM counter WHERE id = 1");
     defer result.deinit();
 
-    std.debug.assert(result.rows.items.len == 1);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 3), result.rows.items[0].values[0].Integer);
     std.log.info("[PASS] Reader/writer: reader sees updates", .{});
 }
 
@@ -153,4 +153,71 @@ fn testSequentialConnections(allocator: std.mem.Allocator) !void {
         std.debug.assert(result.rows.items.len == 50);
         std.log.info("[PASS] Sequential connections: {d} writes persisted", .{result.rows.items.len});
     }
+}
+
+fn testRepeatedRandomizedConnectionInterleaving(allocator: std.mem.Allocator) !void {
+    std.log.info("[TEST] Repeated randomized connection interleaving", .{});
+    const path = try test_dir.dbPath("randomized.db");
+    defer allocator.free(path);
+
+    {
+        var conn = try zqlite.open(allocator, path);
+        defer conn.close();
+        try conn.execute("CREATE TABLE IF NOT EXISTS randomized (id INTEGER PRIMARY KEY, value INTEGER)");
+        try conn.execute("DELETE FROM randomized");
+    }
+
+    var rng = std.Random.DefaultPrng.init(0x5A51_17E_C0FFEE);
+    var expected_rows: usize = 0;
+    var next_id: usize = 1;
+
+    var i: usize = 0;
+    while (i < 160) : (i += 1) {
+        const action = rng.random().intRangeAtMost(u8, 0, 3);
+        switch (action) {
+            0, 1 => {
+                var conn = try zqlite.open(allocator, path);
+                defer conn.close();
+                var sql_buf: [128]u8 = undefined;
+                const sql = try std.fmt.bufPrint(&sql_buf, "INSERT INTO randomized (id, value) VALUES ({d}, {d})", .{ next_id, next_id * 10 });
+                try conn.execute(sql);
+                expected_rows += 1;
+                next_id += 1;
+            },
+            2 => {
+                var conn = try zqlite.open(allocator, path);
+                defer conn.close();
+                var result = try conn.query("SELECT * FROM randomized");
+                defer result.deinit();
+                try std.testing.expectEqual(expected_rows, result.rows.items.len);
+            },
+            3 => {
+                var writer = try zqlite.open(allocator, path);
+                defer writer.close();
+                var reader = try zqlite.open(allocator, path);
+                defer reader.close();
+
+                var sql_buf: [128]u8 = undefined;
+                const sql = try std.fmt.bufPrint(&sql_buf, "INSERT INTO randomized (id, value) VALUES ({d}, {d})", .{ next_id, next_id * 10 });
+                try writer.execute(sql);
+                expected_rows += 1;
+                next_id += 1;
+
+                var result = try reader.query("SELECT * FROM randomized");
+                defer result.deinit();
+                try std.testing.expect(result.rows.items.len <= expected_rows);
+            },
+            else => unreachable,
+        }
+    }
+
+    {
+        var conn = try zqlite.open(allocator, path);
+        defer conn.close();
+        var result = try conn.query("SELECT * FROM randomized");
+        defer result.deinit();
+        try std.testing.expectEqual(expected_rows, result.rows.items.len);
+    }
+
+    std.log.info("[PASS] Randomized interleaving: {d} writes persisted", .{expected_rows});
 }

@@ -1,6 +1,6 @@
 {
-  "version": "1.6.2",
-  "date": "2026-04-13",
+  "version": "1.7.0",
+  "date": "2026-06-24",
   "benchmarks": {
     "simple_insert": {
       "min_ops_per_sec": 1000,
@@ -19,5 +19,5 @@
       "description": "UPDATE operations"
     }
   },
-  "notes": "Documented target benchmark thresholds. The executable source of truth is the benchmarks array in benchmark_validator.zig; it uses monotonic timing, warmups, multiple samples, median/p95 reporting, and a two-tier gate that warns below target but only fails CI on severe regressions below 50% of target."
+  "notes": "Documented target benchmark thresholds for release evidence. The executable source of truth is the benchmarks array in benchmark_validator.zig; it uses monotonic timing, warmups, multiple samples, median/p95 reporting, and a two-tier gate that warns below target but only fails CI on severe regressions below 50% of target."
 }

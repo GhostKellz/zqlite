@@ -30,6 +30,10 @@ zig build test-comprehensive      # Full functionality
 ./scripts/test-release.sh
 ```
 
+Use an idle machine or CI runner for full validation. Package and install smoke
+tests create isolated scratch directories under the project's normal repo-local
+`.zig-cache` by default.
+
 Or manually:
 
 ```bash
@@ -41,11 +45,13 @@ zig build test-storage
 zig build test-advanced
 zig build test-c-api
 zig build bench-validate
+./scripts/coverage-report.sh
 ```
 
 ### Storage Tests
 
-File-backed persistence tests (use temp files in `/tmp/`):
+File-backed persistence tests use per-run temporary directories and clean up
+their generated database/WAL files:
 
 ```bash
 zig build test-file-backed    # Persistence across connections
@@ -143,6 +149,10 @@ When a feature is disabled, its optional public API becomes an empty or placehol
 | `bench-validate` | CI regression check |
 | `bench-minimal` | Debug benchmark |
 
+`tests/bench/benchmark_baseline.json` records release-facing benchmark categories and minimum target thresholds. `zig build bench-validate` remains the executable source of truth and uses a warning band before failing only severe regressions.
+
+Coverage reporting is informational for v1.7.0. See [coverage.md](coverage.md) for stable-core scope and threshold rules.
+
 ### Fuzzing
 
 | Target | Purpose |
@@ -189,11 +199,11 @@ See [release-process.md](release-process.md).
 |--------|---------|
 | Stable | Tested, suitable for use |
 | Partial | Core works, edge cases incomplete |
-| Experimental | Proof of concept, scaffolding only |
+| Experimental | Opt-in, incomplete, or not yet promoted to stable support |
 
 ### Current Experimental
 
-- Post-quantum crypto (ML-KEM, ML-DSA) - scaffolding only
+- Post-quantum crypto (ML-KEM, ML-DSA) - stdlib-backed adapter exists, still experimental pending official vectors/review
 - PQ-QUIC transport - simulated, no real network I/O
 - Cluster/distributed features - stub implementations
 

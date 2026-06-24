@@ -1,9 +1,6 @@
 const std = @import("std");
-const posix = std.posix;
-const builtin = @import("builtin");
-const native_os = builtin.os.tag;
 const encryption = @import("encryption.zig");
-const Io = std.Io;
+const file_io = @import("file_io.zig");
 
 /// Doubly-linked list node for O(1) LRU operations
 const LRUNode = struct {
@@ -174,6 +171,10 @@ const LRUCache = struct {
         return @intCast(self.page_map.count());
     }
 
+    fn setCapacity(self: *LRUCache, capacity: u32) void {
+        self.capacity = capacity;
+    }
+
     fn iterator(self: *LRUCache) std.AutoHashMap(u32, *Page).Iterator {
         return self.page_map.iterator();
     }
@@ -182,15 +183,18 @@ const LRUCache = struct {
 /// Page-based storage manager using POSIX file descriptors
 pub const Pager = struct {
     allocator: std.mem.Allocator,
-    fd: ?posix.fd_t,
+    fd: ?file_io.File,
     cache: LRUCache,
     next_page_id: u32,
     page_size: u32,
     is_memory: bool,
+    read_only: bool,
     cache_hits: u64,
     cache_misses: u64,
     encryption: encryption.Encryption,
     fault_once: ?FaultPoint,
+    max_page_count: ?u32,
+    in_transaction: bool,
 
     const Self = @This();
     pub const DEFAULT_PAGE_SIZE = 4096;
@@ -201,6 +205,11 @@ pub const Pager = struct {
         write,
         partial_write,
         sync,
+    };
+
+    pub const OpenMode = enum {
+        read_write,
+        read_only,
     };
 
     pub fn injectFaultOnce(self: *Self, point: FaultPoint) void {
@@ -217,12 +226,18 @@ pub const Pager = struct {
 
     /// Initialize pager with file backing
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !*Self {
+        return initWithMode(allocator, path, .read_write);
+    }
+
+    /// Initialize pager with file backing and explicit access mode.
+    pub fn initWithMode(allocator: std.mem.Allocator, path: []const u8, mode: OpenMode) !*Self {
         var pager = try allocator.create(Self);
         pager.allocator = allocator;
         pager.fd = null;
         pager.cache = LRUCache.init(allocator, MAX_CACHED_PAGES);
         pager.page_size = DEFAULT_PAGE_SIZE;
         pager.is_memory = false;
+        pager.read_only = mode == .read_only;
         // Start at page 2 to reserve page 1 for metadata (METADATA_PAGE_ID = 1)
         pager.next_page_id = 2;
         pager.cache_hits = 0;
@@ -231,28 +246,19 @@ pub const Pager = struct {
         // For production use with sensitive data, call setEncryption() after init.
         pager.encryption = encryption.Encryption.initPlain();
         pager.fault_once = null;
+        pager.max_page_count = null;
+        pager.in_transaction = false;
 
-        if (comptime native_os == .windows) {
-            allocator.destroy(pager);
-            return error.Unsupported;
-        }
-
-        // Convert path to null-terminated string for posix
-        const path_z = try allocator.dupeSentinel(u8, path, 0);
-        defer allocator.free(path_z);
-
-        // Open or create the database file using POSIX
-        const fd = posix.openat(posix.AT.FDCWD, path_z, .{
-            .ACCMODE = .RDWR,
-            .CREAT = true,
-        }, 0o644) catch |err| {
+        const fd = file_io.open(allocator, path, switch (mode) {
+            .read_write => .read_write_create,
+            .read_only => .read_only,
+        }) catch |err| {
             allocator.destroy(pager);
             return err;
         };
         pager.fd = fd;
 
-        // Read existing page count from file size using lseek
-        const file_size = try getFileSize(fd);
+        const file_size = try file_io.size(fd);
         if (file_size > 0) {
             pager.next_page_id = @intCast(file_size / DEFAULT_PAGE_SIZE + 1);
         }
@@ -268,6 +274,7 @@ pub const Pager = struct {
         pager.cache = LRUCache.init(allocator, MAX_CACHED_PAGES);
         pager.page_size = DEFAULT_PAGE_SIZE;
         pager.is_memory = true;
+        pager.read_only = false;
         pager.next_page_id = 1;
         pager.cache_hits = 0;
         pager.cache_misses = 0;
@@ -275,12 +282,19 @@ pub const Pager = struct {
         // This is typically acceptable since data doesn't persist to disk.
         pager.encryption = encryption.Encryption.initPlain();
         pager.fault_once = null;
+        pager.max_page_count = null;
+        pager.in_transaction = false;
 
         return pager;
     }
 
     /// Allocate a new page
     pub fn allocatePage(self: *Self) !u32 {
+        if (self.read_only) return error.ReadOnlyDatabase;
+        if (self.max_page_count) |limit| {
+            if (self.next_page_id > limit) return error.ResourceLimitExceeded;
+        }
+
         const page_id = self.next_page_id;
         self.next_page_id += 1;
 
@@ -299,6 +313,7 @@ pub const Pager = struct {
         if (try self.cache.put(page_id, page)) |evicted_page| {
             // Handle evicted page
             if (evicted_page.is_dirty) {
+                if (self.in_transaction) return error.TransactionDirtyPageEvicted;
                 try self.writePage(evicted_page);
             }
             self.allocator.free(evicted_page.data);
@@ -330,7 +345,7 @@ pub const Pager = struct {
             const offset: i64 = @as(i64, page_id - 1) * @as(i64, self.page_size);
             if (self.fd) |fd| {
                 if (self.consumeFault(.read)) return error.InjectedReadFailure;
-                const bytes_read = try preadAll(fd, page.data, offset);
+                const bytes_read = try file_io.readAtAll(fd, page.data, offset);
                 if (bytes_read < self.page_size) {
                     @memset(page.data[bytes_read..], 0);
                 }
@@ -346,6 +361,7 @@ pub const Pager = struct {
         if (try self.cache.put(page_id, page)) |evicted_page| {
             // Handle evicted page
             if (evicted_page.is_dirty) {
+                if (self.in_transaction) return error.TransactionDirtyPageEvicted;
                 try self.writePage(evicted_page);
             }
             self.allocator.free(evicted_page.data);
@@ -357,6 +373,8 @@ pub const Pager = struct {
 
     /// Mark a page as dirty (needs to be written to storage)
     pub fn markDirty(self: *Self, page_id: u32) !void {
+        if (self.read_only) return error.ReadOnlyDatabase;
+
         if (self.cache.get(page_id)) |page| {
             page.is_dirty = true;
         } else {
@@ -367,6 +385,8 @@ pub const Pager = struct {
     /// Flush all dirty pages to storage
     pub fn flush(self: *Self) !void {
         if (self.is_memory) return; // No flushing needed for in-memory
+        if (self.read_only) return; // Nothing may be dirty in read-only mode.
+        if (self.in_transaction) return error.TransactionActive;
 
         var iterator = self.cache.iterator();
         while (iterator.next()) |entry| {
@@ -380,21 +400,35 @@ pub const Pager = struct {
         // Sync file to disk
         if (self.fd) |fd| {
             if (self.consumeFault(.sync)) return error.InjectedSyncFailure;
-            try posix.fdatasync(fd);
+            try file_io.sync(fd);
         }
+    }
+
+    pub fn beginTransaction(self: *Self) void {
+        self.in_transaction = true;
+    }
+
+    pub fn endTransactionForCommit(self: *Self) void {
+        self.in_transaction = false;
+    }
+
+    pub fn endTransactionForRollback(self: *Self) void {
+        self.in_transaction = false;
     }
 
     /// Write a page to storage using pwrite
     fn writePage(self: *Self, page: *Page) !void {
+        if (self.read_only) return error.ReadOnlyDatabase;
+
         const offset: i64 = @as(i64, page.id - 1) * @as(i64, self.page_size);
         if (self.fd) |fd| {
             if (self.consumeFault(.write)) return error.InjectedWriteFailure;
             if (self.consumeFault(.partial_write)) {
                 const partial_len = @max(@as(usize, 1), page.data.len / 2);
-                try pwriteAll(fd, page.data[0..partial_len], offset);
+                try file_io.writeAtAll(fd, page.data[0..partial_len], offset);
                 return error.InjectedPartialWrite;
             }
-            try pwriteAll(fd, page.data, offset);
+            try file_io.writeAtAll(fd, page.data, offset);
         }
     }
 
@@ -416,10 +450,21 @@ pub const Pager = struct {
         return self.next_page_id - 1;
     }
 
+    pub fn setMaxPageCount(self: *Self, max_page_count: ?u32) !void {
+        if (max_page_count) |limit| {
+            if (limit < self.getPageCount()) return error.ResourceLimitExceeded;
+        }
+        self.max_page_count = max_page_count;
+    }
+
+    pub fn setCachePageLimit(self: *Self, max_cache_pages: ?u32) void {
+        self.cache.setCapacity(max_cache_pages orelse MAX_CACHED_PAGES);
+    }
+
     /// Clean up pager
     pub fn deinit(self: *Self) void {
         // Flush any remaining dirty pages
-        self.flush() catch {};
+        if (!self.in_transaction) self.flush() catch {};
 
         // Clean up cache
         var iterator = self.cache.iterator();
@@ -432,79 +477,12 @@ pub const Pager = struct {
 
         // Close file
         if (self.fd) |fd| {
-            Io.Threaded.closeFd(fd);
+            file_io.close(fd);
         }
 
         self.allocator.destroy(self);
     }
 };
-
-/// Get file size using lseek
-fn getFileSize(fd: posix.fd_t) !u64 {
-    const SEEK_END = 2;
-    const SEEK_SET = 0;
-
-    if (comptime native_os == .windows) {
-        return error.Unsupported;
-    }
-
-    const end_rc = std.os.linux.lseek(fd, 0, SEEK_END);
-    if (@as(isize, @bitCast(end_rc)) < 0) {
-        return error.SeekError;
-    }
-
-    const start_rc = std.os.linux.lseek(fd, 0, SEEK_SET);
-    if (@as(isize, @bitCast(start_rc)) < 0) {
-        return error.SeekError;
-    }
-
-    return end_rc;
-}
-
-/// POSIX pread - read at offset without changing file position
-fn preadAll(fd: posix.fd_t, buf: []u8, offset: i64) !usize {
-    var total_read: usize = 0;
-    while (total_read < buf.len) {
-        const rc = blk: {
-            if (comptime native_os == .windows) {
-                return error.Unsupported;
-            }
-            const read_rc = std.os.linux.pread(fd, buf.ptr + total_read, buf.len - total_read, offset + @as(i64, @intCast(total_read)));
-            break :blk read_rc;
-        };
-        const signed_rc = @as(isize, @bitCast(rc));
-        if (signed_rc < 0) {
-            if (@as(usize, @bitCast(-signed_rc)) == 4) continue; // EINTR
-            return error.ReadError;
-        }
-        const bytes_read: usize = @bitCast(signed_rc);
-        if (bytes_read == 0) break;
-        total_read += bytes_read;
-    }
-    return total_read;
-}
-
-/// POSIX pwrite - write at offset without changing file position
-fn pwriteAll(fd: posix.fd_t, buf: []const u8, offset: i64) !void {
-    var total_written: usize = 0;
-    while (total_written < buf.len) {
-        const rc = blk: {
-            if (comptime native_os == .windows) {
-                return error.Unsupported;
-            }
-            const write_rc = std.os.linux.pwrite(fd, buf.ptr + total_written, buf.len - total_written, offset + @as(i64, @intCast(total_written)));
-            break :blk write_rc;
-        };
-        const signed_rc = @as(isize, @bitCast(rc));
-        if (signed_rc < 0) {
-            if (@as(usize, @bitCast(-signed_rc)) == 4) continue; // EINTR
-            return error.WriteError;
-        }
-        const bytes_written: usize = @bitCast(signed_rc);
-        if (bytes_written == 0) return error.WriteError;
-        total_written += bytes_written;
-    }
-}
 
 /// Cache statistics
 pub const CacheStats = struct {

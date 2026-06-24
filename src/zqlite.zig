@@ -8,6 +8,7 @@ pub const version = @import("version.zig");
 pub const profile = build_options.profile;
 pub const features = struct {
     pub const crypto = build_options.enable_crypto;
+    pub const liboqs = build_options.enable_liboqs;
     pub const transport = build_options.enable_transport;
     pub const json = build_options.enable_json;
     pub const performance = build_options.enable_performance;
@@ -19,6 +20,10 @@ pub const features = struct {
 pub const db = @import("db/connection.zig");
 pub const Connection = db.Connection; // Export for convenience
 pub const OpenOptions = db.ConnectionOptions;
+pub const ResourceLimits = db.ResourceLimits;
+pub const ProgressEvent = db.ProgressEvent;
+pub const ProgressCallback = db.ProgressCallback;
+pub const Cursor = db.Cursor;
 pub const storage = @import("db/storage.zig");
 pub const btree = @import("db/btree.zig");
 pub const wal = @import("db/wal.zig");
@@ -85,8 +90,8 @@ pub const query_cache = if (build_options.enable_performance)
     @import("performance/query_cache.zig")
 else
     struct {
-        pub const QueryCache = void;
-        pub const QueryHasher = void;
+        pub const QueryCache = struct {};
+        pub const QueryHasher = struct {};
     };
 
 // Error handling
@@ -111,7 +116,7 @@ pub fn categorizeError(err: anyerror) ErrorCategory {
         error.SyntaxError, error.TableNotFound, error.ColumnNotFound, error.TypeMismatch => .sql,
         error.ConstraintViolation, error.UniqueConstraintViolation, error.MissingRequiredValue => .constraint,
         error.IoError, error.InputOutput, error.AccessDenied, error.DiskQuota, error.FileTooBig, error.NoSpaceLeft => .io,
-        error.InvalidParameterIndex, error.ParameterIndexOutOfBounds, error.NoParametersProvided, error.NamedParameterNotFound, error.SavepointNotFound, error.TransactionAlreadyActive, error.TransactionActive, error.UnsupportedDDLInSavepoint => .misuse,
+        error.InvalidParameterIndex, error.ParameterIndexOutOfBounds, error.NoParametersProvided, error.NamedParameterNotFound, error.SavepointNotFound, error.TransactionAlreadyActive, error.TransactionActive, error.UnsupportedDDLInSavepoint, error.ReadOnlyDatabase, error.Interrupted, error.OperationTimedOut, error.ResourceLimitExceeded, error.FeatureUnavailable => .misuse,
         error.CorruptData, error.UnsupportedFormatVersion, error.InvalidFormatVersion => .format,
         else => .unknown,
     };
@@ -153,8 +158,19 @@ pub fn open(allocator: std.mem.Allocator, path: []const u8) !*db.Connection {
     return db.Connection.open(allocator, path);
 }
 
+pub fn openWithOptions(allocator: std.mem.Allocator, path: []const u8, options: db.ConnectionOptions) !*db.Connection {
+    if (std.mem.eql(u8, path, ":memory:")) {
+        return db.Connection.openMemoryWithOptions(allocator, options);
+    }
+    return db.Connection.openWithOptions(allocator, path, options);
+}
+
 pub fn openMemory(allocator: std.mem.Allocator) !*db.Connection {
     return db.Connection.openMemory(allocator);
+}
+
+pub fn openMemoryWithOptions(allocator: std.mem.Allocator, options: db.ConnectionOptions) !*db.Connection {
+    return db.Connection.openMemoryWithOptions(allocator, options);
 }
 
 /// Create connection pool for high-concurrency applications
@@ -165,7 +181,7 @@ pub fn createConnectionPool(allocator: std.mem.Allocator, database_path: ?[]cons
 /// Create query cache (requires performance feature)
 pub fn createQueryCache(allocator: std.mem.Allocator, max_entries: usize, max_memory_bytes: usize) !*query_cache.QueryCache {
     if (!build_options.enable_performance) {
-        @compileError("Query cache requires -Dperformance=true or profile=advanced/full");
+        return error.FeatureUnavailable;
     }
     return query_cache.QueryCache.init(allocator, max_entries, max_memory_bytes);
 }
@@ -210,6 +226,20 @@ const crypto_interface = @import("crypto/interface.zig");
 /// Query post-quantum cryptography capability status
 /// Returns detailed information about PQ crypto availability and algorithms
 pub const PQCapability = crypto_interface.PQCapability;
+pub const PQMode = crypto_interface.PQMode;
+pub const PQRuntimeState = crypto_interface.PQRuntimeState;
+pub const PQBackendProbe = crypto_interface.PQBackendProbe;
+pub const PQDecisionReason = crypto_interface.PQDecisionReason;
+pub const CryptoConfig = crypto_interface.CryptoConfig;
+pub const CryptoInterface = crypto_interface.CryptoInterface;
+pub const pqc_backend = crypto_interface.pqc_backend;
+pub const evaluatePQCapability = crypto_interface.evaluatePQCapability;
+pub const evaluatePQCapabilityWithBuild = crypto_interface.evaluatePQCapabilityWithBuild;
+pub const pqDiagnosticsJson = crypto_interface.pqDiagnosticsJson;
+pub const getPQCapabilityForConfig = crypto_interface.getPQCapabilityForConfig;
+pub const getLibOQSProviderStatus = crypto_interface.getLibOQSProviderStatus;
+pub const getLibOQSIncludePath = crypto_interface.getLibOQSIncludePath;
+pub const getLibOQSLibraryPath = crypto_interface.getLibOQSLibraryPath;
 
 /// Get current PQ capability status
 pub fn getPQCapability() PQCapability {
@@ -228,6 +258,7 @@ pub fn printPQStatus() void {
     std.debug.print("  Compiled: {}\n", .{pq.compiled});
     std.debug.print("  Enabled: {}\n", .{pq.enabled});
     std.debug.print("  Backend: {s}\n", .{@tagName(pq.backend)});
+    std.debug.print("  Provider: {s}\n", .{pq.providerName()});
     std.debug.print("  Algorithms: {s}\n", .{pq.algorithmSummary()});
     std.debug.print("  Status: {s}\n", .{pq.status_message});
 }

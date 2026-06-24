@@ -115,6 +115,49 @@ const cases = [_]TestCase{
         },
         .query = "SELECT id, name FROM savepoint_test ORDER BY id",
     },
+    .{
+        .name = "transaction_rollback_then_commit",
+        .setup = &.{
+            "CREATE TABLE tx_test (id INTEGER, name TEXT)",
+            "BEGIN",
+            "INSERT INTO tx_test VALUES (1, 'rolled-back')",
+            "ROLLBACK",
+            "BEGIN",
+            "INSERT INTO tx_test VALUES (2, 'kept')",
+            "COMMIT",
+        },
+        .query = "SELECT id, name FROM tx_test ORDER BY id",
+    },
+    .{
+        .name = "order_by_limit_offset",
+        .setup = &.{
+            "CREATE TABLE page_test (id INTEGER, name TEXT)",
+            "INSERT INTO page_test VALUES (1, 'a')",
+            "INSERT INTO page_test VALUES (2, 'b')",
+            "INSERT INTO page_test VALUES (3, 'c')",
+            "INSERT INTO page_test VALUES (4, 'd')",
+        },
+        .query = "SELECT id, name FROM page_test ORDER BY id DESC LIMIT 2 OFFSET 1",
+    },
+    .{
+        .name = "multi_column_order_by",
+        .setup = &.{
+            "CREATE TABLE ordered_pairs (a INTEGER, b INTEGER, label TEXT)",
+            "INSERT INTO ordered_pairs VALUES (1, 2, 'a2')",
+            "INSERT INTO ordered_pairs VALUES (1, 3, 'a3')",
+            "INSERT INTO ordered_pairs VALUES (2, 1, 'b1')",
+            "INSERT INTO ordered_pairs VALUES (2, 4, 'b4')",
+        },
+        .query = "SELECT a, b, label FROM ordered_pairs ORDER BY a ASC, b DESC",
+    },
+    .{
+        .name = "json_date_literal_round_trip",
+        .setup = &.{
+            "CREATE TABLE literal_test (id INTEGER, payload TEXT, created_at TEXT)",
+            "INSERT INTO literal_test VALUES (1, '{\"ok\":true}', '2026-06-24')",
+        },
+        .query = "SELECT payload, created_at FROM literal_test WHERE id = 1",
+    },
 };
 
 pub fn main(init: std.process.Init) !void {

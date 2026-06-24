@@ -628,7 +628,8 @@ pub const WindowExecutor = struct {
     /// Execute FIRST_VALUE() window function
     /// FIRST_VALUE(column) - returns the first value of the specified column in the partition
     fn executeFirstValue(self: *WindowExecutor, function: ast.WindowFunction, context: *WindowContext) !storage.Value {
-        if (context.partition_start >= context.rows.len) {
+        const frame = resolveFrame(function, context);
+        if (frame.start >= frame.end or frame.start >= context.rows.len) {
             return storage.Value.Null;
         }
 
@@ -650,7 +651,7 @@ pub const WindowExecutor = struct {
             }
         }
 
-        const first_row = context.rows[context.partition_start];
+        const first_row = context.rows[frame.start];
         if (column_idx < first_row.values.len) {
             return try first_row.values[column_idx].clone(self.allocator);
         }
@@ -660,10 +661,9 @@ pub const WindowExecutor = struct {
 
     /// Execute LAST_VALUE() window function
     /// LAST_VALUE(column) - returns the last value of the specified column in the partition
-    /// Note: In standard SQL, LAST_VALUE uses the current frame, not entire partition.
-    /// This implementation returns the value at the current row's position in the frame.
     fn executeLastValue(self: *WindowExecutor, function: ast.WindowFunction, context: *WindowContext) !storage.Value {
-        if (context.partition_end == 0 or context.partition_end > context.rows.len) {
+        const frame = resolveFrame(function, context);
+        if (frame.start >= frame.end or frame.end > context.rows.len) {
             return storage.Value.Null;
         }
 
@@ -685,10 +685,7 @@ pub const WindowExecutor = struct {
             }
         }
 
-        // Standard SQL LAST_VALUE with default frame (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
-        // returns the current row value. For ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING,
-        // it returns the actual last row. We implement the latter for simplicity.
-        const last_row = context.rows[context.partition_end - 1];
+        const last_row = context.rows[frame.end - 1];
         if (column_idx < last_row.values.len) {
             return try last_row.values[column_idx].clone(self.allocator);
         }
@@ -699,6 +696,8 @@ pub const WindowExecutor = struct {
     /// Execute NTH_VALUE() window function
     /// NTH_VALUE(column, n) - returns the nth value of the column in the partition
     fn executeNthValue(self: *WindowExecutor, function: ast.WindowFunction, context: *WindowContext) !storage.Value {
+        const frame = resolveFrame(function, context);
+
         // Get column index and N from arguments
         var column_idx: usize = 0;
         var n: usize = 1;
@@ -731,8 +730,8 @@ pub const WindowExecutor = struct {
         }
 
         // N is 1-based
-        const target_idx = context.partition_start + n - 1;
-        if (target_idx >= context.partition_end or target_idx >= context.rows.len) {
+        const target_idx = frame.start + n - 1;
+        if (target_idx >= frame.end or target_idx >= context.rows.len) {
             return storage.Value.Null;
         }
 
@@ -744,6 +743,44 @@ pub const WindowExecutor = struct {
         return storage.Value.Null;
     }
 };
+
+const FrameRange = struct {
+    start: usize,
+    end: usize,
+};
+
+fn resolveFrame(function: ast.WindowFunction, context: *WindowContext) FrameRange {
+    const clause = function.window_spec.frame_clause orelse return .{
+        .start = context.partition_start,
+        .end = context.current_row + 1,
+    };
+
+    if (clause.frame_type != .Rows) {
+        return .{ .start = context.partition_start, .end = context.partition_end };
+    }
+
+    const start = resolveFrameBound(clause.start_bound, context, true);
+    const end_bound = clause.end_bound orelse clause.start_bound;
+    const end_inclusive = resolveFrameBound(end_bound, context, false);
+    const end = @min(context.partition_end, end_inclusive + 1);
+
+    if (start > end) return .{ .start = end, .end = end };
+    return .{ .start = start, .end = end };
+}
+
+fn resolveFrameBound(bound: ast.FrameBound, context: *WindowContext, comptime is_start: bool) usize {
+    _ = is_start;
+    return switch (bound) {
+        .UnboundedPreceding => context.partition_start,
+        .UnboundedFollowing => context.partition_end - 1,
+        .CurrentRow => context.current_row,
+        .Preceding => |offset| if (offset > context.current_row - context.partition_start)
+            context.partition_start
+        else
+            context.current_row - offset,
+        .Following => |offset| @min(context.partition_end - 1, context.current_row + offset),
+    };
+}
 
 /// Window function type enumeration
 pub const WindowFunctionType = enum {

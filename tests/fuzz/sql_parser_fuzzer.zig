@@ -1,5 +1,4 @@
 const std = @import("std");
-const zqlite = @import("zqlite");
 const parser = @import("zqlite").parser;
 
 /// SQL Parser Fuzzer - Generates random SQL and tests parser robustness
@@ -16,25 +15,48 @@ const FuzzConfig = struct {
     verbose: bool,
 };
 
+const deterministic_seed: u64 = 0x5A51_1E_F00D_2026;
+
+const CorpusCase = struct {
+    name: []const u8,
+    sql: []const u8,
+};
+
+const parser_corpus = [_]CorpusCase{
+    .{ .name = "select_with_comments", .sql = @embedFile("parser_corpus/select_with_comments.sql") },
+    .{ .name = "default_values", .sql = @embedFile("parser_corpus/default_values.sql") },
+    .{ .name = "check_unique_fk", .sql = @embedFile("parser_corpus/check_unique_fk.sql") },
+    .{ .name = "cte_returning", .sql = @embedFile("parser_corpus/cte_returning.sql") },
+    .{ .name = "upsert_returning", .sql = @embedFile("parser_corpus/upsert_returning.sql") },
+    .{ .name = "malformed_nested", .sql = @embedFile("parser_corpus/malformed_nested.sql") },
+    .{ .name = "quoted_strings", .sql = @embedFile("parser_corpus/quoted_strings.sql") },
+    .{ .name = "attach_detach", .sql = @embedFile("parser_corpus/attach_detach.sql") },
+};
+
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer {
-        const leaked = gpa.deinit();
-        if (leaked == .leak) {
-            std.debug.print("⚠️  Memory leak detected during fuzzing\n", .{});
-        }
-    }
-    const allocator = gpa.allocator();
+    const result = runFuzzer(gpa.allocator());
 
+    const leaked = gpa.deinit();
+    if (leaked == .leak) {
+        std.debug.print("⚠️  Memory leak detected during fuzzing\n", .{});
+        return error.MemoryLeakDetected;
+    }
+
+    try result;
+}
+
+fn runFuzzer(allocator: std.mem.Allocator) !void {
     const config = FuzzConfig{
-        .seed = @bitCast(zqlite.time_utils.getTimestampMillis()),
-        .iterations = 10000,
+        .seed = deterministic_seed,
+        .iterations = 50_000,
         .max_sql_length = 1000,
         .verbose = false,
     };
 
     std.debug.print("🎯 SQL Parser Fuzzer\n", .{});
     std.debug.print("   Seed: {}\n", .{config.seed});
+    std.debug.print("   Corpus inputs: {}\n", .{parser_corpus.len});
     std.debug.print("   Iterations: {}\n", .{config.iterations});
     std.debug.print("   Max SQL length: {}\n\n", .{config.max_sql_length});
 
@@ -81,6 +103,8 @@ const SqlFuzzer = struct {
     }
 
     fn run(self: *SqlFuzzer) !void {
+        try self.runCorpus();
+
         var i: usize = 0;
         while (i < self.config.iterations) : (i += 1) {
             if (i % 1000 == 0) {
@@ -101,6 +125,16 @@ const SqlFuzzer = struct {
             self.stats.total_tests += 1;
         }
         std.debug.print("\rProgress: {}/{} (100.0%)  \n", .{ self.config.iterations, self.config.iterations });
+    }
+
+    fn runCorpus(self: *SqlFuzzer) !void {
+        for (parser_corpus) |case| {
+            if (self.config.verbose) {
+                std.debug.print("Corpus {s}: {s}\n", .{ case.name, case.sql });
+            }
+            try self.testParseSql(case.sql);
+            self.stats.total_tests += 1;
+        }
     }
 
     fn generateRandomSql(self: *SqlFuzzer) ![]const u8 {

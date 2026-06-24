@@ -2,9 +2,41 @@ const std = @import("std");
 const ast = @import("../parser/ast.zig");
 const storage = @import("../db/storage.zig");
 
+pub const PlannerTableStats = struct {
+    table_name: []const u8,
+    row_count: u64,
+    live_rows: u64,
+    deleted_rows: u64,
+    column_count: u32,
+
+    pub fn deinit(self: PlannerTableStats, allocator: std.mem.Allocator) void {
+        allocator.free(self.table_name);
+    }
+};
+
+pub const PlannerIndexStats = struct {
+    index_name: []const u8,
+    table_name: []const u8,
+    column_name: []const u8,
+    indexed_rows: u64,
+    distinct_values: u64,
+    is_unique: bool,
+    is_partial: bool = false,
+    is_expression: bool = false,
+
+    pub fn deinit(self: PlannerIndexStats, allocator: std.mem.Allocator) void {
+        allocator.free(self.index_name);
+        allocator.free(self.table_name);
+        allocator.free(self.column_name);
+    }
+};
+
 /// Query execution planner
 pub const Planner = struct {
     allocator: std.mem.Allocator,
+    aggregate_function_names: ?*const std.StringHashMap(void),
+    table_stats: []const PlannerTableStats,
+    index_stats: []const PlannerIndexStats,
 
     const Self = @This();
 
@@ -12,6 +44,32 @@ pub const Planner = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return Self{
             .allocator = allocator,
+            .aggregate_function_names = null,
+            .table_stats = &.{},
+            .index_stats = &.{},
+        };
+    }
+
+    pub fn initWithAggregateFunctions(allocator: std.mem.Allocator, aggregate_function_names: *const std.StringHashMap(void)) Self {
+        return Self{
+            .allocator = allocator,
+            .aggregate_function_names = aggregate_function_names,
+            .table_stats = &.{},
+            .index_stats = &.{},
+        };
+    }
+
+    pub fn initWithContext(
+        allocator: std.mem.Allocator,
+        aggregate_function_names: *const std.StringHashMap(void),
+        table_stats: []const PlannerTableStats,
+        index_stats: []const PlannerIndexStats,
+    ) Self {
+        return Self{
+            .allocator = allocator,
+            .aggregate_function_names = aggregate_function_names,
+            .table_stats = table_stats,
+            .index_stats = index_stats,
         };
     }
 
@@ -34,6 +92,8 @@ pub const Planner = struct {
             .DropTable => |*drop_tbl| try self.planDropTable(drop_tbl),
             .With => |*with| try self.planWith(with), // Handle CTE
             .Pragma => |*pragma| try self.planPragma(pragma),
+            .Analyze => |*analyze| try self.planAnalyze(analyze),
+            .Vacuum => try self.planVacuum(),
             .Explain => |*explain| try self.planExplain(explain),
             .CompoundSelect => |*compound| try self.planCompoundSelect(compound),
             .Attach => |*attach| try self.planAttach(attach),
@@ -46,12 +106,16 @@ pub const Planner = struct {
     fn planSelect(self: *Self, select: *const ast.SelectStatement) !ExecutionPlan {
         var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
 
-        // Table scan step
-        try steps.append(self.allocator, ExecutionStep{
-            .TableScan = TableScanStep{
-                .table_name = if (select.table) |table| try self.allocator.dupe(u8, table) else "",
-            },
-        });
+        const base_table = select.table orelse "";
+        if (try self.chooseIndexScan(base_table, select.where_clause)) |index_scan| {
+            try steps.append(self.allocator, ExecutionStep{ .IndexScan = index_scan });
+        } else {
+            try steps.append(self.allocator, ExecutionStep{
+                .TableScan = TableScanStep{
+                    .table_name = if (select.table) |table| try self.allocator.dupe(u8, table) else "",
+                },
+            });
+        }
 
         // JOIN steps
         for (select.joins) |join| {
@@ -82,6 +146,27 @@ pub const Planner = struct {
                             try self.allocator.dupe(u8, col)
                         else
                             null,
+                        .function_name = if (column.expression.Aggregate.function_name) |name|
+                            try self.allocator.dupe(u8, name)
+                        else
+                            null,
+                        .alias = if (column.alias) |alias|
+                            try self.allocator.dupe(u8, alias)
+                        else
+                            null,
+                    });
+                } else if (column.expression == .FunctionCall and self.isRegisteredAggregate(column.expression.FunctionCall.name)) {
+                    const func = column.expression.FunctionCall;
+                    if (func.arguments.len != 1) return error.InvalidArgumentCount;
+                    const aggregate_column = switch (func.arguments[0]) {
+                        .Column => |name| try self.allocator.dupe(u8, name),
+                        else => return error.InvalidArgumentType,
+                    };
+
+                    try aggregates.append(self.allocator, AggregateOperation{
+                        .function_type = .UserDefined,
+                        .column = aggregate_column,
+                        .function_name = try self.allocator.dupe(u8, func.name),
                         .alias = if (column.alias) |alias|
                             try self.allocator.dupe(u8, alias)
                         else
@@ -171,6 +256,17 @@ pub const Planner = struct {
             // Add WindowStep BEFORE Project if there are window functions
             // Window step will project non-window columns and compute window functions
             if (window_functions.items.len > 0) {
+                const output_column_count = non_window_columns.items.len;
+
+                for (window_functions.items) |window_func| {
+                    try self.appendWindowInputColumns(&non_window_columns, window_func);
+                }
+                if (select.window_definitions) |window_definitions| {
+                    for (window_definitions) |definition| {
+                        try self.appendWindowSpecInputColumns(&non_window_columns, definition.specification);
+                    }
+                }
+
                 var cloned_window_definitions: ?[]ast.WindowDefinition = null;
                 if (select.window_definitions) |window_definitions| {
                     cloned_window_definitions = try self.allocator.alloc(ast.WindowDefinition, window_definitions.len);
@@ -187,6 +283,7 @@ pub const Planner = struct {
                         .window_functions = try window_functions.toOwnedSlice(self.allocator),
                         .column_names = try window_column_names.toOwnedSlice(self.allocator),
                         .projected_columns = try non_window_columns.toOwnedSlice(self.allocator),
+                        .output_column_count = output_column_count,
                         .window_definitions = cloned_window_definitions,
                     },
                 });
@@ -232,6 +329,27 @@ pub const Planner = struct {
             try steps.append(self.allocator, ExecutionStep.Distinct);
         }
 
+        if (select.order_by) |order_by| {
+            var clauses = try self.allocator.alloc(ast.OrderByClause, order_by.len);
+            var clauses_loaded: usize = 0;
+            errdefer {
+                for (clauses[0..clauses_loaded]) |clause| {
+                    self.allocator.free(clause.column);
+                }
+                self.allocator.free(clauses);
+            }
+            for (order_by, 0..) |clause, i| {
+                clauses[i] = .{
+                    .column = try self.allocator.dupe(u8, clause.column),
+                    .direction = clause.direction,
+                };
+                clauses_loaded = i + 1;
+            }
+            try steps.append(self.allocator, ExecutionStep{
+                .Sort = SortStep{ .order_by = clauses },
+            });
+        }
+
         // Limit step
         if (select.limit) |limit| {
             try steps.append(self.allocator, ExecutionStep{
@@ -246,6 +364,31 @@ pub const Planner = struct {
             .steps = try steps.toOwnedSlice(self.allocator),
             .allocator = self.allocator,
         };
+    }
+
+    fn appendWindowInputColumns(self: *Self, columns: *std.ArrayListUnmanaged([]const u8), window_func: ast.WindowFunction) !void {
+        for (window_func.arguments) |arg| {
+            if (arg == .Column) {
+                try self.appendUniqueColumn(columns, arg.Column);
+            }
+        }
+        try self.appendWindowSpecInputColumns(columns, window_func.window_spec);
+    }
+
+    fn appendWindowSpecInputColumns(self: *Self, columns: *std.ArrayListUnmanaged([]const u8), spec: ast.WindowSpecification) !void {
+        if (spec.partition_by) |partition_by| {
+            for (partition_by) |col| try self.appendUniqueColumn(columns, col);
+        }
+        if (spec.order_by) |order_by| {
+            for (order_by) |clause| try self.appendUniqueColumn(columns, clause.column);
+        }
+    }
+
+    fn appendUniqueColumn(self: *Self, columns: *std.ArrayListUnmanaged([]const u8), name: []const u8) !void {
+        for (columns.items) |existing| {
+            if (std.mem.eql(u8, existing, name)) return;
+        }
+        try columns.append(self.allocator, try self.allocator.dupe(u8, name));
     }
 
     /// Plan JOIN operation
@@ -306,15 +449,111 @@ pub const Planner = struct {
         right_column: []const u8,
     };
 
+    const EqualityLookup = struct {
+        column_name: []const u8,
+        value: storage.Value,
+    };
+
+    const IndexChoice = struct {
+        stats: PlannerIndexStats,
+        estimated_rows: u64,
+        estimated_cost: u64,
+    };
+
+    fn chooseIndexScan(self: *Self, table_name: []const u8, where_clause: ?ast.WhereClause) !?IndexScanStep {
+        if (table_name.len == 0) return null;
+        const where = where_clause orelse return null;
+
+        var lookup = try self.extractEqualityLookup(&where.condition);
+        if (lookup == null) return null;
+        defer if (lookup) |*l| l.value.deinit(self.allocator);
+
+        const table_cost = self.estimateTableScanCost(table_name);
+        const choice = self.chooseBestIndex(table_name, lookup.?.column_name, table_cost) orelse return null;
+
+        return IndexScanStep{
+            .table_name = try self.allocator.dupe(u8, table_name),
+            .index_name = try self.allocator.dupe(u8, choice.stats.index_name),
+            .column_name = try self.allocator.dupe(u8, choice.stats.column_name),
+            .lookup_value = try lookup.?.value.clone(self.allocator),
+            .estimated_rows = choice.estimated_rows,
+            .estimated_cost = choice.estimated_cost,
+        };
+    }
+
+    fn extractEqualityLookup(self: *Self, condition: *const ast.Condition) !?EqualityLookup {
+        switch (condition.*) {
+            .Comparison => |comp| {
+                if (comp.operator != .Equal) return null;
+                if (try self.expressionColumnLiteralLookup(&comp.left, &comp.right)) |lookup| return lookup;
+                return try self.expressionColumnLiteralLookup(&comp.right, &comp.left);
+            },
+            .Logical => |logical| {
+                if (logical.operator != .And) return null;
+                if (try self.extractEqualityLookup(logical.left)) |lookup| return lookup;
+                return try self.extractEqualityLookup(logical.right);
+            },
+        }
+    }
+
+    fn expressionColumnLiteralLookup(self: *Self, column_expr: *const ast.Expression, value_expr: *const ast.Expression) !?EqualityLookup {
+        if (column_expr.* != .Column or value_expr.* != .Literal) return null;
+        return EqualityLookup{
+            .column_name = column_expr.Column,
+            .value = try self.cloneValue(value_expr.Literal),
+        };
+    }
+
+    fn estimateTableScanCost(self: *Self, table_name: []const u8) u64 {
+        for (self.table_stats) |stats| {
+            if (std.mem.eql(u8, stats.table_name, table_name)) return @max(stats.live_rows, 1);
+        }
+        return std.math.maxInt(u64);
+    }
+
+    fn chooseBestIndex(self: *Self, table_name: []const u8, column_name: []const u8, table_cost: u64) ?IndexChoice {
+        var best: ?IndexChoice = null;
+
+        for (self.index_stats) |stats| {
+            if (!std.mem.eql(u8, stats.table_name, table_name)) continue;
+            if (!std.mem.eql(u8, stats.column_name, column_name)) continue;
+            if (!stats.is_unique) continue;
+            if (stats.is_partial or stats.is_expression) continue;
+
+            const estimated_rows: u64 = 1;
+            const estimated_cost: u64 = 1;
+            if (estimated_cost >= table_cost) continue;
+
+            if (best == null or estimated_cost < best.?.estimated_cost) {
+                best = .{
+                    .stats = stats,
+                    .estimated_rows = estimated_rows,
+                    .estimated_cost = estimated_cost,
+                };
+            }
+        }
+
+        return best;
+    }
+
     /// Check if any columns contain aggregate functions
     fn hasAggregates(self: *Self, columns: []ast.Column) bool {
-        _ = self;
         for (columns) |column| {
             if (column.expression == .Aggregate) {
                 return true;
             }
+            if (column.expression == .FunctionCall and self.isRegisteredAggregate(column.expression.FunctionCall.name)) {
+                return true;
+            }
         }
         return false;
+    }
+
+    fn isRegisteredAggregate(self: *Self, name: []const u8) bool {
+        const names = self.aggregate_function_names orelse return false;
+        const lower_name = std.ascii.allocLowerString(self.allocator, name) catch return false;
+        defer self.allocator.free(lower_name);
+        return names.contains(lower_name);
     }
 
     /// Plan INSERT statement execution
@@ -449,6 +688,17 @@ pub const Planner = struct {
                         if (constraint == .Default) {
                             const default_value = try self.convertAstDefaultToStorage(constraint.Default);
                             break :blk default_value;
+                        }
+                    }
+                    break :blk null;
+                },
+                .generated = blk: {
+                    for (col_def.constraints) |constraint| {
+                        if (constraint == .Generated) {
+                            break :blk storage.Column.GeneratedColumn{
+                                .expression = try self.cloneExpression(constraint.Generated.expression),
+                                .stored = constraint.Generated.stored,
+                            };
                         }
                     }
                     break :blk null;
@@ -684,11 +934,24 @@ pub const Planner = struct {
             columns[i] = try self.allocator.dupe(u8, col);
         }
 
+        var expressions = try self.allocator.alloc(ast.Expression, create_idx.expressions.len);
+        var expressions_cloned: usize = 0;
+        errdefer {
+            for (expressions[0..expressions_cloned]) |*expression| expression.deinit(self.allocator);
+            self.allocator.free(expressions);
+        }
+        for (create_idx.expressions, 0..) |expression, i| {
+            expressions[i] = try self.cloneExpression(expression);
+            expressions_cloned = i + 1;
+        }
+
         try steps.append(self.allocator, ExecutionStep{
             .CreateIndex = CreateIndexStep{
                 .index_name = try self.allocator.dupe(u8, create_idx.index_name),
                 .table_name = try self.allocator.dupe(u8, create_idx.table_name),
                 .columns = columns,
+                .expressions = expressions,
+                .where_clause = if (create_idx.where_clause) |*where| try self.cloneCondition(&where.condition) else null,
                 .unique = create_idx.unique,
                 .if_not_exists = create_idx.if_not_exists,
             },
@@ -911,6 +1174,7 @@ pub const Planner = struct {
                 .Aggregate = ast.AggregateFunction{
                     .function_type = agg.function_type,
                     .column = if (agg.column) |col| try self.allocator.dupe(u8, col) else null,
+                    .function_name = if (agg.function_name) |name| try self.allocator.dupe(u8, name) else null,
                 },
             },
             .Window => |window| ast.ColumnExpression{ .Window = try self.cloneWindowFunction(window) },
@@ -1139,9 +1403,34 @@ pub const Planner = struct {
             .Pragma = PragmaStep{
                 .name = try self.allocator.dupe(u8, pragma.name),
                 .argument = if (pragma.argument) |arg| try self.allocator.dupe(u8, arg) else null,
+                .value = pragma.value,
             },
         });
 
+        return ExecutionPlan{
+            .steps = try steps.toOwnedSlice(self.allocator),
+            .allocator = self.allocator,
+        };
+    }
+
+    fn planAnalyze(self: *Self, analyze: *const ast.AnalyzeStatement) !ExecutionPlan {
+        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+
+        try steps.append(self.allocator, ExecutionStep{
+            .Analyze = AnalyzeStep{
+                .table_name = if (analyze.table_name) |table_name| try self.allocator.dupe(u8, table_name) else null,
+            },
+        });
+
+        return ExecutionPlan{
+            .steps = try steps.toOwnedSlice(self.allocator),
+            .allocator = self.allocator,
+        };
+    }
+
+    fn planVacuum(self: *Self) !ExecutionPlan {
+        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        try steps.append(self.allocator, .Vacuum);
         return ExecutionPlan{
             .steps = try steps.toOwnedSlice(self.allocator),
             .allocator = self.allocator,
@@ -1252,15 +1541,23 @@ pub const Planner = struct {
                 self.allocator.free(cte_plan.steps);
             }
 
-            // Clone column names if provided
-            var column_names: ?[][]const u8 = null;
+            var cloned_cols: std.ArrayListUnmanaged([]const u8) = .empty;
+            errdefer {
+                for (cloned_cols.items) |col| self.allocator.free(col);
+                cloned_cols.deinit(self.allocator);
+            }
+
             if (cte_def.column_names) |cols| {
-                var cloned_cols: std.ArrayListUnmanaged([]const u8) = .empty;
                 for (cols) |col| {
                     try cloned_cols.append(self.allocator, try self.allocator.dupe(u8, col));
                 }
-                column_names = try cloned_cols.toOwnedSlice(self.allocator);
+            } else {
+                for (cte_def.query.columns) |col| {
+                    try cloned_cols.append(self.allocator, try self.allocator.dupe(u8, col.alias orelse col.name));
+                }
             }
+
+            const column_names = try cloned_cols.toOwnedSlice(self.allocator);
 
             // Create the CTE step
             try steps.append(self.allocator, ExecutionStep{
@@ -1353,6 +1650,7 @@ pub const ExecutionStep = union(enum) {
     IndexScan: IndexScanStep, // Index-based lookup (query optimizer)
     Filter: FilterStep,
     Project: ProjectStep,
+    Sort: SortStep,
     Limit: LimitStep,
     Insert: InsertStep,
     CreateTable: CreateTableStep,
@@ -1373,6 +1671,8 @@ pub const ExecutionStep = union(enum) {
     DropTable: DropTableStep,
     CreateCTE: CreateCTEStep, // Common Table Expression support
     Pragma: PragmaStep, // PRAGMA statements for introspection
+    Analyze: AnalyzeStep, // ANALYZE planner statistics
+    Vacuum,
     Explain: ExplainStep, // EXPLAIN / EXPLAIN QUERY PLAN
     SetOperation: SetOperationStep, // UNION/INTERSECT/EXCEPT
     Window: WindowStep, // Window functions (ROW_NUMBER, RANK, etc.)
@@ -1388,6 +1688,7 @@ pub const ExecutionStep = union(enum) {
             .IndexScan => |*step| step.deinit(allocator),
             .Filter => |*step| step.deinit(allocator),
             .Project => |*step| step.deinit(allocator),
+            .Sort => |*step| step.deinit(allocator),
             .Limit => {},
             .Insert => |*step| step.deinit(allocator),
             .CreateTable => |*step| step.deinit(allocator),
@@ -1408,6 +1709,8 @@ pub const ExecutionStep = union(enum) {
             .DropTable => |*step| step.deinit(allocator),
             .CreateCTE => |*step| step.deinit(allocator),
             .Pragma => |*step| step.deinit(allocator),
+            .Analyze => |*step| step.deinit(allocator),
+            .Vacuum => {},
             .Explain => |*step| step.deinit(allocator),
             .SetOperation => |*step| step.deinit(allocator),
             .Window => |*step| step.deinit(allocator),
@@ -1443,6 +1746,8 @@ pub const IndexScanStep = struct {
     index_name: []const u8,
     column_name: []const u8,
     lookup_value: storage.Value, // The value to look up in the index
+    estimated_rows: u64 = 0,
+    estimated_cost: u64 = 0,
 
     pub fn deinit(self: *IndexScanStep, allocator: std.mem.Allocator) void {
         allocator.free(self.table_name);
@@ -1487,6 +1792,17 @@ pub const ProjectStep = struct {
             }
             allocator.free(exprs);
         }
+    }
+};
+
+pub const SortStep = struct {
+    order_by: []ast.OrderByClause,
+
+    pub fn deinit(self: *SortStep, allocator: std.mem.Allocator) void {
+        for (self.order_by) |clause| {
+            allocator.free(clause.column);
+        }
+        allocator.free(self.order_by);
     }
 };
 
@@ -1583,6 +1899,9 @@ pub const CreateTableStep = struct {
             if (column.default_value) |default_value| {
                 default_value.deinit(allocator);
             }
+            if (column.generated) |generated| {
+                generated.deinit(allocator);
+            }
         }
         allocator.free(self.columns);
         for (self.unique_constraints) |*constraint| {
@@ -1661,6 +1980,8 @@ pub const CreateIndexStep = struct {
     index_name: []const u8,
     table_name: []const u8,
     columns: [][]const u8,
+    expressions: []ast.Expression,
+    where_clause: ?ast.Condition,
     unique: bool,
     if_not_exists: bool,
 
@@ -1671,6 +1992,13 @@ pub const CreateIndexStep = struct {
             allocator.free(col);
         }
         allocator.free(self.columns);
+        for (self.expressions) |*expression| {
+            expression.deinit(allocator);
+        }
+        allocator.free(self.expressions);
+        if (self.where_clause) |*where| {
+            where.deinit(allocator);
+        }
     }
 };
 
@@ -1771,11 +2099,15 @@ pub const GroupByStep = struct {
 pub const AggregateOperation = struct {
     function_type: ast.AggregateFunctionType,
     column: ?[]const u8, // NULL for COUNT(*)
+    function_name: ?[]const u8 = null,
     alias: ?[]const u8,
 
     pub fn deinit(self: *AggregateOperation, allocator: std.mem.Allocator) void {
         if (self.column) |col| {
             allocator.free(col);
+        }
+        if (self.function_name) |name| {
+            allocator.free(name);
         }
         if (self.alias) |alias| {
             allocator.free(alias);
@@ -1819,12 +2151,22 @@ pub const PragmaStep = struct {
     name: []const u8,
     /// Optional argument (e.g., table name for table_info)
     argument: ?[]const u8,
+    /// Optional assigned integer value (e.g., PRAGMA user_version = 7)
+    value: ?i64 = null,
 
     pub fn deinit(self: *PragmaStep, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         if (self.argument) |arg| {
             allocator.free(arg);
         }
+    }
+};
+
+pub const AnalyzeStep = struct {
+    table_name: ?[]const u8,
+
+    pub fn deinit(self: *AnalyzeStep, allocator: std.mem.Allocator) void {
+        if (self.table_name) |table_name| allocator.free(table_name);
     }
 };
 
@@ -1930,6 +2272,8 @@ pub const WindowStep = struct {
     column_names: [][]const u8,
     /// Projected column names (input columns that ORDER BY can reference)
     projected_columns: [][]const u8,
+    /// Number of projected columns visible in final output before window columns.
+    output_column_count: usize,
     /// Named WINDOW clause definitions
     window_definitions: ?[]ast.WindowDefinition,
 

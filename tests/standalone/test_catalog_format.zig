@@ -24,6 +24,7 @@ pub fn main(init: std.process.Init) !void {
 
     try testMultiPageCatalogRoundTrip(io, allocator);
     try testManyRewritesReadLatest(io, allocator);
+    try testInterruptedInactiveSlotReplacement(io, allocator);
     try testHeaderChecksumCorruption(io, allocator);
     try testUnsupportedVersion(io, allocator);
     try testPayloadChecksumCorruption(io, allocator);
@@ -135,6 +136,51 @@ fn testManyRewritesReadLatest(io: std.Io, allocator: std.mem.Allocator) !void {
 
 fn activeSlotOffset(bytes: []const u8) usize {
     return if (bytes[SB_OFF_ACTIVE] == 0) SB_OFF_SLOT_A else SB_OFF_SLOT_B;
+}
+
+fn inactiveSlotOffset(bytes: []const u8) usize {
+    return if (bytes[SB_OFF_ACTIVE] == 0) SB_OFF_SLOT_B else SB_OFF_SLOT_A;
+}
+
+/// A crash while rewriting the inactive catalog slot must not affect recovery:
+/// reopen still follows the active slot recorded in the durable superblock.
+fn testInterruptedInactiveSlotReplacement(io: std.Io, allocator: std.mem.Allocator) !void {
+    std.log.info("[TEST] Interrupted inactive catalog slot replacement", .{});
+    const path = try test_dir.dbPath("inactive-slot.db");
+    defer allocator.free(path);
+    cleanup(io, path);
+    defer cleanup(io, path);
+
+    {
+        const conn = try zqlite.open(allocator, path);
+        defer conn.close();
+        try conn.execute("CREATE TABLE first_table (id INTEGER)");
+        try conn.execute("CREATE TABLE second_table (id INTEGER)");
+        try conn.execute("CREATE TABLE final_table (id INTEGER, label TEXT)");
+        try conn.execute("INSERT INTO final_table (id, label) VALUES (7, 'active')");
+    }
+
+    const bytes = try readFile(io, allocator, path);
+    defer allocator.free(bytes);
+    try std.testing.expectEqual(SUPERBLOCK_MAGIC, std.mem.readInt(u32, bytes[0..4], .little));
+
+    const inactive_off = inactiveSlotOffset(bytes);
+    const inactive_first_page = std.mem.readInt(u32, bytes[inactive_off..][0..4], .little);
+    try std.testing.expect(inactive_first_page >= 2);
+
+    const payload_byte = (inactive_first_page - 1) * PAGE_SIZE + CATALOG_PAGE_HEADER;
+    try std.testing.expect(payload_byte < bytes.len);
+    bytes[payload_byte] ^= 0xFF;
+    try writeFile(io, path, bytes);
+
+    {
+        const conn = try zqlite.open(allocator, path);
+        defer conn.close();
+        var result = try conn.query("SELECT * FROM final_table");
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.rows.items.len);
+        try std.testing.expectEqual(@as(i64, 7), result.rows.items[0].values[0].Integer);
+    }
 }
 
 /// A superblock whose header bytes no longer match its checksum must be rejected

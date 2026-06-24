@@ -3,11 +3,13 @@ const zqlite = @import("zqlite");
 const temp_dir = @import("temp_dir.zig");
 
 var test_dir: temp_dir.TempDir = undefined;
+var test_io: std.Io = undefined;
 
 pub fn main(init: std.process.Init) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    test_io = init.io;
     test_dir = try .init(init.io, allocator, "zqlite-file-backed");
     defer test_dir.deinit();
 
@@ -26,8 +28,138 @@ pub fn main(init: std.process.Init) !void {
     try testForeignKeyConstraintPersists(allocator);
     try testForeignKeyActionsPersist(allocator);
     try testInsertDefaultValues(allocator);
+    try testCheckpointWalStatsAndBackup(allocator);
+    try testReadOnlyAndImmutableOpenModes(allocator);
+    try testBusyTimeoutAndInterrupt(allocator);
+    try testSchemaVersionAndMigrationPersistence(allocator);
+    try testIntegrityCheckPragma(allocator);
+    try testVacuumMaintenanceCommand(allocator);
 
     std.log.info("=== ALL FILE-BACKED TESTS PASSED ===", .{});
+}
+
+fn testVacuumMaintenanceCommand(allocator: std.mem.Allocator) !void {
+    std.log.info("[TEST] VACUUM maintenance command rebuilds indexes and validates integrity", .{});
+    const path = try test_dir.dbPath("vacuum_maintenance.db");
+    defer allocator.free(path);
+
+    {
+        var conn = try zqlite.open(allocator, path);
+        defer conn.close();
+
+        try conn.execute("CREATE TABLE vacuum_items (id INTEGER, name TEXT)");
+        try conn.execute("CREATE UNIQUE INDEX idx_vacuum_items_id ON vacuum_items (id)");
+        try conn.execute("INSERT INTO vacuum_items VALUES (1, 'one')");
+        try conn.execute("INSERT INTO vacuum_items VALUES (2, 'two')");
+        try conn.execute("DELETE FROM vacuum_items WHERE id = 1");
+
+        var result = try conn.query("VACUUM");
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.rows.items.len);
+        try std.testing.expectEqualStrings("ok", result.rows.items[0].values[0].Text);
+
+        var check = try conn.query("PRAGMA integrity_check");
+        defer check.deinit();
+        try std.testing.expectEqualStrings("ok", check.rows.items[0].values[0].Text);
+        try conn.flush();
+    }
+
+    std.log.info("[PASS] VACUUM maintenance command completed and preserved integrity", .{});
+}
+
+fn testIntegrityCheckPragma(allocator: std.mem.Allocator) !void {
+    std.log.info("[TEST] PRAGMA integrity_check validates storage metadata", .{});
+    const path = try test_dir.dbPath("integrity_check.db");
+    defer allocator.free(path);
+
+    {
+        var conn = try zqlite.open(allocator, path);
+        defer conn.close();
+
+        try conn.execute("CREATE TABLE integrity_items (id INTEGER, name TEXT)");
+        try conn.execute("CREATE UNIQUE INDEX idx_integrity_items_id ON integrity_items (id)");
+        try conn.execute("INSERT INTO integrity_items VALUES (1, 'one')");
+        try conn.execute("INSERT INTO integrity_items VALUES (2, 'two')");
+
+        var check = try conn.integrityCheck();
+        defer check.deinit(allocator);
+        try std.testing.expect(check.ok);
+        try std.testing.expectEqual(@as(usize, 1), check.table_count);
+        try std.testing.expectEqual(@as(usize, 1), check.index_count);
+        try std.testing.expectEqual(@as(usize, 2), check.live_rows);
+
+        var pragma = try conn.query("PRAGMA integrity_check");
+        defer pragma.deinit();
+        try std.testing.expectEqual(@as(usize, 1), pragma.rows.items.len);
+        try std.testing.expectEqualStrings("ok", pragma.rows.items[0].values[0].Text);
+        try conn.flush();
+    }
+
+    {
+        var conn = try zqlite.open(allocator, path);
+        defer conn.close();
+
+        var pragma = try conn.query("PRAGMA integrity_check");
+        defer pragma.deinit();
+        try std.testing.expectEqualStrings("ok", pragma.rows.items[0].values[0].Text);
+    }
+
+    std.log.info("[PASS] PRAGMA integrity_check reports ok across reopen", .{});
+}
+
+fn testSchemaVersionAndMigrationPersistence(allocator: std.mem.Allocator) !void {
+    std.log.info("[TEST] schema/user version and migration persistence", .{});
+    const path = try test_dir.dbPath("schema_versions.db");
+    defer allocator.free(path);
+
+    {
+        var conn = try zqlite.open(allocator, path);
+        defer conn.close();
+
+        try std.testing.expectEqual(@as(u32, 0), conn.getUserVersion());
+        try conn.setUserVersion(11);
+        try conn.execute("CREATE TABLE version_persist (id INTEGER)");
+        const schema_version = conn.getSchemaVersion();
+        try std.testing.expect(schema_version > 0);
+        try conn.flush();
+    }
+
+    {
+        var conn = try zqlite.open(allocator, path);
+        defer conn.close();
+
+        try std.testing.expectEqual(@as(u32, 11), conn.getUserVersion());
+        const reopened_schema_version = conn.getSchemaVersion();
+        try std.testing.expect(reopened_schema_version > 0);
+
+        var user_result = try conn.query("PRAGMA user_version");
+        defer user_result.deinit();
+        try std.testing.expectEqual(@as(i64, 11), user_result.rows.items[0].values[0].Integer);
+
+        var schema_result = try conn.query("PRAGMA schema_version");
+        defer schema_result.deinit();
+        try std.testing.expectEqual(@as(i64, @intCast(reopened_schema_version)), schema_result.rows.items[0].values[0].Integer);
+
+        const migrations = [_]zqlite.migration.Migration{
+            zqlite.migration.createMigration(12, "add_migration_table", "CREATE TABLE persisted_migration (id INTEGER)", "DROP TABLE persisted_migration"),
+        };
+        var manager = zqlite.migration.MigrationManager.init(allocator, conn, &migrations);
+        try manager.runMigrations();
+        try std.testing.expectEqual(@as(u32, 12), conn.getUserVersion());
+        try conn.flush();
+    }
+
+    {
+        var conn = try zqlite.open(allocator, path);
+        defer conn.close();
+
+        try std.testing.expectEqual(@as(u32, 12), conn.getUserVersion());
+        var result = try conn.query("SELECT * FROM persisted_migration");
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 0), result.rows.items.len);
+    }
+
+    std.log.info("[PASS] schema/user version and migration metadata survived reopen", .{});
 }
 
 fn testInsertDefaultValues(allocator: std.mem.Allocator) !void {
@@ -78,6 +210,154 @@ fn testInsertDefaultValues(allocator: std.mem.Allocator) !void {
     }
 
     std.log.info("[PASS] INSERT DEFAULT VALUES and function defaults produced default rows", .{});
+}
+
+fn testCheckpointWalStatsAndBackup(allocator: std.mem.Allocator) !void {
+    std.log.info("[TEST] checkpoint API, WAL stats, and file backup", .{});
+    const path = try test_dir.dbPath("backup_source.db");
+    defer allocator.free(path);
+    const backup_path = try test_dir.dbPath("backup_copy.db");
+    defer allocator.free(backup_path);
+
+    {
+        var conn = try zqlite.open(allocator, path);
+        defer conn.close();
+
+        try conn.execute("CREATE TABLE backup_test (id INTEGER PRIMARY KEY, name TEXT)");
+        try conn.execute("INSERT INTO backup_test (id, name) VALUES (1, 'primary')");
+
+        const stats_before = (try conn.getWalStats()).?;
+        try std.testing.expect(stats_before.path.len > 0);
+        try std.testing.expect(!stats_before.active_transaction);
+
+        try conn.checkpoint();
+        const stats_after = (try conn.getWalStats()).?;
+        try std.testing.expect(!stats_after.active_transaction);
+
+        try conn.backupToFile(test_io, backup_path);
+    }
+
+    {
+        var backup = try zqlite.open(allocator, backup_path);
+        defer backup.close();
+
+        var result = try backup.query("SELECT * FROM backup_test");
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.rows.items.len);
+        try std.testing.expectEqual(@as(i64, 1), result.rows.items[0].values[0].Integer);
+        try std.testing.expectEqualStrings("primary", result.rows.items[0].values[1].Text);
+    }
+
+    {
+        var memory = try zqlite.openMemory(allocator);
+        defer memory.close();
+        try std.testing.expectEqual(@as(?zqlite.wal.WriteAheadLog.Stats, null), try memory.getWalStats());
+        try std.testing.expectError(error.BackupRequiresFileDatabase, memory.backupToFile(test_io, backup_path));
+    }
+
+    std.log.info("[PASS] checkpoint/WAL stats/backup API produced a readable copy", .{});
+}
+
+fn testReadOnlyAndImmutableOpenModes(allocator: std.mem.Allocator) !void {
+    std.log.info("[TEST] read-only and immutable open modes", .{});
+    const path = try test_dir.dbPath("readonly_modes.db");
+    defer allocator.free(path);
+    const backup_path = try test_dir.dbPath("readonly_backup.db");
+    defer allocator.free(backup_path);
+    const missing_path = try test_dir.dbPath("missing_readonly.db");
+    defer allocator.free(missing_path);
+
+    {
+        var conn = try zqlite.open(allocator, path);
+        defer conn.close();
+        try conn.execute("CREATE TABLE readonly_test (id INTEGER PRIMARY KEY, name TEXT)");
+        try conn.execute("INSERT INTO readonly_test (id, name) VALUES (1, 'stable')");
+        try conn.flush();
+    }
+
+    {
+        var ro = try zqlite.openWithOptions(allocator, path, zqlite.OpenOptions.READ_ONLY);
+        defer ro.close();
+        try std.testing.expect(ro.isReadOnly());
+        try std.testing.expect(!ro.isImmutable());
+        try std.testing.expectEqual(@as(?zqlite.wal.WriteAheadLog.Stats, null), try ro.getWalStats());
+
+        var result = try ro.query("SELECT * FROM readonly_test");
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.rows.items.len);
+        try std.testing.expectEqualStrings("stable", result.rows.items[0].values[1].Text);
+
+        try ro.checkpoint();
+        try ro.backupToFile(test_io, backup_path);
+
+        try std.testing.expectError(error.ReadOnlyDatabase, ro.execute("INSERT INTO readonly_test (id, name) VALUES (2, 'blocked')"));
+        try std.testing.expectError(error.ReadOnlyDatabase, ro.exec("UPDATE readonly_test SET name = 'blocked' WHERE id = 1"));
+        try std.testing.expectError(error.ReadOnlyDatabase, ro.query("DELETE FROM readonly_test WHERE id = 1"));
+        try std.testing.expectError(error.ReadOnlyDatabase, ro.execute("BEGIN"));
+        try std.testing.expectError(error.ReadOnlyDatabase, ro.attachDatabase(path, "aux"));
+        try std.testing.expectError(error.ReadOnlyDatabase, ro.prepare("INSERT INTO readonly_test (id, name) VALUES (?, ?)"));
+    }
+
+    {
+        var backup = try zqlite.open(allocator, backup_path);
+        defer backup.close();
+        var result = try backup.query("SELECT * FROM readonly_test");
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.rows.items.len);
+    }
+
+    {
+        var imm = try zqlite.openWithOptions(allocator, path, zqlite.OpenOptions.IMMUTABLE);
+        defer imm.close();
+        try std.testing.expect(imm.isReadOnly());
+        try std.testing.expect(imm.isImmutable());
+
+        var result = try imm.query("SELECT * FROM readonly_test");
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.rows.items.len);
+        try std.testing.expectError(error.ReadOnlyDatabase, imm.execute("CREATE TABLE blocked (id INTEGER)"));
+    }
+
+    try std.testing.expectError(error.FileNotFound, zqlite.openWithOptions(allocator, missing_path, zqlite.OpenOptions.READ_ONLY));
+    try std.testing.expectError(error.FileNotFound, zqlite.openWithOptions(allocator, missing_path, zqlite.OpenOptions.IMMUTABLE));
+
+    std.log.info("[PASS] read-only and immutable modes allowed reads and rejected writes", .{});
+}
+
+fn testBusyTimeoutAndInterrupt(allocator: std.mem.Allocator) !void {
+    std.log.info("[TEST] busy timeout and interrupt controls", .{});
+    const path = try test_dir.dbPath("operation_controls.db");
+    defer allocator.free(path);
+
+    var conn = try zqlite.open(allocator, path);
+    defer conn.close();
+
+    try conn.execute("CREATE TABLE operation_controls (id INTEGER PRIMARY KEY, name TEXT)");
+    try conn.execute("INSERT INTO operation_controls (id, name) VALUES (1, 'ready')");
+
+    conn.interrupt();
+    try std.testing.expect(conn.isInterrupted());
+    try std.testing.expectError(error.Interrupted, conn.query("SELECT * FROM operation_controls"));
+    try std.testing.expectError(error.Interrupted, conn.prepare("SELECT * FROM operation_controls"));
+
+    conn.clearInterrupt();
+    try std.testing.expect(!conn.isInterrupted());
+
+    var result = try conn.query("SELECT * FROM operation_controls");
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.rows.items.len);
+
+    conn.setBusyTimeout(1);
+    try std.testing.expectEqual(@as(?u64, 1), conn.getBusyTimeout());
+    conn.beginOperation();
+    defer conn.endOperation();
+    try std.Io.sleep(test_io, .fromNanoseconds(2 * std.time.ns_per_ms), .awake);
+    try std.testing.expectError(error.OperationTimedOut, conn.checkOperation());
+
+    conn.setBusyTimeout(0);
+    try std.testing.expectEqual(@as(?u64, null), conn.getBusyTimeout());
+
+    std.log.info("[PASS] busy timeout and interrupt controls fail cooperatively", .{});
 }
 
 fn testForeignKeyConstraintPersists(allocator: std.mem.Allocator) !void {

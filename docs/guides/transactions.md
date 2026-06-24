@@ -62,6 +62,21 @@ Transactions use WAL-backed logging and rollback state:
 
 Avoid reading this as a blanket claim that every ACID/crash-recovery edge case is fully characterized across all experimental subsystems.
 
+## Isolation Model
+
+ZQLite's stable file-backed transaction model guarantees commit and rollback
+behavior for the owning connection and prevents dirty reads across independent
+file-backed connections:
+
+- uncommitted file-backed writes are not visible to other connections
+- committed changes are visible after opening a new connection or reopening the reader
+- nested `BEGIN` transactions are rejected; use `SAVEPOINT` for nested rollback scopes
+
+This is still a conservative embedded-database contract rather than a claim of
+full SQLite MVCC parity for every concurrent reader refresh pattern. The covered
+commit, rollback, no-dirty-read, reopen, and savepoint behavior lives in
+`tests/standalone/test_transaction_atomicity.zig`.
+
 ## Notes
 
 - Nested transactions not supported

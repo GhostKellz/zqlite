@@ -120,6 +120,9 @@ ZQLITE_API int zqlite_abi_version_patch(void);
 ZQLITE_API int zqlite_pq_available(void);
 ZQLITE_API const char *zqlite_pq_status(void);
 ZQLITE_API const char *zqlite_pq_backend(void);
+ZQLITE_API const char *zqlite_pq_liboqs_status(void);
+/* The returned string is allocated and must be released with zqlite_free_string. */
+ZQLITE_API const char *zqlite_pq_diagnostics_json(void);
 ZQLITE_API void zqlite_shutdown(void);
 
 #ifdef __cplusplus

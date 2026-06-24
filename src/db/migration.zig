@@ -36,16 +36,14 @@ pub const MigrationManager = struct {
 
     /// Run all pending migrations
     pub fn runMigrations(self: *Self) !void {
-        // Ensure migration table exists
-        try self.ensureMigrationTable();
-
         // Get current version
-        const current_version = try self.getCurrentVersion();
+        var current_version = try self.getCurrentVersion();
 
         // Apply pending migrations
         for (self.migrations) |migration| {
             if (migration.version > current_version) {
                 try self.applyMigration(migration);
+                current_version = migration.version;
             }
         }
     }
@@ -68,18 +66,16 @@ pub const MigrationManager = struct {
                 try self.rollbackMigration(migration);
             }
         }
+        try self.connection.setUserVersion(target_version);
     }
 
     /// Apply a single migration
     fn applyMigration(self: *Self, migration: Migration) !void {
         std.log.info("Applying migration {d}: {s}", .{ migration.version, migration.name });
 
-        // Use transactionExec for simple SQL execution
         const sql_statements = [_][]const u8{migration.up};
         try self.connection.transactionExec(&sql_statements);
-
-        // Record migration in history (outside transaction for simplicity)
-        try self.recordMigration(migration);
+        try self.connection.setUserVersion(migration.version);
 
         std.log.info("Migration {d} applied successfully", .{migration.version});
     }
@@ -88,12 +84,8 @@ pub const MigrationManager = struct {
     fn rollbackMigration(self: *Self, migration: Migration) !void {
         std.log.info("Rolling back migration {d}: {s}", .{ migration.version, migration.name });
 
-        // Use transactionExec for simple SQL execution
         const sql_statements = [_][]const u8{migration.down};
         try self.connection.transactionExec(&sql_statements);
-
-        // Remove migration from history (outside transaction for simplicity)
-        try self.removeMigrationRecord(migration.version);
 
         std.log.info("Migration {d} rolled back successfully", .{migration.version});
     }
@@ -114,10 +106,7 @@ pub const MigrationManager = struct {
 
     /// Get current schema version
     fn getCurrentVersion(self: *Self) !u32 {
-        // This is a simplified implementation - in practice you'd query the migration table
-        // For now, we'll return 0 to indicate no migrations have been applied
-        _ = self;
-        return 0;
+        return self.connection.getUserVersion();
     }
 
     /// Record a migration in the history table
@@ -163,9 +152,11 @@ pub const MigrationManager = struct {
 
     /// Validate migration integrity
     pub fn validateMigrations(self: *Self) !bool {
-        // Check if applied migrations match the current migration definitions
-        // This is a placeholder for a more comprehensive validation
-        _ = self;
+        var previous: u32 = 0;
+        for (self.migrations) |migration| {
+            if (migration.version == 0 or migration.version <= previous) return false;
+            previous = migration.version;
+        }
         return true;
     }
 

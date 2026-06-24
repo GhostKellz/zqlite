@@ -130,10 +130,80 @@ const StatementWrapper = struct {
     }
 };
 
+fn getResult(result: ?*zqlite_result_t) ?*QueryResult {
+    const r = result orelse return null;
+    if (!isLiveHandle(.result, @ptrCast(r))) return null;
+    return @ptrCast(@alignCast(r));
+}
+
+fn getStatement(stmt: ?*zqlite_stmt_t) ?*StatementWrapper {
+    const s = stmt orelse return null;
+    if (!isLiveHandle(.statement, @ptrCast(s))) return null;
+    return @ptrCast(@alignCast(s));
+}
+
 // Default global allocator for C API. SafeAllocator is thread-safe when backed
 // by page_allocator, so independent C callers do not race allocator metadata.
 var c_safe_allocator = std.heap.SafeAllocator.init(std.heap.page_allocator, .{});
 var c_allocator: std.mem.Allocator = c_safe_allocator.allocator();
+var registry_mutex: std.atomic.Mutex = .unlocked;
+var live_connections: ?std.AutoHashMap(usize, void) = null;
+var live_statements: ?std.AutoHashMap(usize, void) = null;
+var live_results: ?std.AutoHashMap(usize, void) = null;
+
+fn ensureRegistries() bool {
+    if (live_connections == null) live_connections = std.AutoHashMap(usize, void).init(c_allocator);
+    if (live_statements == null) live_statements = std.AutoHashMap(usize, void).init(c_allocator);
+    if (live_results == null) live_results = std.AutoHashMap(usize, void).init(c_allocator);
+    return true;
+}
+
+fn registerHandle(comptime kind: enum { connection, statement, result }, ptr: *anyopaque) bool {
+    lockRegistry();
+    defer unlockRegistry();
+    _ = ensureRegistries();
+    const key = @intFromPtr(ptr);
+    switch (kind) {
+        .connection => live_connections.?.put(key, {}) catch return false,
+        .statement => live_statements.?.put(key, {}) catch return false,
+        .result => live_results.?.put(key, {}) catch return false,
+    }
+    return true;
+}
+
+fn unregisterHandle(comptime kind: enum { connection, statement, result }, ptr: *anyopaque) bool {
+    lockRegistry();
+    defer unlockRegistry();
+    _ = ensureRegistries();
+    const key = @intFromPtr(ptr);
+    return switch (kind) {
+        .connection => live_connections.?.remove(key),
+        .statement => live_statements.?.remove(key),
+        .result => live_results.?.remove(key),
+    };
+}
+
+fn isLiveHandle(comptime kind: enum { connection, statement, result }, ptr: *anyopaque) bool {
+    lockRegistry();
+    defer unlockRegistry();
+    _ = ensureRegistries();
+    const key = @intFromPtr(ptr);
+    return switch (kind) {
+        .connection => live_connections.?.contains(key),
+        .statement => live_statements.?.contains(key),
+        .result => live_results.?.contains(key),
+    };
+}
+
+fn lockRegistry() void {
+    while (!registry_mutex.tryLock()) {
+        std.atomic.spinLoopHint();
+    }
+}
+
+fn unlockRegistry() void {
+    registry_mutex.unlock();
+}
 
 fn storageValueType(value: zqlite.storage.Value) c_int {
     return switch (value) {
@@ -144,6 +214,30 @@ fn storageValueType(value: zqlite.storage.Value) c_int {
         .Null => ZQLITE_TYPE_NULL,
         .Parameter, .FunctionCall => ZQLITE_TYPE_NULL,
     };
+}
+
+fn freeQueryResultRaw(query_result: *QueryResult) void {
+    for (query_result.rows, 0..) |row, row_idx| {
+        for (row) |cell| {
+            if (cell) |data| {
+                c_allocator.free(data);
+            }
+        }
+        c_allocator.free(row);
+        c_allocator.free(query_result.cell_types[row_idx]);
+    }
+    c_allocator.free(query_result.rows);
+    c_allocator.free(query_result.cell_types);
+
+    for (query_result.column_names) |name| {
+        c_allocator.free(name);
+    }
+    c_allocator.free(query_result.column_names);
+
+    if (query_result.error_message) |msg| {
+        c_allocator.free(msg);
+    }
+    c_allocator.destroy(query_result);
 }
 
 /// Open a database connection
@@ -170,12 +264,19 @@ export fn zqlite_open(path: [*:0]const u8) ?*zqlite_connection_t {
         .allocator = c_allocator,
     };
 
-    return @as(*zqlite_connection_t, @ptrCast(wrapper));
+    const handle = @as(*zqlite_connection_t, @ptrCast(wrapper));
+    if (!registerHandle(.connection, @ptrCast(handle))) {
+        wrapper.connection.close();
+        c_allocator.destroy(wrapper);
+        return null;
+    }
+    return handle;
 }
 
 /// Close a database connection
 export fn zqlite_close(conn: ?*zqlite_connection_t) void {
     if (conn) |c| {
+        if (!unregisterHandle(.connection, @ptrCast(c))) return;
         const wrapper: *ConnectionWrapper = @ptrCast(@alignCast(c));
         wrapper.connection.close();
         c_allocator.destroy(wrapper);
@@ -185,6 +286,7 @@ export fn zqlite_close(conn: ?*zqlite_connection_t) void {
 /// Get the underlying connection from a wrapper (for internal use)
 fn getConnection(conn: ?*zqlite_connection_t) ?*ConnectionWrapper {
     if (conn) |c| {
+        if (!isLiveHandle(.connection, @ptrCast(c))) return null;
         return @ptrCast(@alignCast(c));
     }
     return null;
@@ -214,7 +316,7 @@ fn mapErrorToCode(err: anyerror) c_int {
         error.TypeMismatch => ZQLITE_MISMATCH,
         error.ConstraintViolation, error.UniqueConstraintViolation, error.MissingRequiredValue => ZQLITE_CONSTRAINT,
         error.InvalidParameterIndex, error.ParameterIndexOutOfBounds, error.NamedParameterNotFound => ZQLITE_RANGE,
-        error.SavepointNotFound, error.TransactionAlreadyActive, error.TransactionActive, error.UnsupportedDDLInSavepoint => ZQLITE_MISUSE,
+        error.SavepointNotFound, error.TransactionAlreadyActive, error.TransactionActive, error.UnsupportedDDLInSavepoint, error.PreparedStatementExpired => ZQLITE_MISUSE,
         error.IoError => ZQLITE_IOERR,
         error.CorruptData => ZQLITE_CORRUPT,
         else => ZQLITE_ERROR,
@@ -259,7 +361,9 @@ export fn zqlite_query(conn: ?*zqlite_connection_t, sql: [*:0]const u8) ?*zqlite
         const error_code = mapErrorToCode(err);
         wrapper.error_info.set(error_code, @errorName(err), sql);
         result.error_message = c_allocator.dupe(u8, @errorName(err)) catch null;
-        return @as(*zqlite_result_t, @ptrCast(result));
+        const handle = @as(*zqlite_result_t, @ptrCast(result));
+        _ = registerHandle(.result, @ptrCast(handle));
+        return handle;
     };
     defer result_set.deinit();
 
@@ -268,7 +372,9 @@ export fn zqlite_query(conn: ?*zqlite_connection_t, sql: [*:0]const u8) ?*zqlite
     const col_count = result_set.columnCount();
     var column_names = c_allocator.alloc([:0]u8, col_count) catch {
         result.error_message = c_allocator.dupe(u8, "OutOfMemory") catch null;
-        return @as(*zqlite_result_t, @ptrCast(result));
+        const handle = @as(*zqlite_result_t, @ptrCast(result));
+        _ = registerHandle(.result, @ptrCast(handle));
+        return handle;
     };
     var column_names_loaded: usize = 0;
     errdefer {
@@ -279,7 +385,9 @@ export fn zqlite_query(conn: ?*zqlite_connection_t, sql: [*:0]const u8) ?*zqlite
         const name = result_set.columnName(col_idx) orelse "";
         column_names[col_idx] = c_allocator.dupeSentinel(u8, name, 0) catch {
             result.error_message = c_allocator.dupe(u8, "OutOfMemory") catch null;
-            return @as(*zqlite_result_t, @ptrCast(result));
+            const handle = @as(*zqlite_result_t, @ptrCast(result));
+            _ = registerHandle(.result, @ptrCast(handle));
+            return handle;
         };
         column_names_loaded = col_idx + 1;
     }
@@ -288,18 +396,24 @@ export fn zqlite_query(conn: ?*zqlite_connection_t, sql: [*:0]const u8) ?*zqlite
     if (row_count == 0 or col_count == 0) {
         result.row_count = 0;
         result.column_count = @intCast(col_count);
-        return @as(*zqlite_result_t, @ptrCast(result));
+        const handle = @as(*zqlite_result_t, @ptrCast(result));
+        _ = registerHandle(.result, @ptrCast(handle));
+        return handle;
     }
 
     // Allocate rows array
     var rows = c_allocator.alloc([]?[]const u8, row_count) catch {
         result.error_message = c_allocator.dupe(u8, "OutOfMemory") catch null;
-        return @as(*zqlite_result_t, @ptrCast(result));
+        const handle = @as(*zqlite_result_t, @ptrCast(result));
+        _ = registerHandle(.result, @ptrCast(handle));
+        return handle;
     };
     var cell_types = c_allocator.alloc([]c_int, row_count) catch {
         c_allocator.free(rows);
         result.error_message = c_allocator.dupe(u8, "OutOfMemory") catch null;
-        return @as(*zqlite_result_t, @ptrCast(result));
+        const handle = @as(*zqlite_result_t, @ptrCast(result));
+        _ = registerHandle(.result, @ptrCast(handle));
+        return handle;
     };
 
     // Process each row
@@ -319,7 +433,9 @@ export fn zqlite_query(conn: ?*zqlite_connection_t, sql: [*:0]const u8) ?*zqlite
             }
             c_allocator.free(rows);
             result.error_message = c_allocator.dupe(u8, "OutOfMemory") catch null;
-            return @as(*zqlite_result_t, @ptrCast(result));
+            const handle = @as(*zqlite_result_t, @ptrCast(result));
+            _ = registerHandle(.result, @ptrCast(handle));
+            return handle;
         };
         var row_types = c_allocator.alloc(c_int, col_count) catch {
             c_allocator.free(row_data);
@@ -333,7 +449,9 @@ export fn zqlite_query(conn: ?*zqlite_connection_t, sql: [*:0]const u8) ?*zqlite
             c_allocator.free(cell_types);
             c_allocator.free(rows);
             result.error_message = c_allocator.dupe(u8, "OutOfMemory") catch null;
-            return @as(*zqlite_result_t, @ptrCast(result));
+            const handle = @as(*zqlite_result_t, @ptrCast(result));
+            _ = registerHandle(.result, @ptrCast(handle));
+            return handle;
         };
 
         // Copy values
@@ -372,30 +490,30 @@ export fn zqlite_query(conn: ?*zqlite_connection_t, sql: [*:0]const u8) ?*zqlite
     result.row_count = @intCast(row_count);
     result.column_count = @intCast(col_count);
 
-    return @as(*zqlite_result_t, @ptrCast(result));
+    const handle = @as(*zqlite_result_t, @ptrCast(result));
+    if (!registerHandle(.result, @ptrCast(handle))) {
+        freeQueryResultRaw(result);
+        return null;
+    }
+    return handle;
 }
 
 /// Get the number of rows in a result
 export fn zqlite_result_row_count(result: ?*zqlite_result_t) c_int {
-    if (result == null) return -1;
-
-    const query_result: *QueryResult = @ptrCast(@alignCast(result.?));
+    const query_result = getResult(result) orelse return -1;
     return @intCast(query_result.row_count);
 }
 
 /// Get the number of columns in a result
 export fn zqlite_result_column_count(result: ?*zqlite_result_t) c_int {
-    if (result == null) return -1;
-
-    const query_result: *QueryResult = @ptrCast(@alignCast(result.?));
+    const query_result = getResult(result) orelse return -1;
     return @intCast(query_result.column_count);
 }
 
 /// Get a result column name. Borrowed from the result object.
 export fn zqlite_result_column_name(result: ?*zqlite_result_t, column: c_int) ?[*:0]const u8 {
-    if (result == null or column < 0) return null;
-
-    const query_result: *QueryResult = @ptrCast(@alignCast(result.?));
+    if (column < 0) return null;
+    const query_result = getResult(result) orelse return null;
     if (column >= query_result.column_count) return null;
     const name = query_result.column_names[@intCast(column)];
     return name.ptr;
@@ -403,9 +521,7 @@ export fn zqlite_result_column_name(result: ?*zqlite_result_t, column: c_int) ?[
 
 /// Get a result cell storage class.
 export fn zqlite_result_get_type(result: ?*zqlite_result_t, row: c_int, column: c_int) c_int {
-    if (result == null) return ZQLITE_TYPE_NULL;
-
-    const query_result: *QueryResult = @ptrCast(@alignCast(result.?));
+    const query_result = getResult(result) orelse return ZQLITE_TYPE_NULL;
 
     if (row < 0 or column < 0) return ZQLITE_TYPE_NULL;
     if (row >= query_result.row_count or column >= query_result.column_count) return ZQLITE_TYPE_NULL;
@@ -416,9 +532,7 @@ export fn zqlite_result_get_type(result: ?*zqlite_result_t, row: c_int, column: 
 /// Get a cell value from the result
 /// IMPORTANT: The returned string must be freed with zqlite_free_string() when done
 export fn zqlite_result_get_text(result: ?*zqlite_result_t, row: c_int, column: c_int) ?[*:0]const u8 {
-    if (result == null) return null;
-
-    const query_result: *QueryResult = @ptrCast(@alignCast(result.?));
+    const query_result = getResult(result) orelse return null;
 
     if (row < 0 or column < 0) return null;
     if (row >= query_result.row_count or column >= query_result.column_count) return null;
@@ -437,7 +551,7 @@ export fn zqlite_result_get_text(result: ?*zqlite_result_t, row: c_int, column: 
 
 /// Free a string returned by zqlite_result_get_text or other zqlite functions
 /// SECURITY: Always call this to prevent memory leaks from returned strings
-export fn zqlite_free_string(str: ?[*:0]const u8) void {
+pub export fn zqlite_free_string(str: ?[*:0]const u8) void {
     if (str) |s| {
         // Calculate length and free the allocation
         const len = std.mem.len(s);
@@ -449,31 +563,9 @@ export fn zqlite_free_string(str: ?[*:0]const u8) void {
 /// Free a result
 export fn zqlite_result_free(result: ?*zqlite_result_t) void {
     if (result) |r| {
+        if (!unregisterHandle(.result, @ptrCast(r))) return;
         const query_result: *QueryResult = @ptrCast(@alignCast(r));
-
-        // Free rows and columns
-        for (query_result.rows, 0..) |row, row_idx| {
-            for (row) |cell| {
-                if (cell) |data| {
-                    c_allocator.free(data);
-                }
-            }
-            c_allocator.free(row);
-            c_allocator.free(query_result.cell_types[row_idx]);
-        }
-        c_allocator.free(query_result.rows);
-        c_allocator.free(query_result.cell_types);
-
-        for (query_result.column_names) |name| {
-            c_allocator.free(name);
-        }
-        c_allocator.free(query_result.column_names);
-
-        if (query_result.error_message) |msg| {
-            c_allocator.free(msg);
-        }
-
-        c_allocator.destroy(query_result);
+        freeQueryResultRaw(query_result);
     }
 }
 
@@ -496,15 +588,19 @@ export fn zqlite_prepare(conn: ?*zqlite_connection_t, sql: [*:0]const u8) ?*zqli
         return null;
     };
     stmt_wrapper.* = .{ .statement = stmt };
-    return @as(*zqlite_stmt_t, @ptrCast(stmt_wrapper));
+    const handle = @as(*zqlite_stmt_t, @ptrCast(stmt_wrapper));
+    if (!registerHandle(.statement, @ptrCast(handle))) {
+        stmt_wrapper.statement.deinit();
+        c_allocator.destroy(stmt_wrapper);
+        return null;
+    }
+    return handle;
 }
 
 /// Bind an integer parameter
 export fn zqlite_bind_int(stmt: ?*zqlite_stmt_t, index: c_int, value: i64) c_int {
-    if (stmt == null) return ZQLITE_MISUSE;
-
+    const wrapper = getStatement(stmt) orelse return ZQLITE_MISUSE;
     if (index < 0) return ZQLITE_RANGE;
-    const wrapper: *StatementWrapper = @ptrCast(@alignCast(stmt.?));
     const storage_value = zqlite.storage.Value{ .Integer = value };
 
     wrapper.clearResult();
@@ -514,10 +610,8 @@ export fn zqlite_bind_int(stmt: ?*zqlite_stmt_t, index: c_int, value: i64) c_int
 
 /// Bind a text parameter
 export fn zqlite_bind_text(stmt: ?*zqlite_stmt_t, index: c_int, value: [*:0]const u8) c_int {
-    if (stmt == null) return ZQLITE_MISUSE;
-
+    const wrapper = getStatement(stmt) orelse return ZQLITE_MISUSE;
     if (index < 0) return ZQLITE_RANGE;
-    const wrapper: *StatementWrapper = @ptrCast(@alignCast(stmt.?));
     const text_value = std.mem.span(value);
     // Pass borrowed value - bindParameter will clone internally
     const storage_value = zqlite.storage.Value{ .Text = text_value };
@@ -529,10 +623,8 @@ export fn zqlite_bind_text(stmt: ?*zqlite_stmt_t, index: c_int, value: [*:0]cons
 
 /// Bind a real (float) parameter
 export fn zqlite_bind_real(stmt: ?*zqlite_stmt_t, index: c_int, value: f64) c_int {
-    if (stmt == null) return ZQLITE_MISUSE;
-
+    const wrapper = getStatement(stmt) orelse return ZQLITE_MISUSE;
     if (index < 0) return ZQLITE_RANGE;
-    const wrapper: *StatementWrapper = @ptrCast(@alignCast(stmt.?));
     const storage_value = zqlite.storage.Value{ .Real = value };
 
     wrapper.clearResult();
@@ -542,10 +634,8 @@ export fn zqlite_bind_real(stmt: ?*zqlite_stmt_t, index: c_int, value: f64) c_in
 
 /// Bind a null parameter
 export fn zqlite_bind_null(stmt: ?*zqlite_stmt_t, index: c_int) c_int {
-    if (stmt == null) return ZQLITE_MISUSE;
-
+    const wrapper = getStatement(stmt) orelse return ZQLITE_MISUSE;
     if (index < 0) return ZQLITE_RANGE;
-    const wrapper: *StatementWrapper = @ptrCast(@alignCast(stmt.?));
     const storage_value = zqlite.storage.Value.Null;
 
     wrapper.clearResult();
@@ -555,11 +645,9 @@ export fn zqlite_bind_null(stmt: ?*zqlite_stmt_t, index: c_int) c_int {
 
 /// Bind a blob parameter
 export fn zqlite_bind_blob(stmt: ?*zqlite_stmt_t, index: c_int, value: ?*const anyopaque, len: usize) c_int {
-    if (stmt == null) return ZQLITE_MISUSE;
+    const wrapper = getStatement(stmt) orelse return ZQLITE_MISUSE;
     if (index < 0) return ZQLITE_RANGE;
     if (value == null and len != 0) return ZQLITE_MISUSE;
-
-    const wrapper: *StatementWrapper = @ptrCast(@alignCast(stmt.?));
     const bytes: []const u8 = if (len == 0) &.{} else @as([*]const u8, @ptrCast(value.?))[0..len];
     const storage_value = zqlite.storage.Value{ .Blob = bytes };
 
@@ -569,8 +657,7 @@ export fn zqlite_bind_blob(stmt: ?*zqlite_stmt_t, index: c_int, value: ?*const a
 }
 
 export fn zqlite_bind_int_named(stmt: ?*zqlite_stmt_t, name: [*:0]const u8, value: i64) c_int {
-    if (stmt == null) return ZQLITE_MISUSE;
-    const wrapper: *StatementWrapper = @ptrCast(@alignCast(stmt.?));
+    const wrapper = getStatement(stmt) orelse return ZQLITE_MISUSE;
     const storage_value = zqlite.storage.Value{ .Integer = value };
 
     wrapper.clearResult();
@@ -579,8 +666,7 @@ export fn zqlite_bind_int_named(stmt: ?*zqlite_stmt_t, name: [*:0]const u8, valu
 }
 
 export fn zqlite_bind_text_named(stmt: ?*zqlite_stmt_t, name: [*:0]const u8, value: [*:0]const u8) c_int {
-    if (stmt == null) return ZQLITE_MISUSE;
-    const wrapper: *StatementWrapper = @ptrCast(@alignCast(stmt.?));
+    const wrapper = getStatement(stmt) orelse return ZQLITE_MISUSE;
     const storage_value = zqlite.storage.Value{ .Text = std.mem.span(value) };
 
     wrapper.clearResult();
@@ -589,8 +675,7 @@ export fn zqlite_bind_text_named(stmt: ?*zqlite_stmt_t, name: [*:0]const u8, val
 }
 
 export fn zqlite_bind_real_named(stmt: ?*zqlite_stmt_t, name: [*:0]const u8, value: f64) c_int {
-    if (stmt == null) return ZQLITE_MISUSE;
-    const wrapper: *StatementWrapper = @ptrCast(@alignCast(stmt.?));
+    const wrapper = getStatement(stmt) orelse return ZQLITE_MISUSE;
     const storage_value = zqlite.storage.Value{ .Real = value };
 
     wrapper.clearResult();
@@ -599,8 +684,7 @@ export fn zqlite_bind_real_named(stmt: ?*zqlite_stmt_t, name: [*:0]const u8, val
 }
 
 export fn zqlite_bind_null_named(stmt: ?*zqlite_stmt_t, name: [*:0]const u8) c_int {
-    if (stmt == null) return ZQLITE_MISUSE;
-    const wrapper: *StatementWrapper = @ptrCast(@alignCast(stmt.?));
+    const wrapper = getStatement(stmt) orelse return ZQLITE_MISUSE;
 
     wrapper.clearResult();
     wrapper.statement.bindNamedParameter(std.mem.span(name), zqlite.storage.Value.Null) catch return ZQLITE_ERROR;
@@ -608,10 +692,9 @@ export fn zqlite_bind_null_named(stmt: ?*zqlite_stmt_t, name: [*:0]const u8) c_i
 }
 
 export fn zqlite_bind_blob_named(stmt: ?*zqlite_stmt_t, name: [*:0]const u8, value: ?*const anyopaque, len: usize) c_int {
-    if (stmt == null) return ZQLITE_MISUSE;
+    const wrapper = getStatement(stmt) orelse return ZQLITE_MISUSE;
     if (value == null and len != 0) return ZQLITE_MISUSE;
 
-    const wrapper: *StatementWrapper = @ptrCast(@alignCast(stmt.?));
     const bytes: []const u8 = if (len == 0) &.{} else @as([*]const u8, @ptrCast(value.?))[0..len];
     const storage_value = zqlite.storage.Value{ .Blob = bytes };
 
@@ -622,9 +705,7 @@ export fn zqlite_bind_blob_named(stmt: ?*zqlite_stmt_t, name: [*:0]const u8, val
 
 /// Execute a prepared statement
 export fn zqlite_step(stmt: ?*zqlite_stmt_t) c_int {
-    if (stmt == null) return ZQLITE_MISUSE;
-
-    const wrapper: *StatementWrapper = @ptrCast(@alignCast(stmt.?));
+    const wrapper = getStatement(stmt) orelse return ZQLITE_MISUSE;
     wrapper.clearText(c_allocator);
 
     if (wrapper.result) |*result| {
@@ -648,8 +729,8 @@ export fn zqlite_step(stmt: ?*zqlite_stmt_t) c_int {
 }
 
 fn getCurrentValue(stmt: ?*zqlite_stmt_t, column: c_int) ?*const zqlite.storage.Value {
-    if (stmt == null or column < 0) return null;
-    const wrapper: *StatementWrapper = @ptrCast(@alignCast(stmt.?));
+    if (column < 0) return null;
+    const wrapper = getStatement(stmt) orelse return null;
     const row = wrapper.currentRow() orelse return null;
     if (column >= row.values.len) return null;
     return &row.values[@intCast(column)];
@@ -657,8 +738,7 @@ fn getCurrentValue(stmt: ?*zqlite_stmt_t, column: c_int) ?*const zqlite.storage.
 
 /// Number of columns in the current prepared-statement row/result.
 export fn zqlite_column_count(stmt: ?*zqlite_stmt_t) c_int {
-    if (stmt == null) return -1;
-    const wrapper: *StatementWrapper = @ptrCast(@alignCast(stmt.?));
+    const wrapper = getStatement(stmt) orelse return -1;
     if (wrapper.result) |*result| {
         if (result.rows.items.len == 0) return 0;
         return @intCast(result.rows.items[0].values.len);
@@ -669,8 +749,8 @@ export fn zqlite_column_count(stmt: ?*zqlite_stmt_t) c_int {
 /// Name of a prepared-statement result column. Borrowed until the next
 /// statement step/reset/finalize or column-name call.
 export fn zqlite_column_name(stmt: ?*zqlite_stmt_t, column: c_int) ?[*:0]const u8 {
-    if (stmt == null or column < 0) return null;
-    const wrapper: *StatementWrapper = @ptrCast(@alignCast(stmt.?));
+    if (column < 0) return null;
+    const wrapper = getStatement(stmt) orelse return null;
     wrapper.clearText(c_allocator);
 
     const name: []const u8 = switch (wrapper.statement.parsed_statement) {
@@ -725,8 +805,8 @@ export fn zqlite_column_double(stmt: ?*zqlite_stmt_t, column: c_int) f64 {
 }
 
 export fn zqlite_column_text(stmt: ?*zqlite_stmt_t, column: c_int) ?[*:0]const u8 {
-    if (stmt == null or column < 0) return null;
-    const wrapper: *StatementWrapper = @ptrCast(@alignCast(stmt.?));
+    if (column < 0) return null;
+    const wrapper = getStatement(stmt) orelse return null;
     wrapper.clearText(c_allocator);
 
     const value = getCurrentValue(stmt, column) orelse return null;
@@ -760,9 +840,7 @@ export fn zqlite_column_bytes(stmt: ?*zqlite_stmt_t, column: c_int) usize {
 
 /// Reset a prepared statement
 export fn zqlite_reset(stmt: ?*zqlite_stmt_t) c_int {
-    if (stmt == null) return ZQLITE_MISUSE;
-
-    const wrapper: *StatementWrapper = @ptrCast(@alignCast(stmt.?));
+    const wrapper = getStatement(stmt) orelse return ZQLITE_MISUSE;
     wrapper.clearText(c_allocator);
     wrapper.clearResult();
     wrapper.statement.reset();
@@ -772,6 +850,7 @@ export fn zqlite_reset(stmt: ?*zqlite_stmt_t) c_int {
 /// Finalize a prepared statement
 export fn zqlite_finalize(stmt: ?*zqlite_stmt_t) c_int {
     if (stmt) |s| {
+        if (!unregisterHandle(.statement, @ptrCast(s))) return ZQLITE_MISUSE;
         const wrapper: *StatementWrapper = @ptrCast(@alignCast(s));
         wrapper.clearText(c_allocator);
         wrapper.clearResult();
@@ -868,26 +947,51 @@ export fn zqlite_abi_version_patch() c_int {
 }
 
 /// Returns 1 when real post-quantum crypto is enabled, 0 otherwise.
-export fn zqlite_pq_available() c_int {
+pub export fn zqlite_pq_available() c_int {
     const pq = zqlite.getPQCapability();
-    return if (pq.enabled) 1 else 0;
+    return if (pq.isAvailable()) 1 else 0;
 }
 
 /// Returns the current post-quantum status message.
-export fn zqlite_pq_status() [*:0]const u8 {
+pub export fn zqlite_pq_status() [*:0]const u8 {
     const pq = zqlite.getPQCapability();
     return switch (pq.backend) {
         .none => "Post-quantum crypto not compiled (use -Dcrypto=true)",
         .native_fallback => "Classical crypto only (Ed25519). PQ is experimental scaffolding.",
+        .simulated => "Simulated PQC diagnostics active; not production cryptography.",
+        .hybrid => "Hybrid PQC backend active.",
+        .pqc => "Production PQC backend active.",
     };
 }
 
 /// Returns the current post-quantum backend name.
-export fn zqlite_pq_backend() [*:0]const u8 {
+pub export fn zqlite_pq_backend() [*:0]const u8 {
     return switch (zqlite.getPQCapability().backend) {
         .none => "none",
         .native_fallback => "native_fallback",
+        .simulated => "simulated",
+        .hybrid => "hybrid",
+        .pqc => "pqc",
     };
+}
+
+/// Returns liboqs integration status for build diagnostics.
+pub export fn zqlite_pq_liboqs_status() [*:0]const u8 {
+    return switch (zqlite.getLibOQSProviderStatus()) {
+        .not_configured => "not_configured",
+        .configured_but_unlinked => "configured_but_unlinked",
+        .linked_active => "linked_active",
+    };
+}
+
+/// Returns allocated machine-readable PQC diagnostics JSON.
+/// The caller must release it with zqlite_free_string().
+pub export fn zqlite_pq_diagnostics_json() ?[*:0]const u8 {
+    const json = zqlite.pqDiagnosticsJson(c_allocator, zqlite.getPQCapability()) catch return null;
+    defer c_allocator.free(json);
+
+    const c_str = c_allocator.dupeSentinel(u8, json, 0) catch return null;
+    return c_str.ptr;
 }
 
 /// Cleanup global resources
@@ -932,6 +1036,104 @@ test "c api prepared statements" {
     // Test binding parameters
     try testing.expectEqual(ZQLITE_OK, zqlite_bind_int(stmt, 0, 123));
     try testing.expectEqual(ZQLITE_OK, zqlite_bind_text(stmt, 1, "test"));
+}
+
+test "c api misuse returns stable errors" {
+    const testing = std.testing;
+
+    try testing.expectEqual(ZQLITE_MISUSE, zqlite_execute(null, "CREATE TABLE nope (id INTEGER)"));
+    try testing.expect(zqlite_query(null, "SELECT 1") == null);
+    try testing.expect(zqlite_prepare(null, "SELECT 1") == null);
+    try testing.expectEqual(ZQLITE_MISUSE, zqlite_step(null));
+    try testing.expectEqual(ZQLITE_MISUSE, zqlite_reset(null));
+    try testing.expectEqual(ZQLITE_OK, zqlite_finalize(null));
+    try testing.expectEqual(@as(c_int, -1), zqlite_result_row_count(null));
+    try testing.expectEqual(@as(c_int, -1), zqlite_result_column_count(null));
+
+    const conn = zqlite_open(":memory:");
+    try testing.expect(conn != null);
+    defer zqlite_close(conn);
+
+    try testing.expectEqual(ZQLITE_OK, zqlite_execute(conn, "CREATE TABLE misuse (id INTEGER, name TEXT)"));
+    const stmt = zqlite_prepare(conn, "INSERT INTO misuse VALUES (?, ?)");
+    try testing.expect(stmt != null);
+    defer _ = zqlite_finalize(stmt);
+
+    try testing.expectEqual(ZQLITE_RANGE, zqlite_bind_int(stmt, -1, 1));
+    try testing.expectEqual(ZQLITE_ERROR, zqlite_bind_text(stmt, 99, "bad"));
+    try testing.expectEqual(ZQLITE_MISUSE, zqlite_bind_blob(stmt, 0, null, 4));
+    try testing.expectEqual(ZQLITE_OK, zqlite_reset(stmt));
+    try testing.expectEqual(ZQLITE_OK, zqlite_finalize(stmt));
+    try testing.expectEqual(ZQLITE_MISUSE, zqlite_finalize(stmt));
+    try testing.expectEqual(ZQLITE_MISUSE, zqlite_step(stmt));
+    try testing.expectEqual(ZQLITE_MISUSE, zqlite_bind_int(stmt, 0, 1));
+
+    const result = zqlite_query(conn, "SELECT id, name FROM misuse");
+    try testing.expect(result != null);
+    zqlite_result_free(result);
+    try testing.expectEqual(@as(c_int, -1), zqlite_result_row_count(result));
+    try testing.expect(zqlite_result_get_text(result, 0, 0) == null);
+
+    zqlite_close(conn);
+    try testing.expectEqual(ZQLITE_MISUSE, zqlite_execute(conn, "SELECT 1"));
+}
+
+test "c api string and blob ownership" {
+    const testing = std.testing;
+
+    const conn = zqlite_open(":memory:");
+    try testing.expect(conn != null);
+    defer zqlite_close(conn);
+
+    try testing.expectEqual(ZQLITE_OK, zqlite_execute(conn, "CREATE TABLE ownership (id INTEGER, label TEXT, payload BLOB)"));
+
+    const insert = zqlite_prepare(conn, "INSERT INTO ownership VALUES (?, ?, ?)");
+    try testing.expect(insert != null);
+    defer _ = zqlite_finalize(insert);
+
+    var blob = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+    try testing.expectEqual(ZQLITE_OK, zqlite_bind_int(insert, 0, 1));
+    try testing.expectEqual(ZQLITE_OK, zqlite_bind_text(insert, 1, "owned-text"));
+    try testing.expectEqual(ZQLITE_OK, zqlite_bind_blob(insert, 2, &blob, blob.len));
+    blob = [_]u8{ 0, 0, 0, 0 };
+    try testing.expectEqual(ZQLITE_DONE, zqlite_step(insert));
+
+    const result = zqlite_query(conn, "SELECT label FROM ownership WHERE id = 1");
+    try testing.expect(result != null);
+    defer zqlite_result_free(result);
+    const text_a = zqlite_result_get_text(result, 0, 0) orelse return error.ExpectedText;
+    const text_b = zqlite_result_get_text(result, 0, 0) orelse return error.ExpectedText;
+    defer zqlite_free_string(text_a);
+    defer zqlite_free_string(text_b);
+    try testing.expect(text_a != text_b);
+    try testing.expectEqualStrings("owned-text", std.mem.span(text_a));
+    try testing.expectEqualStrings("owned-text", std.mem.span(text_b));
+
+    const select_blob = zqlite_prepare(conn, "SELECT payload FROM ownership WHERE id = ?");
+    try testing.expect(select_blob != null);
+    defer _ = zqlite_finalize(select_blob);
+    try testing.expectEqual(ZQLITE_OK, zqlite_bind_int(select_blob, 0, 1));
+    try testing.expectEqual(ZQLITE_ROW, zqlite_step(select_blob));
+    try testing.expectEqual(ZQLITE_TYPE_BLOB, zqlite_column_type(select_blob, 0));
+    try testing.expectEqual(@as(usize, 4), zqlite_column_bytes(select_blob, 0));
+    const blob_ptr = zqlite_column_blob(select_blob, 0) orelse return error.ExpectedBlob;
+    const blob_bytes = @as([*]const u8, @ptrCast(blob_ptr))[0..4];
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xaa, 0xbb, 0xcc, 0xdd }, blob_bytes);
+    try testing.expectEqual(ZQLITE_OK, zqlite_reset(select_blob));
+    try testing.expect(zqlite_column_blob(select_blob, 0) == null);
+    try testing.expectEqual(@as(usize, 0), zqlite_column_bytes(select_blob, 0));
+}
+
+test "c api allocation failures are reported safely" {
+    const testing = std.testing;
+
+    const saved_allocator = c_allocator;
+    var failing_alloc = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    c_allocator = failing_alloc.allocator();
+    defer c_allocator = saved_allocator;
+
+    try testing.expect(zqlite_open(":memory:") == null);
+    try testing.expect(zqlite_pq_diagnostics_json() == null);
 }
 
 test "c api pq capability exports" {

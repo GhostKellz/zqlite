@@ -129,6 +129,10 @@ pub const Shell = struct {
             try writeAll("ZQLite ");
             try writeAll(version.VERSION_STRING);
             try writeAll("\n");
+        } else if (std.mem.eql(u8, command, ".pq")) {
+            try printPQStatus(false, self.allocator);
+        } else if (std.mem.eql(u8, command, ".pq json")) {
+            try printPQStatus(true, self.allocator);
         } else if (std.mem.startsWith(u8, command, ".open ")) {
             const path = std.mem.trim(u8, command[6..], " \t");
             try self.openDatabase(path);
@@ -377,6 +381,7 @@ pub const Shell = struct {
             \\  .schema [table]       Show CREATE statements
             \\  .databases            Show connected databases
             \\  .version              Show version information
+            \\  .pq [json]            Show PQC capability diagnostics
             \\  .quit, .exit          Exit the shell
             \\  <SQL>                 Execute SQL statement
             \\
@@ -484,6 +489,8 @@ pub fn executeCommand(allocator: std.mem.Allocator, args: []const []const u8) !v
     var sql_command: ?[]const u8 = null;
     var show_version = false;
     var show_help = false;
+    var show_pq_status = false;
+    var pq_status_json = false;
 
     var i: usize = 1; // Skip program name
     while (i < args.len) : (i += 1) {
@@ -493,6 +500,11 @@ pub fn executeCommand(allocator: std.mem.Allocator, args: []const []const u8) !v
             show_version = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             show_help = true;
+        } else if (std.mem.eql(u8, arg, "--pq-status")) {
+            show_pq_status = true;
+        } else if (std.mem.eql(u8, arg, "--pq-status=json") or std.mem.eql(u8, arg, "--pq-json")) {
+            show_pq_status = true;
+            pq_status_json = true;
         } else if (std.mem.eql(u8, arg, "--sql") or std.mem.eql(u8, arg, "-c")) {
             if (i + 1 < args.len) {
                 i += 1;
@@ -525,6 +537,8 @@ pub fn executeCommand(allocator: std.mem.Allocator, args: []const []const u8) !v
             \\  -v, --version       Show version information
             \\  -d, --db <file>     Database file to open
             \\  -c, --sql <sql>     Execute SQL command and exit
+            \\  --pq-status[=json]  Show PQC capability diagnostics and exit
+            \\  --pq-json           Alias for --pq-status=json
             \\
             \\Examples:
             \\  zqlite                          Start interactive shell with :memory:
@@ -533,6 +547,11 @@ pub fn executeCommand(allocator: std.mem.Allocator, args: []const []const u8) !v
             \\  zqlite mydb.db -c "SELECT *"    Execute SQL on database file
             \\
         );
+        return;
+    }
+
+    if (show_pq_status) {
+        try printPQStatus(pq_status_json, allocator);
         return;
     }
 
@@ -588,4 +607,38 @@ pub fn executeCommand(allocator: std.mem.Allocator, args: []const []const u8) !v
             };
         }
     }
+}
+
+fn printPQStatus(json: bool, allocator: std.mem.Allocator) !void {
+    const pq = zqlite.getPQCapability();
+    if (json) {
+        const diagnostics = try zqlite.pqDiagnosticsJson(allocator, pq);
+        defer allocator.free(diagnostics);
+        try writeAll(diagnostics);
+        try writeAll("\n");
+        return;
+    }
+
+    try writeAll("Post-Quantum Crypto Status:\n");
+    try writeAll("  State: ");
+    try writeAll(@tagName(pq.state));
+    try writeAll("\n  Backend: ");
+    try writeAll(@tagName(pq.backend));
+    try writeAll("\n  Provider: ");
+    try writeAll(pq.providerName());
+    try writeAll("\n  Requested: ");
+    try writeAll(@tagName(pq.requested_mode));
+    try writeAll("\n  Available: ");
+    try writeAll(if (pq.isAvailable()) "true" else "false");
+    try writeAll("\n  Production ready: ");
+    try writeAll(if (pq.production_ready) "true" else "false");
+    try writeAll("\n  Fallback allowed: ");
+    try writeAll(if (pq.fallback_allowed) "true" else "false");
+    try writeAll("\n  Reason: ");
+    try writeAll(pq.reasonTag());
+    try writeAll("\n  Algorithms: ");
+    try writeAll(pq.algorithmSummary());
+    try writeAll("\n  Status: ");
+    try writeAll(pq.status_message);
+    try writeAll("\n");
 }

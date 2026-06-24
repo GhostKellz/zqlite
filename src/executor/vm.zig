@@ -15,6 +15,8 @@ pub const VirtualMachine = struct {
     cte_context: std.StringHashMap(CTEResult),
     /// Current table being scanned (for column name resolution in projection)
     current_table: ?*storage.Table,
+    /// Current projected column names for CTE scans.
+    current_column_names: ?[][]const u8,
     /// Table alias map: maps alias -> actual table name
     table_aliases: std.StringHashMap([]const u8),
     /// Maps alias -> Table pointer for column resolution
@@ -72,6 +74,7 @@ pub const VirtualMachine = struct {
             .function_evaluator = functions.FunctionEvaluator.init(connection.allocator),
             .cte_context = std.StringHashMap(CTEResult).init(connection.allocator),
             .current_table = null,
+            .current_column_names = null,
             .table_aliases = std.StringHashMap([]const u8).init(connection.allocator),
             .alias_to_table = std.StringHashMap(*storage.Table).init(connection.allocator),
             .alias_column_offset = std.StringHashMap(usize).init(connection.allocator),
@@ -147,6 +150,46 @@ pub const VirtualMachine = struct {
         return .{ .name = try self.connection.allocator.dupe(u8, table_str), .alias = null };
     }
 
+    const ResolvedTableRef = struct {
+        connection: *db.Connection,
+        table_name: []const u8,
+    };
+
+    const QualifiedName = struct {
+        schema_name: ?[]const u8,
+        name: []const u8,
+    };
+
+    fn splitQualifiedName(_: *Self, qualified_name: []const u8) !QualifiedName {
+        const dot = std.mem.indexOfScalar(u8, qualified_name, '.') orelse return .{
+            .schema_name = null,
+            .name = qualified_name,
+        };
+
+        const schema_name = qualified_name[0..dot];
+        const local_name = qualified_name[dot + 1 ..];
+        if (schema_name.len == 0 or local_name.len == 0) return error.InvalidSchemaQualifiedName;
+        return .{ .schema_name = schema_name, .name = local_name };
+    }
+
+    fn resolveSchemaConnection(self: *Self, schema_name: []const u8) !*db.Connection {
+        if (std.mem.eql(u8, schema_name, "main")) return self.connection;
+        return self.connection.getAttachedDatabase(schema_name) orelse error.SchemaNotFound;
+    }
+
+    fn resolveTableRef(self: *Self, qualified_name: []const u8) !ResolvedTableRef {
+        const parts = try self.splitQualifiedName(qualified_name);
+        const schema_name = parts.schema_name orelse return .{
+            .connection = self.connection,
+            .table_name = parts.name,
+        };
+
+        return .{
+            .connection = try self.resolveSchemaConnection(schema_name),
+            .table_name = parts.name,
+        };
+    }
+
     /// Clear all CTE results
     fn clearCTEContext(self: *Self) void {
         var iter = self.cte_context.iterator();
@@ -164,8 +207,10 @@ pub const VirtualMachine = struct {
             .affected_rows = 0,
             .connection = self.connection,
         };
+        errdefer result.deinit();
 
         for (plan.steps) |*step| {
+            try self.connection.checkOperation();
             try self.executeStep(step, &result);
         }
 
@@ -184,11 +229,14 @@ pub const VirtualMachine = struct {
 
     /// Execute a single step
     fn executeStep(self: *Self, step: *planner.ExecutionStep, result: *ExecutionResult) !void {
+        try self.connection.checkOperation();
+        try self.connection.recordVmStep();
         switch (step.*) {
             .TableScan => |*scan| try self.executeTableScan(scan, result),
             .IndexScan => |*scan| try self.executeIndexScan(scan, result),
             .Filter => |*filter| try self.executeFilter(filter, result),
             .Project => |*project| try self.executeProject(project, result),
+            .Sort => |*sort| try self.executeSort(sort, result),
             .Limit => |*limit| try self.executeLimit(limit, result),
             .Insert => |*insert| try self.executeInsert(insert, result),
             .CreateTable => |*create| try self.executeCreateTable(create, result),
@@ -209,6 +257,8 @@ pub const VirtualMachine = struct {
             .DropTable => |*drop_tbl| try self.executeDropTable(drop_tbl, result),
             .CreateCTE => |*cte| try self.executeCreateCTE(cte, result),
             .Pragma => |*pragma| try self.executePragma(pragma, result),
+            .Analyze => |*analyze| try self.executeAnalyze(analyze, result),
+            .Vacuum => try self.executeVacuum(result),
             .Explain => |*explain| try self.executeExplain(explain, result),
             .SetOperation => |*set_op| try self.executeSetOperation(set_op, result),
             .Window => |*window| try self.executeWindow(window, result),
@@ -218,6 +268,8 @@ pub const VirtualMachine = struct {
             .Detach => |*detach| try self.executeDetach(detach, result),
             .CreateVirtualTable => |*create_vt| try self.executeCreateVirtualTable(create_vt, result),
         }
+        try self.connection.recordResultRows(result.rows.items.len);
+        try self.connection.recordAffectedRows(result.affected_rows);
     }
 
     /// Execute CTE creation - stores the CTE result for later reference
@@ -231,6 +283,7 @@ pub const VirtualMachine = struct {
 
         // Execute the CTE's subquery steps (non-recursive since CTEs can't contain CTEs in subquery)
         for (cte.subquery_steps) |*step| {
+            try self.connection.checkOperation();
             try self.executeNonCTEStep(step, &cte_result);
         }
 
@@ -269,11 +322,14 @@ pub const VirtualMachine = struct {
 
     /// Execute a step that is not a CTE (used by CTE execution to avoid recursion)
     fn executeNonCTEStep(self: *Self, step: *planner.ExecutionStep, result: *ExecutionResult) !void {
+        try self.connection.checkOperation();
+        try self.connection.recordVmStep();
         switch (step.*) {
             .TableScan => |*scan| try self.executeTableScan(scan, result),
             .IndexScan => |*scan| try self.executeIndexScan(scan, result),
             .Filter => |*filter| try self.executeFilter(filter, result),
             .Project => |*project| try self.executeProject(project, result),
+            .Sort => |*sort| try self.executeSort(sort, result),
             .Limit => |*limit| try self.executeLimit(limit, result),
             .Insert => |*insert| try self.executeInsert(insert, result),
             .CreateTable => |*create| try self.executeCreateTable(create, result),
@@ -297,6 +353,8 @@ pub const VirtualMachine = struct {
                 return error.NestedCTENotSupported;
             },
             .Pragma => |*pragma| try self.executePragma(pragma, result),
+            .Analyze => |*analyze| try self.executeAnalyze(analyze, result),
+            .Vacuum => try self.executeVacuum(result),
             .Explain => |*explain| try self.executeExplain(explain, result),
             .SetOperation => {
                 // Nested set operations should be executed via executeStep
@@ -309,6 +367,8 @@ pub const VirtualMachine = struct {
             .Detach => |*detach| try self.executeDetach(detach, result),
             .CreateVirtualTable => |*create_vt| try self.executeCreateVirtualTable(create_vt, result),
         }
+        try self.connection.recordResultRows(result.rows.items.len);
+        try self.connection.recordAffectedRows(result.affected_rows);
     }
 
     /// Execute table scan
@@ -320,14 +380,20 @@ pub const VirtualMachine = struct {
 
         // First check if this is a CTE reference
         if (self.cte_context.get(actual_table_name)) |cte_result| {
+            self.current_table = null;
+            self.current_column_names = cte_result.column_names;
+
             // Use CTE results instead of table
             for (cte_result.rows) |row| {
+                try self.connection.checkOperation();
+                try self.connection.recordRowsScanned(1);
                 // Clone the row for the result
                 var cloned_values = try self.connection.allocator.alloc(storage.Value, row.values.len);
                 for (row.values, 0..) |value, j| {
                     cloned_values[j] = try value.clone(self.connection.allocator);
                 }
                 try result.rows.append(self.connection.allocator, storage.Row{ .values = cloned_values });
+                try self.connection.recordResultRows(result.rows.items.len);
             }
             if (parsed.alias) |alias| {
                 self.connection.allocator.free(alias);
@@ -336,12 +402,15 @@ pub const VirtualMachine = struct {
         }
 
         // Executing table scan on actual table
-        const table = self.connection.storage_engine.getTable(actual_table_name) orelse {
+        const resolved = try self.resolveTableRef(actual_table_name);
+        const table = resolved.connection.storage_engine.getTable(resolved.table_name) orelse {
             if (parsed.alias) |alias| {
                 self.connection.allocator.free(alias);
             }
             return error.TableNotFound;
         };
+
+        self.current_column_names = null;
 
         // Register table alias if present
         if (parsed.alias) |alias| {
@@ -351,17 +420,28 @@ pub const VirtualMachine = struct {
 
         // Also register the table name itself for "tablename.column" references
         try self.registerTableAlias(actual_table_name, table);
+        if (!std.mem.eql(u8, actual_table_name, resolved.table_name)) {
+            try self.registerTableAlias(resolved.table_name, table);
+        }
 
         // Track the current table for column name resolution in projection
         self.current_table = table;
 
         const rows = try table.select(self.connection.allocator);
+        var transferred_rows: usize = 0;
         defer {
-            // Only free the rows array itself - the individual rows are now owned by result
+            for (rows[transferred_rows..]) |row| {
+                for (row.values) |value| {
+                    value.deinit(self.connection.allocator);
+                }
+                self.connection.allocator.free(row.values);
+            }
             self.connection.allocator.free(rows);
         }
 
-        for (rows) |row| {
+        for (rows, 0..) |row, row_index| {
+            try self.connection.checkOperation();
+            try self.connection.recordRowsScanned(1);
             // The row is already properly cloned by btree.selectAll - use it directly
             // Using pre-cloned row from btree
             for (row.values) |value| {
@@ -373,6 +453,8 @@ pub const VirtualMachine = struct {
                 }
             }
             try result.rows.append(self.connection.allocator, row);
+            transferred_rows = row_index + 1;
+            try self.connection.recordResultRows(result.rows.items.len);
             // Row appended to result
         }
     }
@@ -380,13 +462,14 @@ pub const VirtualMachine = struct {
     /// Execute index scan (uses index for direct lookup instead of full table scan)
     fn executeIndexScan(self: *Self, scan: *planner.IndexScanStep, result: *ExecutionResult) !void {
         // Get the table
-        const table = self.connection.storage_engine.getTable(scan.table_name) orelse {
+        const resolved = try self.resolveTableRef(scan.table_name);
+        const table = resolved.connection.storage_engine.getTable(resolved.table_name) orelse {
             return error.TableNotFound;
         };
         self.current_table = table;
 
         // Try to use the index for lookup
-        if (self.connection.storage_engine.getIndex(scan.index_name)) |index| {
+        if (resolved.connection.storage_engine.getIndex(scan.index_name)) |index| {
             // Convert lookup value to index key
             const key = self.valueToIndexKey(scan.lookup_value);
 
@@ -394,6 +477,14 @@ pub const VirtualMachine = struct {
             if (try index.search(key)) |row_id| {
                 // Get the row from the table
                 if (try table.getRow(@intCast(row_id))) |row| {
+                    try self.connection.recordRowsScanned(1);
+                    defer {
+                        for (row.values) |value| {
+                            value.deinit(self.connection.allocator);
+                        }
+                        self.connection.allocator.free(row.values);
+                    }
+
                     // Clone the row values for the result
                     var values = try self.connection.allocator.alloc(storage.Value, row.values.len);
                     errdefer self.connection.allocator.free(values);
@@ -410,6 +501,7 @@ pub const VirtualMachine = struct {
                         cloned_count = i + 1;
                     }
                     try result.rows.append(self.connection.allocator, storage.Row{ .values = values });
+                    try self.connection.recordResultRows(result.rows.items.len);
                 }
             }
         } else {
@@ -441,6 +533,8 @@ pub const VirtualMachine = struct {
         // Full table scan fallback - iterate through all rows in the table
         var row_id: i64 = 1;
         while (row_id <= @as(i64, @intCast(table.row_count))) : (row_id += 1) {
+            try self.connection.checkOperation();
+            try self.connection.recordRowsScanned(1);
             if (try table.getRow(row_id)) |row| {
                 var values = try self.connection.allocator.alloc(storage.Value, row.values.len);
                 errdefer self.connection.allocator.free(values);
@@ -457,6 +551,7 @@ pub const VirtualMachine = struct {
                     cloned_count = i + 1;
                 }
                 try result.rows.append(self.connection.allocator, storage.Row{ .values = values });
+                try self.connection.recordResultRows(result.rows.items.len);
             }
         }
     }
@@ -466,6 +561,8 @@ pub const VirtualMachine = struct {
         var filtered_rows: std.ArrayListUnmanaged(storage.Row) = .empty;
 
         for (result.rows.items) |row| {
+            try self.connection.checkOperation();
+            try self.connection.recordRowsScanned(1);
             if (try self.evaluateCondition(&filter.condition, &row)) {
                 try filtered_rows.append(self.connection.allocator, row);
             } else {
@@ -487,6 +584,8 @@ pub const VirtualMachine = struct {
         var filtered_rows: std.ArrayListUnmanaged(storage.Row) = .empty;
 
         for (result.rows.items) |row| {
+            try self.connection.checkOperation();
+            try self.connection.recordRowsScanned(1);
             if (try self.evaluateCondition(&having.condition, &row)) {
                 try filtered_rows.append(self.connection.allocator, row);
             } else {
@@ -515,6 +614,7 @@ pub const VirtualMachine = struct {
         defer seen.deinit();
 
         for (result.rows.items) |row| {
+            try self.connection.checkOperation();
             // Build a hash key for the row by concatenating all values
             const row_key = try self.buildRowKey(&row);
             defer self.connection.allocator.free(row_key);
@@ -632,6 +732,7 @@ pub const VirtualMachine = struct {
         var projected_rows: std.ArrayListUnmanaged(storage.Row) = .empty;
 
         for (result.rows.items) |original_row| {
+            try self.connection.checkOperation();
             // Track which original indices we're using (sized based on actual row, not table schema)
             var used_indices = try self.connection.allocator.alloc(bool, original_row.values.len);
             defer self.connection.allocator.free(used_indices);
@@ -687,6 +788,13 @@ pub const VirtualMachine = struct {
                     // Simple column name - look up in current table
                     for (t.schema.columns, 0..) |col, idx| {
                         if (std.mem.eql(u8, col.name, col_name)) {
+                            col_idx = idx;
+                            break;
+                        }
+                    }
+                } else if (self.current_column_names) |columns| {
+                    for (columns, 0..) |column, idx| {
+                        if (std.mem.eql(u8, column, col_name)) {
                             col_idx = idx;
                             break;
                         }
@@ -1027,6 +1135,17 @@ pub const VirtualMachine = struct {
         };
     }
 
+    fn computeGeneratedColumns(self: *Self, table: *storage.Table, row_values: []storage.Value) !void {
+        for (table.schema.columns, 0..) |column, idx| {
+            const generated = column.generated orelse continue;
+            if (!generated.stored) return error.VirtualGeneratedColumnUnsupported;
+
+            const computed = try self.evaluateUpdateExpression(generated.expression, row_values, table);
+            row_values[idx].deinit(self.connection.allocator);
+            row_values[idx] = computed;
+        }
+    }
+
     /// Perform arithmetic operation on two values
     fn performArithmetic(self: *Self, left: storage.Value, op: ast.ArithmeticOp, right: storage.Value) !storage.Value {
         _ = self;
@@ -1089,9 +1208,15 @@ pub const VirtualMachine = struct {
         }
     }
 
+    fn executeSort(self: *Self, sort: *planner.SortStep, result: *ExecutionResult) !void {
+        try self.sortResultRows(result, sort.order_by);
+    }
+
     /// Execute insert
     fn executeInsert(self: *Self, insert: *planner.InsertStep, result: *ExecutionResult) !void {
-        const table = self.connection.storage_engine.getTable(insert.table_name) orelse {
+        const resolved = try self.resolveTableRef(insert.table_name);
+        try resolved.connection.ensureWritable();
+        const table = resolved.connection.storage_engine.getTable(resolved.table_name) orelse {
             return error.TableNotFound;
         };
 
@@ -1100,6 +1225,8 @@ pub const VirtualMachine = struct {
         self.current_table = table;
 
         for (insert.values) |row_values| {
+            try self.connection.checkOperation();
+            try self.connection.recordRowsScanned(1);
             // Build final values array for all table columns
             var final_values = try self.connection.allocator.alloc(storage.Value, table.schema.columns.len);
             var values_initialized: usize = 0;
@@ -1131,6 +1258,7 @@ pub const VirtualMachine = struct {
                     var table_col_idx: ?usize = null;
                     for (table.schema.columns, 0..) |table_col, table_idx| {
                         if (std.mem.eql(u8, table_col.name, col_name)) {
+                            if (table_col.generated != null) return error.CannotWriteGeneratedColumn;
                             table_col_idx = table_idx;
                             break;
                         }
@@ -1149,23 +1277,37 @@ pub const VirtualMachine = struct {
                 // INSERT without column specification: INSERT INTO table VALUES (...)
                 // Values are provided in table column order. FTS virtual tables keep
                 // an implicit rowid backing column, so user-provided VALUES start at 1.
-                const column_offset: usize = if (self.connection.storage_engine.isFTSTable(insert.table_name)) 1 else 0;
-                for (row_values, 0..) |value, i| {
-                    const target_idx = i + column_offset;
-                    if (target_idx >= table.schema.columns.len) {
-                        return error.TooManyValues;
-                    }
-                    // resolveValue already returns owned/cloned values
-                    const resolved_value = try self.resolveValue(value);
+                var input_idx: usize = 0;
+                const skip_fts_rowid = resolved.connection.storage_engine.isFTSTable(resolved.table_name);
+                for (table.schema.columns, 0..) |column, target_idx| {
+                    if (skip_fts_rowid and target_idx == 0 and column.is_primary_key) continue;
+                    if (column.generated != null) continue;
+                    if (input_idx >= row_values.len) break;
+
+                    const resolved_value = try self.resolveValue(row_values[input_idx]);
                     final_values[target_idx] = resolved_value;
                     values_initialized = target_idx + 1;
+                    input_idx += 1;
+                }
+                if (input_idx != row_values.len) {
+                    return error.TooManyValues;
+                }
+                var required_input_count: usize = 0;
+                for (table.schema.columns, 0..) |column, target_idx| {
+                    if (skip_fts_rowid and target_idx == 0 and column.is_primary_key) continue;
+                    if (column.generated != null) continue;
+                    required_input_count += 1;
+                }
+                if (row_values.len > required_input_count) {
+                    return error.TooManyValues;
                 }
             }
 
             // Apply default values for columns that weren't specified
             for (table.schema.columns, 0..) |column, i| {
+                if (column.generated != null) continue;
                 if (final_values[i] == .Null) {
-                    if (self.connection.storage_engine.isFTSTable(insert.table_name) and i == 0 and column.is_primary_key) {
+                    if (resolved.connection.storage_engine.isFTSTable(resolved.table_name) and i == 0 and column.is_primary_key) {
                         final_values[i] = storage.Value{ .Integer = @intCast(table.row_count) };
                         values_initialized = @max(values_initialized, i + 1);
                         continue;
@@ -1183,10 +1325,13 @@ pub const VirtualMachine = struct {
                 }
             }
 
+            try self.computeGeneratedColumns(table, final_values);
+            values_initialized = final_values.len;
+
             try self.validateCheckConstraints(table, final_values);
             try self.validateNotNullConstraints(table, final_values);
             try self.validateForeignKeyReferences(table, final_values);
-            try self.connection.storage_engine.checkUniqueIndexes(table, final_values);
+            try resolved.connection.storage_engine.checkUniqueIndexes(table, final_values);
 
             // Handle ON CONFLICT - check for primary key conflict before insert
             if (insert.on_conflict != null) {
@@ -1287,9 +1432,9 @@ pub const VirtualMachine = struct {
 
                                     const new_row_id: i64 = @intCast(table.row_count);
 
-                                    if (self.connection.in_transaction) {
+                                    if (resolved.connection.in_transaction) {
                                         const table_name_copy = try self.connection.allocator.dupe(u8, insert.table_name);
-                                        try self.connection.logUndo(db.UndoEntry{
+                                        try resolved.connection.logUndo(db.UndoEntry{
                                             .operation = .Update,
                                             .table_name = table_name_copy,
                                             .row_id = @intCast(conflict_row_key.?),
@@ -1300,6 +1445,7 @@ pub const VirtualMachine = struct {
 
                                     try table.updateRow(self.connection.allocator, @intCast(conflict_row_key.?), replacement_values);
                                     result.affected_rows += 1;
+                                    try self.connection.recordAffectedRows(result.affected_rows);
 
                                     // Handle RETURNING for upserted row
                                     if (insert.returning_columns) |ret_cols| {
@@ -1323,9 +1469,9 @@ pub const VirtualMachine = struct {
             ownership_transferred = true; // Table now owns final_values
 
             // Log undo entry if in transaction
-            if (self.connection.in_transaction) {
+            if (resolved.connection.in_transaction) {
                 const table_name_copy = try self.connection.allocator.dupe(u8, insert.table_name);
-                try self.connection.logUndo(db.UndoEntry{
+                try resolved.connection.logUndo(db.UndoEntry{
                     .operation = .Insert,
                     .table_name = table_name_copy,
                     .row_id = row_id,
@@ -1334,7 +1480,7 @@ pub const VirtualMachine = struct {
                 });
             }
 
-            if (self.connection.storage_engine.getFTSIndex(insert.table_name)) |fts_index| {
+            if (resolved.connection.storage_engine.getFTSIndex(resolved.table_name)) |fts_index| {
                 if (try table.btree.search(@intCast(row_id))) |inserted_row| {
                     defer {
                         for (inserted_row.values) |value| {
@@ -1349,6 +1495,7 @@ pub const VirtualMachine = struct {
             }
 
             result.affected_rows += 1;
+            try self.connection.recordAffectedRows(result.affected_rows);
 
             // Handle RETURNING clause - add inserted row to result
             if (insert.returning_columns) |ret_cols| {
@@ -1366,11 +1513,11 @@ pub const VirtualMachine = struct {
         }
 
         if (result.affected_rows > 0) {
-            try self.connection.storage_engine.refreshIndexesForTable(insert.table_name);
+            try resolved.connection.storage_engine.refreshIndexesForTable(resolved.table_name);
         }
 
         // Invalidate query result cache for this table
-        self.connection.invalidateResultCache(insert.table_name);
+        resolved.connection.invalidateResultCache(resolved.table_name);
     }
 
     /// Helper to add a row to result based on RETURNING columns
@@ -1640,9 +1787,11 @@ pub const VirtualMachine = struct {
     /// Execute create table
     fn executeCreateTable(self: *Self, create: *planner.CreateTableStep, result: *ExecutionResult) !void {
         try self.rejectSchemaChangeInSavepoint();
+        const resolved = try self.resolveTableRef(create.table_name);
+        try resolved.connection.ensureWritable();
 
         // Check if table exists and if_not_exists is true
-        if (create.if_not_exists and self.connection.storage_engine.getTable(create.table_name) != null) {
+        if (create.if_not_exists and resolved.connection.storage_engine.getTable(resolved.table_name) != null) {
             return; // Table already exists, skip creation
         }
 
@@ -1656,6 +1805,7 @@ pub const VirtualMachine = struct {
                     for (cloned_columns[0..i]) |c| {
                         self.connection.allocator.free(c.name);
                         if (c.default_value) |dv| dv.deinit(self.connection.allocator);
+                        if (c.generated) |generated| generated.deinit(self.connection.allocator);
                     }
                     self.connection.allocator.free(cloned_columns);
                     return error.OutOfMemory;
@@ -1670,6 +1820,21 @@ pub const VirtualMachine = struct {
                         for (cloned_columns[0..i]) |c| {
                             self.connection.allocator.free(c.name);
                             if (c.default_value) |dv| dv.deinit(self.connection.allocator);
+                            if (c.generated) |generated| generated.deinit(self.connection.allocator);
+                        }
+                        self.connection.allocator.free(cloned_columns);
+                        return error.OutOfMemory;
+                    }
+                else
+                    null,
+                .generated = if (column.generated) |generated|
+                    generated.clone(self.connection.allocator) catch {
+                        self.connection.allocator.free(cloned_columns[i].name);
+                        if (cloned_columns[i].default_value) |dv| dv.deinit(self.connection.allocator);
+                        for (cloned_columns[0..i]) |c| {
+                            self.connection.allocator.free(c.name);
+                            if (c.default_value) |dv| dv.deinit(self.connection.allocator);
+                            if (c.generated) |generated_column| generated_column.deinit(self.connection.allocator);
                         }
                         self.connection.allocator.free(cloned_columns);
                         return error.OutOfMemory;
@@ -1693,18 +1858,18 @@ pub const VirtualMachine = struct {
             schema.deinit(self.connection.allocator);
         }
 
-        try self.connection.storage_engine.createTable(create.table_name, schema);
-        self.connection.invalidateResultCache(create.table_name);
+        try resolved.connection.storage_engine.createTable(resolved.table_name, schema);
+        resolved.connection.invalidateResultCache(resolved.table_name);
 
         // Enforce inline UNIQUE column constraints by auto-creating a unique index.
         // The index is persisted in the catalog, so the constraint survives reopen.
         for (create.columns) |column| {
             if (!column.is_unique or column.is_primary_key) continue;
-            try self.createAutoUniqueIndex(create.table_name, column.name);
+            try self.createAutoUniqueIndexForConnection(resolved.connection, resolved.table_name, column.name);
         }
 
         for (create.unique_constraints, 0..) |unique, i| {
-            try self.createAutoUniqueIndexForColumns(create.table_name, unique.columns, i + 1);
+            try self.createAutoUniqueIndexForColumnsOnConnection(resolved.connection, resolved.table_name, unique.columns, i + 1);
         }
 
         result.affected_rows = 1;
@@ -1714,6 +1879,10 @@ pub const VirtualMachine = struct {
     /// constraint. The index name mirrors SQLite's `sqlite_autoindex_*` scheme so
     /// it is recognizable and unlikely to collide with user index names.
     fn createAutoUniqueIndex(self: *Self, table_name: []const u8, column_name: []const u8) !void {
+        return self.createAutoUniqueIndexForConnection(self.connection, table_name, column_name);
+    }
+
+    fn createAutoUniqueIndexForConnection(self: *Self, target_conn: *db.Connection, table_name: []const u8, column_name: []const u8) !void {
         const index_name = try std.fmt.allocPrint(
             self.connection.allocator,
             "sqlite_autoindex_{s}_{s}",
@@ -1722,13 +1891,17 @@ pub const VirtualMachine = struct {
         defer self.connection.allocator.free(index_name);
 
         var columns = [_][]const u8{column_name};
-        try self.connection.storage_engine.createIndex(index_name, table_name, columns[0..], true);
+        try target_conn.storage_engine.createIndex(index_name, table_name, columns[0..], true);
     }
 
     /// Create a deterministic unique index backing a table-level UNIQUE(...)
     /// constraint. The index is persisted in the catalog with the rest of the
     /// table metadata, so enforcement survives reopen.
     fn createAutoUniqueIndexForColumns(self: *Self, table_name: []const u8, column_names: [][]const u8, ordinal: usize) !void {
+        return self.createAutoUniqueIndexForColumnsOnConnection(self.connection, table_name, column_names, ordinal);
+    }
+
+    fn createAutoUniqueIndexForColumnsOnConnection(self: *Self, target_conn: *db.Connection, table_name: []const u8, column_names: [][]const u8, ordinal: usize) !void {
         const index_name = try std.fmt.allocPrint(
             self.connection.allocator,
             "sqlite_autoindex_{s}_unique_{d}",
@@ -1736,12 +1909,14 @@ pub const VirtualMachine = struct {
         );
         defer self.connection.allocator.free(index_name);
 
-        try self.connection.storage_engine.createIndex(index_name, table_name, column_names, true);
+        try target_conn.storage_engine.createIndex(index_name, table_name, column_names, true);
     }
 
     /// Execute update using logical updates with transaction undo support
     fn executeUpdate(self: *Self, update: *planner.UpdateStep, result: *ExecutionResult) !void {
-        const table = self.connection.storage_engine.getTable(update.table_name) orelse {
+        const resolved = try self.resolveTableRef(update.table_name);
+        try resolved.connection.ensureWritable();
+        const table = resolved.connection.storage_engine.getTable(resolved.table_name) orelse {
             return error.TableNotFound;
         };
 
@@ -1763,6 +1938,8 @@ pub const VirtualMachine = struct {
         var updated_count: u32 = 0;
 
         for (all_rows) |item| {
+            try self.connection.checkOperation();
+            try self.connection.recordRowsScanned(1);
             // Check if row matches condition
             var matches = true;
             if (update.condition) |condition| {
@@ -1790,6 +1967,7 @@ pub const VirtualMachine = struct {
                     var col_idx: ?usize = null;
                     for (table.schema.columns, 0..) |col, idx| {
                         if (std.mem.eql(u8, col.name, assignment.column)) {
+                            if (col.generated != null) return error.CannotWriteGeneratedColumn;
                             col_idx = idx;
                             break;
                         }
@@ -1802,6 +1980,8 @@ pub const VirtualMachine = struct {
                         }
                     }
                 }
+
+                try self.computeGeneratedColumns(table, updated_values);
 
                 var returning_values: ?[]storage.Value = null;
                 errdefer if (returning_values) |values| {
@@ -1835,9 +2015,9 @@ pub const VirtualMachine = struct {
                 try self.applyParentForeignKeyUpdateActions(table, item.row.values, updated_values);
 
                 // Log undo entry before updating (if in transaction)
-                if (self.connection.in_transaction) {
+                if (resolved.connection.in_transaction) {
                     const table_name_copy = try self.connection.allocator.dupe(u8, update.table_name);
-                    try self.connection.logUndo(db.UndoEntry{
+                    try resolved.connection.logUndo(db.UndoEntry{
                         .operation = .Update,
                         .table_name = table_name_copy,
                         .row_id = item.key, // old row_id to restore
@@ -1849,6 +2029,7 @@ pub const VirtualMachine = struct {
                 // Perform logical update (marks old as deleted, inserts new)
                 try table.updateRow(self.connection.allocator, item.key, updated_values);
                 updated_count += 1;
+                try self.connection.recordAffectedRows(updated_count);
 
                 // Handle RETURNING clause - return the updated row values
                 if (update.returning_columns) |ret_cols| {
@@ -1865,16 +2046,18 @@ pub const VirtualMachine = struct {
         result.affected_rows = updated_count;
 
         if (updated_count > 0) {
-            try self.connection.storage_engine.refreshIndexesForTable(update.table_name);
+            try resolved.connection.storage_engine.refreshIndexesForTable(resolved.table_name);
         }
 
         // Invalidate query result cache for this table
-        self.connection.invalidateResultCache(update.table_name);
+        resolved.connection.invalidateResultCache(resolved.table_name);
     }
 
     /// Execute delete using logical deletes with transaction undo support
     fn executeDelete(self: *Self, delete: *planner.DeleteStep, result: *ExecutionResult) !void {
-        const table = self.connection.storage_engine.getTable(delete.table_name) orelse {
+        const resolved = try self.resolveTableRef(delete.table_name);
+        try resolved.connection.ensureWritable();
+        const table = resolved.connection.storage_engine.getTable(resolved.table_name) orelse {
             return error.TableNotFound;
         };
 
@@ -1896,6 +2079,8 @@ pub const VirtualMachine = struct {
         var deleted_count: u32 = 0;
 
         for (all_rows) |item| {
+            try self.connection.checkOperation();
+            try self.connection.recordRowsScanned(1);
             // Check if row matches delete condition
             var should_delete = true;
             if (delete.condition) |condition| {
@@ -1911,9 +2096,9 @@ pub const VirtualMachine = struct {
                 }
 
                 // Log undo entry before deleting (if in transaction)
-                if (self.connection.in_transaction) {
+                if (resolved.connection.in_transaction) {
                     const table_name_copy = try self.connection.allocator.dupe(u8, delete.table_name);
-                    try self.connection.logUndo(db.UndoEntry{
+                    try resolved.connection.logUndo(db.UndoEntry{
                         .operation = .Delete,
                         .table_name = table_name_copy,
                         .row_id = item.key,
@@ -1925,17 +2110,18 @@ pub const VirtualMachine = struct {
                 // Perform logical delete
                 try table.delete(self.connection.allocator, item.key);
                 deleted_count += 1;
+                try self.connection.recordAffectedRows(deleted_count);
             }
         }
 
         result.affected_rows = deleted_count;
 
         if (deleted_count > 0) {
-            try self.connection.storage_engine.refreshIndexesForTable(delete.table_name);
+            try resolved.connection.storage_engine.refreshIndexesForTable(resolved.table_name);
         }
 
         // Invalidate query result cache for this table
-        self.connection.invalidateResultCache(delete.table_name);
+        resolved.connection.invalidateResultCache(resolved.table_name);
     }
 
     /// Evaluate a condition against a row
@@ -2112,7 +2298,12 @@ pub const VirtualMachine = struct {
     /// Execute a subquery and return the full result
     fn executeSubquery(self: *Self, subquery: *ast.SelectStatement) anyerror!ExecutionResult {
         // Create execution plan for subquery
-        var query_planner = planner.Planner.init(self.connection.allocator);
+        var query_planner = planner.Planner.initWithContext(
+            self.connection.allocator,
+            &self.connection.aggregate_function_names,
+            self.connection.planner_table_stats.items,
+            self.connection.planner_index_stats.items,
+        );
         var cloned_stmt = try query_planner.cloneSelectStatement(subquery.*);
         defer @constCast(&cloned_stmt).deinit(self.connection.allocator);
 
@@ -2404,9 +2595,65 @@ pub const VirtualMachine = struct {
         } else if (std.mem.eql(u8, lower_name, "trim")) {
             return self.evalTrimWithRow(func_call.arguments, row);
         } else {
+            if (try self.evalJsonFunctionWithRow(lower_name, func_call.arguments, row)) |value| {
+                return value;
+            }
+            if (try self.evalScalarFunctionWithRow(func_call.name, func_call.arguments, row)) |value| {
+                return value;
+            }
             // For other functions, use the regular function evaluator
             return try self.function_evaluator.evaluateFunction(func_call);
         }
+    }
+
+    fn evalScalarFunctionWithRow(self: *Self, name: []const u8, arguments: []ast.FunctionArgument, row: *const storage.Row) anyerror!?storage.Value {
+        const callback = self.connection.getScalarFunction(name) orelse return null;
+
+        var values = try self.connection.allocator.alloc(storage.Value, arguments.len);
+        var resolved: usize = 0;
+        errdefer {
+            for (values[0..resolved]) |value| {
+                value.deinit(self.connection.allocator);
+            }
+            self.connection.allocator.free(values);
+        }
+
+        for (arguments, 0..) |argument, i| {
+            values[i] = try self.resolveArgumentWithRow(argument, row);
+            resolved = i + 1;
+        }
+        defer {
+            for (values) |value| {
+                value.deinit(self.connection.allocator);
+            }
+            self.connection.allocator.free(values);
+        }
+
+        return try callback(self.connection.allocator, values);
+    }
+
+    fn evalJsonFunctionWithRow(self: *Self, lower_name: []const u8, arguments: []ast.FunctionArgument, row: *const storage.Row) anyerror!?storage.Value {
+        var values = try self.connection.allocator.alloc(storage.Value, arguments.len);
+        var resolved: usize = 0;
+        errdefer {
+            for (values[0..resolved]) |value| {
+                value.deinit(self.connection.allocator);
+            }
+            self.connection.allocator.free(values);
+        }
+
+        for (arguments, 0..) |argument, i| {
+            values[i] = try self.resolveArgumentWithRow(argument, row);
+            resolved = i + 1;
+        }
+        defer {
+            for (values) |value| {
+                value.deinit(self.connection.allocator);
+            }
+            self.connection.allocator.free(values);
+        }
+
+        return try self.function_evaluator.evaluateJsonFunctionWithValues(lower_name, values);
     }
 
     /// COALESCE with row context
@@ -2715,6 +2962,17 @@ pub const VirtualMachine = struct {
                         }
                     }
                 }
+                if (self.current_column_names) |columns| {
+                    for (columns, 0..) |column, idx| {
+                        if (std.mem.eql(u8, column, col_name)) {
+                            if (idx < row.values.len) {
+                                return try self.cloneValue(row.values[idx]);
+                            } else {
+                                return storage.Value.Null;
+                            }
+                        }
+                    }
+                }
                 // Fallback: if no table or column not found, return Null
                 return storage.Value.Null;
             },
@@ -2926,9 +3184,11 @@ pub const VirtualMachine = struct {
 
         // Perform join logic based on join type
         for (left_rows) |left_row| {
+            try self.connection.recordRowsScanned(1);
             var matched = false;
 
             for (right_rows) |right_row| {
+                try self.connection.recordRowsScanned(1);
                 // Create combined row for condition evaluation
                 const combined_row = try self.combineRows(&left_row, &right_row);
                 defer {
@@ -2944,6 +3204,7 @@ pub const VirtualMachine = struct {
                     // Add the combined row to results
                     const final_row = try self.combineRows(&left_row, &right_row);
                     try result.rows.append(self.connection.allocator, final_row);
+                    try self.connection.recordResultRows(result.rows.items.len);
                 }
             }
 
@@ -2959,15 +3220,18 @@ pub const VirtualMachine = struct {
 
                 const final_row = try self.combineRows(&left_row, &null_right_row);
                 try result.rows.append(self.connection.allocator, final_row);
+                try self.connection.recordResultRows(result.rows.items.len);
             }
         }
 
         // Handle RIGHT JOIN - iterate from right side
         if (join.join_type == .Right or join.join_type == .Full) {
             for (right_rows) |right_row| {
+                try self.connection.recordRowsScanned(1);
                 var matched = false;
 
                 for (left_rows) |left_row| {
+                    try self.connection.recordRowsScanned(1);
                     const combined_row = try self.combineRows(&left_row, &right_row);
                     defer {
                         for (combined_row.values) |value| {
@@ -2994,6 +3258,7 @@ pub const VirtualMachine = struct {
 
                     const final_row = try self.combineRows(&null_left_row, &right_row);
                     try result.rows.append(self.connection.allocator, final_row);
+                    try self.connection.recordResultRows(result.rows.items.len);
                 }
             }
         }
@@ -3557,6 +3822,10 @@ pub const VirtualMachine = struct {
                         try self.finishAggregateResult(result, result_value);
                     }
                 },
+                .UserDefined => {
+                    const result_value = try self.evaluateUserDefinedAggregate(aggregate_op, result.rows.items, table);
+                    try self.finishAggregateResult(result, result_value);
+                },
             }
         }
     }
@@ -3917,7 +4186,36 @@ pub const VirtualMachine = struct {
                 }
                 return storage.Value{ .Real = sum_sq_diff / @as(f64, @floatFromInt(count)) };
             },
+            .UserDefined => return self.evaluateUserDefinedAggregate(agg, rows, table),
         }
+    }
+
+    fn evaluateUserDefinedAggregate(self: *Self, agg: planner.AggregateOperation, rows: []storage.Row, table: ?*storage.Table) !storage.Value {
+        const function_name = agg.function_name orelse return error.UnknownFunction;
+        const callback = self.connection.getAggregateFunction(function_name) orelse return error.UnknownFunction;
+
+        const col_idx: ?usize = if (agg.column) |col_name| blk: {
+            if (table) |t| {
+                break :blk self.findColumnIndex(t, col_name);
+            }
+            break :blk null;
+        } else null;
+
+        var values = try self.connection.allocator.alloc(storage.Value, rows.len);
+        var cloned: usize = 0;
+        defer {
+            for (values[0..cloned]) |value| {
+                value.deinit(self.connection.allocator);
+            }
+            self.connection.allocator.free(values);
+        }
+
+        for (rows, 0..) |row, i| {
+            values[i] = try self.cloneValue(self.getAggregateColumnValue(row, col_idx));
+            cloned = i + 1;
+        }
+
+        return try callback(self.connection.allocator, values);
     }
 
     /// Get column value for aggregate computation
@@ -3976,14 +4274,22 @@ pub const VirtualMachine = struct {
     fn executeCreateIndex(self: *Self, create_idx: *planner.CreateIndexStep, result: *ExecutionResult) !void {
         _ = result;
         try self.rejectSchemaChangeInSavepoint();
+        const resolved = try self.resolveTableRef(create_idx.table_name);
+        const index_parts = try self.splitQualifiedName(create_idx.index_name);
+        if (index_parts.schema_name) |schema_name| {
+            const index_connection = try self.resolveSchemaConnection(schema_name);
+            if (index_connection != resolved.connection) return error.SchemaMismatch;
+        }
+        try resolved.connection.ensureWritable();
 
         // Check if table exists
-        const table = self.connection.storage_engine.getTable(create_idx.table_name) orelse {
+        const table = resolved.connection.storage_engine.getTable(resolved.table_name) orelse {
             return error.TableNotFound;
         };
 
         // Verify columns exist
         for (create_idx.columns) |col_name| {
+            if (std.mem.eql(u8, col_name, "<expr>")) continue;
             var found = false;
             for (table.schema.columns) |column| {
                 if (std.mem.eql(u8, column.name, col_name)) {
@@ -3997,7 +4303,7 @@ pub const VirtualMachine = struct {
         }
 
         // Check if index already exists
-        if (self.connection.storage_engine.getIndex(create_idx.index_name) != null) {
+        if (resolved.connection.storage_engine.getIndex(index_parts.name) != null) {
             if (create_idx.if_not_exists) {
                 return; // Silently skip if IF NOT EXISTS is specified
             }
@@ -4005,42 +4311,52 @@ pub const VirtualMachine = struct {
         }
 
         // Create the index in storage engine
-        try self.connection.storage_engine.createIndex(
-            create_idx.index_name,
-            create_idx.table_name,
+        try resolved.connection.storage_engine.createIndexEx(
+            index_parts.name,
+            resolved.table_name,
             create_idx.columns,
+            create_idx.expressions,
+            create_idx.where_clause,
             create_idx.unique,
         );
-        self.connection.invalidateResultCache(create_idx.table_name);
+        resolved.connection.invalidateResultCache(resolved.table_name);
     }
 
     /// Execute DROP INDEX
     fn executeDropIndex(self: *Self, drop_idx: *planner.DropIndexStep, result: *ExecutionResult) !void {
         _ = result;
         try self.rejectSchemaChangeInSavepoint();
+        const index_parts = try self.splitQualifiedName(drop_idx.index_name);
+        const target_connection = if (index_parts.schema_name) |schema_name|
+            try self.resolveSchemaConnection(schema_name)
+        else
+            self.connection;
+        try target_connection.ensureWritable();
 
         // Check if index exists
-        if (self.connection.storage_engine.getIndex(drop_idx.index_name) == null) {
+        if (target_connection.storage_engine.getIndex(index_parts.name) == null) {
             if (drop_idx.if_exists) {
                 return; // Silently skip if IF EXISTS is specified
             }
             return error.IndexNotFound;
         }
 
-        const index = self.connection.storage_engine.getIndex(drop_idx.index_name).?;
-        self.connection.invalidateResultCache(index.table_name);
+        const index = target_connection.storage_engine.getIndex(index_parts.name).?;
+        target_connection.invalidateResultCache(index.table_name);
 
         // Drop the index
-        try self.connection.storage_engine.dropIndex(drop_idx.index_name);
+        try target_connection.storage_engine.dropIndex(index_parts.name);
     }
 
     /// Execute DROP TABLE
     fn executeDropTable(self: *Self, drop_tbl: *planner.DropTableStep, result: *ExecutionResult) !void {
         _ = result;
         try self.rejectSchemaChangeInSavepoint();
+        const resolved = try self.resolveTableRef(drop_tbl.table_name);
+        try resolved.connection.ensureWritable();
 
         // Check if table exists
-        if (self.connection.storage_engine.getTable(drop_tbl.table_name) == null) {
+        if (resolved.connection.storage_engine.getTable(resolved.table_name) == null) {
             if (drop_tbl.if_exists) {
                 return; // Silently skip if IF EXISTS is specified
             }
@@ -4048,8 +4364,8 @@ pub const VirtualMachine = struct {
         }
 
         // Drop the table
-        try self.connection.storage_engine.dropTable(drop_tbl.table_name);
-        self.connection.invalidateResultCache(drop_tbl.table_name);
+        try resolved.connection.storage_engine.dropTable(resolved.table_name);
+        resolved.connection.invalidateResultCache(resolved.table_name);
     }
 
     /// Execute PRAGMA statement
@@ -4057,7 +4373,29 @@ pub const VirtualMachine = struct {
         const allocator = self.connection.allocator;
 
         // Handle different PRAGMA commands
-        if (std.ascii.eqlIgnoreCase(pragma.name, "table_info")) {
+        if (std.ascii.eqlIgnoreCase(pragma.name, "user_version")) {
+            if (pragma.value) |value| {
+                if (value < 0 or value > std.math.maxInt(u32)) return error.InvalidUserVersion;
+                try self.connection.setUserVersion(@intCast(value));
+            }
+            try self.addSingleIntegerPragmaRow(result, self.connection.getUserVersion());
+        } else if (std.ascii.eqlIgnoreCase(pragma.name, "schema_version")) {
+            if (pragma.value != null) return error.ReadOnlyPragma;
+            try self.addSingleIntegerPragmaRow(result, self.connection.getSchemaVersion());
+        } else if (std.ascii.eqlIgnoreCase(pragma.name, "integrity_check")) {
+            var check = try self.connection.integrityCheck();
+            defer check.deinit(allocator);
+
+            const message = if (check.ok)
+                try allocator.dupe(u8, "ok")
+            else
+                try std.fmt.allocPrint(allocator, "integrity_check failed: {s}", .{check.first_issue orelse "unknown issue"});
+
+            const values = try allocator.alloc(storage.Value, 1);
+            values[0] = storage.Value{ .Text = message };
+            try result.rows.append(allocator, storage.Row{ .values = values });
+            try self.connection.recordResultRows(result.rows.items.len);
+        } else if (std.ascii.eqlIgnoreCase(pragma.name, "table_info")) {
             // PRAGMA table_info(table_name)
             // Returns: cid, name, type, notnull, dflt_value, pk
             const table_name = pragma.argument orelse return error.PragmaRequiresArgument;
@@ -4175,9 +4513,53 @@ pub const VirtualMachine = struct {
                     .values = try row_values.toOwnedSlice(allocator),
                 });
             }
+        } else if (std.ascii.eqlIgnoreCase(pragma.name, "planner_stats")) {
+            for (self.connection.planner_table_stats.items) |stats| {
+                var row_values: std.ArrayListUnmanaged(storage.Value) = .empty;
+                try row_values.append(allocator, storage.Value{ .Text = try allocator.dupe(u8, "table") });
+                try row_values.append(allocator, storage.Value{ .Text = try allocator.dupe(u8, stats.table_name) });
+                try row_values.append(allocator, storage.Value{ .Text = try allocator.dupe(u8, "") });
+                try row_values.append(allocator, storage.Value{ .Integer = @intCast(stats.live_rows) });
+                try row_values.append(allocator, storage.Value{ .Integer = @intCast(stats.row_count) });
+                try row_values.append(allocator, storage.Value{ .Integer = @intCast(stats.deleted_rows) });
+                try row_values.append(allocator, storage.Value{ .Integer = stats.column_count });
+                try result.rows.append(allocator, storage.Row{ .values = try row_values.toOwnedSlice(allocator) });
+            }
+
+            for (self.connection.planner_index_stats.items) |stats| {
+                var row_values: std.ArrayListUnmanaged(storage.Value) = .empty;
+                try row_values.append(allocator, storage.Value{ .Text = try allocator.dupe(u8, "index") });
+                try row_values.append(allocator, storage.Value{ .Text = try allocator.dupe(u8, stats.index_name) });
+                try row_values.append(allocator, storage.Value{ .Text = try allocator.dupe(u8, stats.table_name) });
+                try row_values.append(allocator, storage.Value{ .Integer = @intCast(stats.indexed_rows) });
+                try row_values.append(allocator, storage.Value{ .Integer = @intCast(stats.distinct_values) });
+                try row_values.append(allocator, storage.Value{ .Integer = if (stats.is_unique) 1 else 0 });
+                try row_values.append(allocator, storage.Value{ .Text = try allocator.dupe(u8, stats.column_name) });
+                try result.rows.append(allocator, storage.Row{ .values = try row_values.toOwnedSlice(allocator) });
+            }
         } else {
             return error.UnknownPragma;
         }
+    }
+
+    fn executeAnalyze(self: *Self, analyze: *planner.AnalyzeStep, result: *ExecutionResult) !void {
+        _ = result;
+        try self.connection.analyze(analyze.table_name);
+    }
+
+    fn executeVacuum(self: *Self, result: *ExecutionResult) !void {
+        const allocator = self.connection.allocator;
+        var check = try self.connection.vacuum();
+        defer check.deinit(allocator);
+
+        const message = if (check.ok)
+            try allocator.dupe(u8, "ok")
+        else
+            try std.fmt.allocPrint(allocator, "vacuum integrity check failed: {s}", .{check.first_issue orelse "unknown issue"});
+
+        const values = try allocator.alloc(storage.Value, 1);
+        values[0] = storage.Value{ .Text = message };
+        try result.rows.append(allocator, storage.Row{ .values = values });
     }
 
     /// Execute EXPLAIN / EXPLAIN QUERY PLAN statement
@@ -4306,10 +4688,12 @@ pub const VirtualMachine = struct {
 
     /// Execute a basic query step (no CTEs or nested set operations - breaks recursion)
     fn executeBasicStep(self: *Self, step: *planner.ExecutionStep, result: *ExecutionResult) !void {
+        try self.connection.recordVmStep();
         switch (step.*) {
             .TableScan => |*scan| try self.executeTableScan(scan, result),
             .Filter => |*filter| try self.executeFilter(filter, result),
             .Project => |*project| try self.executeProject(project, result),
+            .Sort => |*sort| try self.executeSort(sort, result),
             .Limit => |*limit| try self.executeLimit(limit, result),
             .NestedLoopJoin => |*join| try self.executeNestedLoopJoin(join, result),
             .HashJoin => |*join| try self.executeHashJoin(join, result),
@@ -4318,6 +4702,8 @@ pub const VirtualMachine = struct {
             .Window => |*window| try self.executeWindow(window, result),
             else => return error.UnsupportedStepInSetOperation,
         }
+        try self.connection.recordResultRows(result.rows.items.len);
+        try self.connection.recordAffectedRows(result.affected_rows);
     }
 
     /// Execute set operation (UNION/INTERSECT/EXCEPT)
@@ -4484,6 +4870,13 @@ pub const VirtualMachine = struct {
         }
     }
 
+    fn addSingleIntegerPragmaRow(self: *Self, result: *ExecutionResult, value: u32) !void {
+        const values = try self.connection.allocator.alloc(storage.Value, 1);
+        values[0] = storage.Value{ .Integer = @intCast(value) };
+        try result.rows.append(self.connection.allocator, storage.Row{ .values = values });
+        try self.connection.recordResultRows(result.rows.items.len);
+    }
+
     /// Except (difference) two row sets
     fn exceptRows(self: *Self, left: *std.ArrayList(storage.Row), right: *std.ArrayList(storage.Row), result: *ExecutionResult, keep_duplicates: bool) !void {
         const allocator = self.connection.allocator;
@@ -4625,6 +5018,35 @@ pub const VirtualMachine = struct {
                 result,
             );
         }
+
+        if (window_step.output_column_count < window_step.projected_columns.len) {
+            try self.trimHiddenWindowColumns(window_step, result);
+        }
+    }
+
+    fn trimHiddenWindowColumns(self: *Self, window_step: *planner.WindowStep, result: *ExecutionResult) !void {
+        const allocator = self.connection.allocator;
+        const output_count = window_step.output_column_count;
+        const projected_count = window_step.projected_columns.len;
+        const window_count = window_step.window_functions.len;
+
+        for (result.rows.items) |*row| {
+            var new_values = try allocator.alloc(storage.Value, output_count + window_count);
+
+            for (0..output_count) |idx| {
+                new_values[idx] = row.values[idx];
+            }
+            for (0..window_count) |idx| {
+                new_values[output_count + idx] = row.values[projected_count + idx];
+            }
+
+            for (output_count..projected_count) |idx| {
+                row.values[idx].deinit(allocator);
+            }
+
+            allocator.free(row.values);
+            row.values = new_values;
+        }
     }
 
     fn executeWindowFunctionOverGroups(
@@ -4718,7 +5140,9 @@ pub const VirtualMachine = struct {
 
         for (ordered_indices, 0..) |original_row_idx, local_idx| {
             context.current_row = local_idx;
-            const window_value = try executor.executeWindowFunction(window_func, &context);
+            var resolved_window_func = window_func;
+            resolved_window_func.window_spec = resolved_spec;
+            const window_value = try executor.executeWindowFunction(resolved_window_func, &context);
             result.rows.items[original_row_idx].values[window_slot].deinit(allocator);
             result.rows.items[original_row_idx].values[window_slot] = window_value;
         }
@@ -4838,7 +5262,7 @@ pub const VirtualMachine = struct {
                         0;
 
                     if (col_idx < items[j].values.len and col_idx < items[j + 1].values.len) {
-                        const cmp = self.compareValues(items[j].values[col_idx], items[j + 1].values[col_idx]);
+                        const cmp = self.compareSortValues(items[j].values[col_idx], items[j + 1].values[col_idx]);
                         // Respect sort direction (ASC vs DESC)
                         const should_swap_this = if (clause.direction == .Desc)
                             cmp == .lt
@@ -4858,14 +5282,26 @@ pub const VirtualMachine = struct {
         }
     }
 
+    fn compareSortValues(self: *Self, left: storage.Value, right: storage.Value) std.math.Order {
+        if (left == .Text and right == .Text) {
+            const left_number = std.fmt.parseFloat(f64, left.Text) catch null;
+            const right_number = std.fmt.parseFloat(f64, right.Text) catch null;
+            if (left_number != null and right_number != null) {
+                return std.math.order(left_number.?, right_number.?);
+            }
+        }
+        return self.compareValues(left, right);
+    }
+
     /// Generate a human-readable description of an execution step
     fn describeStep(self: *Self, step: *const planner.ExecutionStep, allocator: std.mem.Allocator) ![]const u8 {
         _ = self;
         return switch (step.*) {
             .TableScan => |scan| try std.fmt.allocPrint(allocator, "SCAN TABLE {s}", .{scan.table_name}),
-            .IndexScan => |scan| try std.fmt.allocPrint(allocator, "INDEX SCAN {s}.{s} USING {s}", .{ scan.table_name, scan.column_name, scan.index_name }),
+            .IndexScan => |scan| try std.fmt.allocPrint(allocator, "INDEX SCAN {s}.{s} USING {s} rows={d} cost={d}", .{ scan.table_name, scan.column_name, scan.index_name, scan.estimated_rows, scan.estimated_cost }),
             .Filter => try allocator.dupe(u8, "FILTER"),
             .Project => try allocator.dupe(u8, "PROJECT"),
+            .Sort => try allocator.dupe(u8, "SORT"),
             .Limit => |limit| try std.fmt.allocPrint(allocator, "LIMIT {d}", .{limit.count}),
             .Insert => |insert| try std.fmt.allocPrint(allocator, "INSERT INTO {s}", .{insert.table_name}),
             .CreateTable => |create| try std.fmt.allocPrint(allocator, "CREATE TABLE {s}", .{create.table_name}),
@@ -4886,6 +5322,11 @@ pub const VirtualMachine = struct {
             .DropTable => |drop| try std.fmt.allocPrint(allocator, "DROP TABLE {s}", .{drop.table_name}),
             .CreateCTE => |cte| try std.fmt.allocPrint(allocator, "CREATE CTE {s}", .{cte.name}),
             .Pragma => |pragma| try std.fmt.allocPrint(allocator, "PRAGMA {s}", .{pragma.name}),
+            .Analyze => |analyze| if (analyze.table_name) |table_name|
+                try std.fmt.allocPrint(allocator, "ANALYZE {s}", .{table_name})
+            else
+                try allocator.dupe(u8, "ANALYZE"),
+            .Vacuum => try allocator.dupe(u8, "VACUUM"),
             .Explain => try allocator.dupe(u8, "EXPLAIN"),
             .SetOperation => |set_op| try std.fmt.allocPrint(allocator, "SET OPERATION {s}", .{@tagName(set_op.operation)}),
             .Window => try allocator.dupe(u8, "WINDOW"),
@@ -4990,10 +5431,16 @@ const VmError = error{
 
 /// Execute a parsed statement (convenience function)
 pub fn execute(connection: *db.Connection, parsed: *const ast.Statement) !void {
+    try connection.checkOperation();
     var vm = VirtualMachine.init(connection.allocator, connection);
     defer vm.deinitVM();
 
-    var query_planner = planner.Planner.init(connection.allocator);
+    var query_planner = planner.Planner.initWithContext(
+        connection.allocator,
+        &connection.aggregate_function_names,
+        connection.planner_table_stats.items,
+        connection.planner_index_stats.items,
+    );
     var plan = try query_planner.plan(parsed);
     defer plan.deinit();
 

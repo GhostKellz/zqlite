@@ -75,10 +75,87 @@ pub const Parser = struct {
             .Release => try self.parseRelease(),
             .Drop => try self.parseDrop(),
             .Pragma => try self.parsePragma(),
+            .Analyze => try self.parseAnalyze(),
+            .Vacuum => ast.Statement{ .Vacuum = .{} },
             .Explain => try self.parseExplain(),
             .Attach => try self.parseAttach(),
             .Detach => try self.parseDetach(),
+            .With => try self.parseWith(),
             else => error.UnexpectedToken,
+        };
+    }
+
+    fn parseWith(self: *Self) !ast.Statement {
+        try self.expect(.With);
+
+        const recursive = std.meta.activeTag(self.current_token) == .Recursive;
+        if (recursive) {
+            try self.advance();
+        }
+
+        var cte_definitions: std.ArrayListUnmanaged(ast.CTEDefinition) = .empty;
+        defer cte_definitions.deinit(self.allocator);
+        errdefer for (cte_definitions.items) |*cte| cte.deinit(self.allocator);
+
+        while (true) {
+            const name = try self.expectIdentifier();
+            errdefer self.allocator.free(name);
+
+            var column_names: ?[][]const u8 = null;
+            errdefer if (column_names) |cols| {
+                for (cols) |col| self.allocator.free(col);
+                self.allocator.free(cols);
+            };
+            if (std.meta.activeTag(self.current_token) == .LeftParen) {
+                try self.advance();
+
+                var cols: std.ArrayListUnmanaged([]const u8) = .empty;
+                defer cols.deinit(self.allocator);
+                errdefer for (cols.items) |col| self.allocator.free(col);
+
+                while (true) {
+                    const col = try self.expectIdentifier();
+                    try cols.append(self.allocator, col);
+
+                    if (std.meta.activeTag(self.current_token) == .Comma) {
+                        try self.advance();
+                    } else {
+                        break;
+                    }
+                }
+
+                try self.expect(.RightParen);
+                column_names = try cols.toOwnedSlice(self.allocator);
+            }
+
+            try self.expect(.As);
+            try self.expect(.LeftParen);
+            const query = try self.parseSimpleSelect();
+            try self.expect(.RightParen);
+
+            try cte_definitions.append(self.allocator, ast.CTEDefinition{
+                .name = name,
+                .column_names = column_names,
+                .query = query,
+            });
+            column_names = null;
+
+            if (std.meta.activeTag(self.current_token) == .Comma) {
+                try self.advance();
+            } else {
+                break;
+            }
+        }
+
+        var main_query = try self.parseSimpleSelect();
+        errdefer main_query.deinit(self.allocator);
+
+        return ast.Statement{
+            .With = ast.WithStatement{
+                .cte_definitions = try cte_definitions.toOwnedSlice(self.allocator),
+                .recursive = recursive,
+                .main_query = main_query,
+            },
         };
     }
 
@@ -230,7 +307,7 @@ pub const Parser = struct {
 
         // Parse FROM clause
         try self.expect(.From);
-        var table_name = try self.expectIdentifier();
+        var table_name = try self.expectQualifiedIdentifier();
         errdefer self.allocator.free(table_name);
 
         // Check for optional table alias
@@ -554,7 +631,7 @@ pub const Parser = struct {
 
         try self.expect(.Into);
 
-        const table_name = try self.expectIdentifierOrKeyword();
+        const table_name = try self.expectQualifiedIdentifierOrKeyword();
 
         // Parse optional column list
         var columns: ?[][]const u8 = null;
@@ -880,7 +957,7 @@ pub const Parser = struct {
                 if_exists = true;
             }
 
-            const index_name = try self.expectIdentifier();
+            const index_name = try self.expectQualifiedIdentifier();
 
             return ast.Statement{
                 .DropIndex = ast.DropIndexStatement{
@@ -899,7 +976,7 @@ pub const Parser = struct {
                 if_exists = true;
             }
 
-            const table_name = try self.expectIdentifier();
+            const table_name = try self.expectQualifiedIdentifier();
 
             return ast.Statement{
                 .DropTable = ast.DropTableStatement{
@@ -921,19 +998,42 @@ pub const Parser = struct {
 
         // Check for argument in parentheses
         var argument: ?[]const u8 = null;
+        var value: ?i64 = null;
         if (std.meta.activeTag(self.current_token) == .LeftParen) {
             try self.advance(); // consume '('
 
             // Get the argument (table name, etc.)
-            argument = try self.expectIdentifier();
+            argument = try self.expectQualifiedIdentifier();
 
             try self.expect(.RightParen);
+        } else if (std.meta.activeTag(self.current_token) == .Equal) {
+            try self.advance();
+            if (std.meta.activeTag(self.current_token) != .Integer) return error.UnexpectedToken;
+            value = self.current_token.Integer;
+            try self.advance();
         }
 
         return ast.Statement{
             .Pragma = ast.PragmaStatement{
                 .name = pragma_name,
                 .argument = argument,
+                .value = value,
+            },
+        };
+    }
+
+    fn parseAnalyze(self: *Self) !ast.Statement {
+        try self.expect(.Analyze);
+
+        const table_name: ?[]const u8 = switch (std.meta.activeTag(self.current_token)) {
+            .Identifier => try self.expectIdentifier(),
+            .EOF, .Semicolon => null,
+            else => return error.UnexpectedToken,
+        };
+
+        return ast.Statement{
+            .Analyze = ast.AnalyzeStatement{
+                .table_name = table_name,
             },
         };
     }
@@ -1001,24 +1101,10 @@ pub const Parser = struct {
 
         // Check for QUERY PLAN variant
         var is_query_plan = false;
-        if (std.meta.activeTag(self.current_token) == .Identifier) {
-            if (self.current_token.Identifier.len == 5 and
-                std.ascii.eqlIgnoreCase(self.current_token.Identifier, "QUERY"))
-            {
-                try self.advance(); // consume 'QUERY'
-
-                // Expect PLAN
-                if (std.meta.activeTag(self.current_token) == .Identifier) {
-                    if (std.ascii.eqlIgnoreCase(self.current_token.Identifier, "PLAN")) {
-                        try self.advance(); // consume 'PLAN'
-                        is_query_plan = true;
-                    } else {
-                        return error.UnexpectedToken;
-                    }
-                } else {
-                    return error.UnexpectedToken;
-                }
-            }
+        if (std.meta.activeTag(self.current_token) == .Query) {
+            try self.advance(); // consume 'QUERY'
+            try self.expect(.Plan);
+            is_query_plan = true;
         }
 
         // Parse the inner statement
@@ -1070,7 +1156,7 @@ pub const Parser = struct {
         }
 
         // Table name
-        const table_name = try self.expectIdentifier();
+        const table_name = try self.expectQualifiedIdentifier();
         errdefer self.allocator.free(table_name);
 
         // USING keyword
@@ -1138,18 +1224,34 @@ pub const Parser = struct {
             if_not_exists = true;
         }
 
-        const index_name = try self.expectIdentifier();
+        const index_name = try self.expectQualifiedIdentifier();
         try self.expect(.On);
-        const table_name = try self.expectIdentifier();
+        const table_name = try self.expectQualifiedIdentifier();
 
         try self.expect(.LeftParen);
 
         var columns: std.ArrayListUnmanaged([]const u8) = .empty;
         defer columns.deinit(self.allocator);
+        errdefer for (columns.items) |col| self.allocator.free(col);
+
+        var expressions: std.ArrayListUnmanaged(ast.Expression) = .empty;
+        defer expressions.deinit(self.allocator);
+        errdefer for (expressions.items) |*expr| expr.deinit(self.allocator);
 
         while (true) {
-            const col = try self.expectIdentifier();
-            try columns.append(self.allocator, col);
+            if (std.meta.activeTag(self.current_token) == .LeftParen) {
+                try self.advance();
+                var expression = try self.parseExpression();
+                errdefer expression.deinit(self.allocator);
+                try self.expect(.RightParen);
+                try expressions.append(self.allocator, expression);
+                try columns.append(self.allocator, try self.allocator.dupe(u8, "<expr>"));
+            } else {
+                const col = try self.expectIdentifier();
+                errdefer self.allocator.free(col);
+                try columns.append(self.allocator, try self.allocator.dupe(u8, col));
+                try expressions.append(self.allocator, ast.Expression{ .Column = col });
+            }
 
             if (std.meta.activeTag(self.current_token) == .Comma) {
                 try self.advance();
@@ -1160,11 +1262,20 @@ pub const Parser = struct {
 
         try self.expect(.RightParen);
 
+        var where_clause: ?ast.WhereClause = null;
+        errdefer if (where_clause) |*where| where.deinit(self.allocator);
+        if (std.meta.activeTag(self.current_token) == .Where) {
+            try self.advance();
+            where_clause = try self.parseWhere();
+        }
+
         return ast.Statement{
             .CreateIndex = ast.CreateIndexStatement{
                 .index_name = index_name,
                 .table_name = table_name,
                 .columns = try columns.toOwnedSlice(self.allocator),
+                .expressions = try expressions.toOwnedSlice(self.allocator),
+                .where_clause = where_clause,
                 .unique = unique,
                 .if_not_exists = if_not_exists,
             },
@@ -1203,7 +1314,7 @@ pub const Parser = struct {
             if_not_exists = true;
         }
 
-        const table_name = try self.expectIdentifier();
+        const table_name = try self.expectQualifiedIdentifier();
 
         try self.expect(.LeftParen);
 
@@ -1246,7 +1357,7 @@ pub const Parser = struct {
     /// Parse UPDATE statement
     fn parseUpdate(self: *Self) !ast.Statement {
         try self.expect(.Update);
-        const table_name = try self.expectIdentifier();
+        const table_name = try self.expectQualifiedIdentifier();
         errdefer self.allocator.free(table_name);
 
         try self.expect(.Set);
@@ -1309,7 +1420,7 @@ pub const Parser = struct {
     fn parseDelete(self: *Self) !ast.Statement {
         try self.expect(.Delete);
         try self.expect(.From);
-        const table_name = try self.expectIdentifier();
+        const table_name = try self.expectQualifiedIdentifier();
         errdefer self.allocator.free(table_name);
 
         var where_clause: ?ast.WhereClause = null;
@@ -1520,6 +1631,32 @@ pub const Parser = struct {
                 .expression = ast.ColumnExpression{ .FunctionCall = func_call },
                 .alias = alias,
             };
+        }
+
+        if (std.meta.activeTag(self.current_token) == .Identifier) {
+            const next_token = try self.peekNextToken();
+            defer if (next_token) |token| token.deinit(self.allocator);
+
+            if (next_token != null and std.meta.activeTag(next_token.?) == .LeftParen) {
+                const func_call = try self.parseFunctionCall();
+
+                var alias: ?[]const u8 = null;
+                if (std.meta.activeTag(self.current_token) == .As) {
+                    try self.advance();
+                    alias = try self.expectIdentifierOrKeyword();
+                } else if (std.meta.activeTag(self.current_token) == .Identifier) {
+                    const id = self.current_token.Identifier;
+                    if (!isClauseKeyword(id)) {
+                        alias = try self.expectIdentifierOrKeyword();
+                    }
+                }
+
+                return ast.Column{
+                    .name = try self.allocator.dupe(u8, func_call.name),
+                    .expression = ast.ColumnExpression{ .FunctionCall = func_call },
+                    .alias = alias,
+                };
+            }
         }
 
         // Regular column parsing - handle qualified names (table.column)
@@ -1798,13 +1935,14 @@ pub const Parser = struct {
             try self.expect(.Row); // expect ROW
             return .CurrentRow;
         } else if (std.meta.activeTag(self.current_token) == .Integer) {
+            const offset: u32 = @intCast(self.current_token.Integer);
             try self.advance(); // consume the number
             if (std.meta.activeTag(self.current_token) == .Preceding) {
                 try self.advance();
-                return .Preceding;
+                return ast.FrameBound{ .Preceding = offset };
             } else if (std.meta.activeTag(self.current_token) == .Following) {
                 try self.advance();
-                return .Following;
+                return ast.FrameBound{ .Following = offset };
             } else {
                 return error.UnexpectedToken;
             }
@@ -1932,6 +2070,16 @@ pub const Parser = struct {
                 const default_value = try self.parseDefaultValue();
                 return ast.ColumnConstraint{ .Default = default_value };
             },
+            .As => {
+                const generated = try self.parseGeneratedColumn(false);
+                return ast.ColumnConstraint{ .Generated = generated };
+            },
+            .Identifier => |id| {
+                if (!std.ascii.eqlIgnoreCase(id, "GENERATED")) return error.UnexpectedToken;
+                try self.advance();
+                const generated = try self.parseGeneratedColumn(true);
+                return ast.ColumnConstraint{ .Generated = generated };
+            },
             .Foreign => {
                 try self.advance();
                 try self.expect(.Key);
@@ -1951,6 +2099,41 @@ pub const Parser = struct {
                 return ast.ColumnConstraint{ .Check = ast.CheckConstraint{ .condition = condition } };
             },
             else => error.UnexpectedToken,
+        };
+    }
+
+    fn parseGeneratedColumn(self: *Self, has_generated_keyword: bool) !ast.GeneratedColumn {
+        if (has_generated_keyword) {
+            const always = try self.expectIdentifier();
+            defer self.allocator.free(always);
+            if (!std.ascii.eqlIgnoreCase(always, "ALWAYS")) return error.UnexpectedToken;
+        }
+
+        try self.expect(.As);
+        try self.expect(.LeftParen);
+        var expression = try self.parseExpression();
+        errdefer expression.deinit(self.allocator);
+        try self.expect(.RightParen);
+
+        var stored = true;
+        if (self.current_token == .Identifier) {
+            const keyword = try self.expectIdentifier();
+            defer self.allocator.free(keyword);
+            if (std.ascii.eqlIgnoreCase(keyword, "STORED")) {
+                stored = true;
+            } else if (std.ascii.eqlIgnoreCase(keyword, "VIRTUAL")) {
+                stored = false;
+            } else {
+                return error.UnexpectedToken;
+            }
+        } else if (std.meta.activeTag(self.current_token) == .Virtual) {
+            try self.advance();
+            stored = false;
+        }
+
+        return ast.GeneratedColumn{
+            .expression = expression,
+            .stored = stored,
         };
     }
 
@@ -2697,6 +2880,29 @@ pub const Parser = struct {
                 return error.ExpectedIdentifier;
             },
         }
+    }
+
+    fn expectQualifiedIdentifier(self: *Self) ![]const u8 {
+        const first = try self.expectIdentifier();
+        return self.finishQualifiedIdentifier(first);
+    }
+
+    fn expectQualifiedIdentifierOrKeyword(self: *Self) ![]const u8 {
+        const first = try self.expectIdentifierOrKeyword();
+        return self.finishQualifiedIdentifier(first);
+    }
+
+    fn finishQualifiedIdentifier(self: *Self, first: []const u8) ![]const u8 {
+        errdefer self.allocator.free(first);
+        if (std.meta.activeTag(self.current_token) != .Dot) return first;
+
+        try self.advance();
+        const second = try self.expectIdentifierOrKeyword();
+        defer self.allocator.free(second);
+
+        const qualified = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ first, second });
+        self.allocator.free(first);
+        return qualified;
     }
 
     /// Advance to next token

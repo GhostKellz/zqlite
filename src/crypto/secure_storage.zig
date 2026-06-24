@@ -2,6 +2,7 @@ const std = @import("std");
 const crypto_interface = @import("interface.zig");
 const storage = @import("../db/storage.zig");
 const time_utils = @import("../time_utils.zig");
+const build_options = @import("build_options");
 
 /// ZQLite Crypto Engine - Database encryption layer
 /// Features: ZCrypto integration, Modular crypto backends, Native Zig crypto fallback
@@ -30,7 +31,7 @@ pub const CryptoEngine = struct {
             .allocator = allocator,
             .crypto = crypto_interface.CryptoInterface.init(config),
             .master_key = null,
-            .hybrid_mode = config.enable_pq,
+            .hybrid_mode = config.enable_pq or config.pq_mode == .hybrid or config.pq_mode == .pqc,
         };
     }
 
@@ -111,15 +112,14 @@ pub const CryptoEngine = struct {
         return token;
     }
 
-    /// Enable post-quantum only mode.
-    /// Note: PQ algorithms (ML-KEM, ML-DSA) are experimental scaffolding only.
-    /// This enables hybrid mode flag which uses PQ algorithms when implemented.
+    /// Require post-quantum-only mode.
+    /// Storage keypair generation still fails closed for strict PQC until the storage
+    /// keypair format can carry PQ public/private key material.
     pub fn enablePostQuantumOnlyMode(self: *Self) void {
         self.hybrid_mode = true;
-        // PQ algorithms not yet implemented:
-        // - ML-KEM-768 for key encapsulation
-        // - ML-DSA-65 for digital signatures
-        // For now, hybrid_mode flag signals intent to use PQ when available
+        self.crypto.config.pq_mode = .pqc;
+        self.crypto.config.enable_pq = true;
+        self.crypto.config.allow_classical_fallback = false;
     }
 
     /// Derive master key from password using HKDF
@@ -147,8 +147,14 @@ pub const CryptoEngine = struct {
 
     /// Generate secure keypair (classical Ed25519)
     pub fn generateKeyPair(self: *Self) !KeyPair {
-        if (self.hybrid_mode and !self.crypto.hasPQCrypto()) {
-            std.log.warn("EXPERIMENTAL: Post-quantum crypto requested but unavailable; falling back to classical Ed25519.", .{});
+        const capability = self.pqCapability();
+        switch (capability.state) {
+            .unavailable => {
+                if (capability.requested_mode != .disabled) return error.PQCBackendUnavailable;
+            },
+            .simulated => return error.SimulatedPQCNotAllowed,
+            .hybrid_active, .pqc_active => return error.PQCBackendUnavailable,
+            .classical_fallback => {},
         }
 
         // Use native Ed25519 for classical crypto
@@ -166,6 +172,11 @@ pub const CryptoEngine = struct {
                 .secret_key = keypair.secret_key.bytes,
             },
         };
+    }
+
+    pub fn pqCapability(self: Self) crypto_interface.PQCapability {
+        const probe: crypto_interface.PQBackendProbe = if (build_options.enable_crypto) .real else .none;
+        return crypto_interface.evaluatePQCapability(build_options.enable_crypto, self.crypto.config, probe);
     }
 
     /// Encrypt data with master key

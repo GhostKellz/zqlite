@@ -3,13 +3,15 @@ set -euo pipefail
 
 # zqlite installation script
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/ghostkellz/zqlite/refs/heads/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/ghostkellz/zqlite/refs/heads/main/install.sh -o install.sh
+#   chmod +x install.sh
+#   ZQLITE_REF=<tag> ./install.sh
 
 REPO="ghostkellz/zqlite"
 DEFAULT_REF="main"
-INSTALL_DIR="${HOME}/.local/bin"
+INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
 BINARY_NAME="zqlite"
-MIN_ZIG_VERSION="0.17.0-dev.639+284ab0ad8"
+MIN_ZIG_VERSION="0.17.0-dev.931+84f84267c"
 RELEASE_API="https://api.github.com/repos/${REPO}/releases/tags"
 
 RED='\033[0;31m'
@@ -19,11 +21,14 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 cleanup() {
-    if [ -n "${TMP_DIR:-}" ] && [ -d "${TMP_DIR}" ]; then
-        rm -rf "${TMP_DIR}"
+    if [ -n "${WORK_DIR:-}" ] && [ -d "${WORK_DIR}" ]; then
+        rm -rf "${WORK_DIR}"
     fi
 }
 trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+trap 'cleanup; exit 129' HUP
 
 have_cmd() {
     command -v "$1" >/dev/null 2>&1
@@ -55,6 +60,15 @@ done
 
 install_from_release() {
     local ref="$1"
+
+    if [ -n "${ZQLITE_RELEASE_ARCHIVE:-}" ]; then
+        echo -e "${BLUE}Installing from local release archive ${ZQLITE_RELEASE_ARCHIVE}...${NC}"
+        tar -xzf "${ZQLITE_RELEASE_ARCHIVE}"
+        mkdir -p "${INSTALL_DIR}"
+        install -m 0755 "package/bin/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+        return 0
+    fi
+
     local target="x86_64-unknown-linux-gnu"
     local archive="zqlite-${ref}-${target}.tar.gz"
     local checksum_file="${archive}.sha256"
@@ -88,8 +102,19 @@ install_from_source() {
 
     echo -e "${GREEN}Using Zig ${ZIG_VERSION}${NC}"
 
-    echo -e "${BLUE}Cloning repository...${NC}"
-    git clone --depth 1 --branch "${REF}" "https://github.com/${REPO}.git" zqlite
+    if [ -n "${ZQLITE_LOCAL_SOURCE:-}" ]; then
+        echo -e "${BLUE}Using local source ${ZQLITE_LOCAL_SOURCE}...${NC}"
+        mkdir zqlite
+        tar \
+            --exclude .git \
+            --exclude .zig-cache \
+            --exclude zig-out \
+            -C "${ZQLITE_LOCAL_SOURCE}" \
+            -cf - . | tar -xf - -C zqlite
+    else
+        echo -e "${BLUE}Cloning repository...${NC}"
+        git clone --depth 1 --branch "${REF}" "https://github.com/${REPO}.git" zqlite
+    fi
     cd zqlite
 
     echo -e "${BLUE}Building zqlite...${NC}"
@@ -99,15 +124,21 @@ install_from_source() {
     install -m 0755 "zig-out/bin/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
 }
 
-TMP_DIR=$(mktemp -d)
-cd "${TMP_DIR}"
+if [ -n "${ZQLITE_LOCAL_SOURCE:-}" ]; then
+    ZQLITE_INSTALL_CACHE_DIR="${ZQLITE_INSTALL_CACHE_DIR:-${ZQLITE_LOCAL_SOURCE%/}/.zig-cache}"
+else
+    ZQLITE_INSTALL_CACHE_DIR="${ZQLITE_INSTALL_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME}/.cache}/zqlite}"
+fi
+mkdir -p "${ZQLITE_INSTALL_CACHE_DIR}"
+WORK_DIR=$(mktemp -d "${ZQLITE_INSTALL_CACHE_DIR}/zqlite-install-script.XXXXXX")
+cd "${WORK_DIR}"
 
 if [ "$USE_SOURCE_INSTALL" = "1" ]; then
     install_from_source
 elif [[ "$REF" == v* ]]; then
     if ! install_from_release "$REF"; then
         echo -e "${YELLOW}Release artifact install failed, falling back to source build.${NC}"
-        cd "${TMP_DIR}"
+        cd "${WORK_DIR}"
         install_from_source
     fi
 else

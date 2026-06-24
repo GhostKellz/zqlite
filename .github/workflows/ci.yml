@@ -1,127 +1,66 @@
-name: ZQLite CI Pipeline
+name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
-  lint:
-    name: "Lint & Format"
+  linux-release-gate:
+    name: Linux release gate
     runs-on: self-hosted
-    timeout-minutes: 10
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v4
+      - run: ./scripts/test-release.sh
 
-      - name: Clean workspace
-        run: rm -rf zig-out
-
-      - name: Zig version
-        run: zig version
-
-      - name: Format check
-        run: |
-          set -euo pipefail
-          zig fmt --check src/
-          zig fmt --check examples/
-          if [ -d tests ]; then
-            zig fmt --check tests/
-          fi
-
-      - name: Repository and C ABI contracts
-        run: |
-          bash scripts/check-repository-hygiene.sh
-          bash scripts/check-c-api.sh
-
-  build-test:
-    name: "Build & Unit Tests"
+  profile-matrix:
+    name: Profile ${{ matrix.profile }} / ${{ matrix.optimize }}
     runs-on: self-hosted
-    timeout-minutes: 20
-    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [core, advanced, experimental, full]
+        optimize: [Debug, ReleaseSafe, ReleaseFast]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v4
+      - run: zig build test -Dprofile=${{ matrix.profile }} -Doptimize=${{ matrix.optimize }} --summary all
 
-      - name: Clean workspace
-        run: rm -rf zig-out
-
-      - name: Zig version
-        run: zig version
-
-      - name: Build
-        run: zig build
-
-      - name: Build profile matrix
-        run: |
-          zig build -Dprofile=core
-          zig build -Dprofile=advanced
-          zig build -Dprofile=experimental
-          zig build -Dprofile=full
-
-      - name: Run unit tests
-        run: zig build test
-
-      - name: Release package consumers
-        run: zig build test-release-package
-
-  memory-tests:
-    name: "Memory Leak Detection"
+  linux-arch-cross-compile:
+    name: Linux cross compile ${{ matrix.target }}
     runs-on: self-hosted
-    timeout-minutes: 15
-    needs: build-test
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux-gnu
+          - aarch64-linux-gnu
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v4
+      - run: zig build -Dtarget=${{ matrix.target }} -Dprofile=advanced
 
-      - name: Clean workspace
-        run: rm -rf zig-out
-
-      - name: Zig version
-        run: zig version
-
-      - name: CREATE TABLE memory leak detection
-        run: zig build test-create-table-leaks
-
-  benchmarks:
-    name: "Benchmark Validation"
+  macos-file-backed:
+    name: macOS file-backed smoke
     runs-on: self-hosted
-    timeout-minutes: 10
-    needs: build-test
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v4
+      - run: zig build test-storage --summary all
 
-      - name: Clean workspace
-        run: rm -rf zig-out
-
-      - name: Zig version
-        run: zig version
-
-      - name: Validate benchmark performance
-        run: zig build bench-validate
-
-  extended-tests:
-    name: "Extended Test Suite"
+  minimum-zig:
+    name: Minimum Zig compatibility
     runs-on: self-hosted
-    timeout-minutes: 15
-    needs: build-test
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v4
+      - run: zig build test --summary all
 
-      - name: Clean workspace
-        run: rm -rf zig-out /tmp/zqlite_*.db
-
-      - name: Zig version
-        run: zig version
-
-      - name: Security tests
-        run: zig build test-security
-
-      - name: Comprehensive tests
-        run: zig build test-comprehensive
-
-      - name: Storage tests
-        run: zig build test-storage
+  stable-core-coverage:
+    name: Stable core coverage workload
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - run: mkdir -p zig-out/coverage
+      - run: ./scripts/coverage-report.sh | tee zig-out/coverage/stable-core-coverage.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stable-core-coverage
+          path: zig-out/coverage/stable-core-coverage.txt

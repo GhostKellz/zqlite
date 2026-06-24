@@ -67,6 +67,10 @@ echo "--- Release Package Consumers ---"
 bash scripts/test-release-package.sh
 echo ""
 
+echo "--- Install Script Paths ---"
+bash scripts/test-install.sh
+echo ""
+
 echo "--- Benchmark Validation ---"
 $ZIG build bench-validate
 echo ""

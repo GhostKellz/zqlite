@@ -45,6 +45,11 @@ jobs:
           zig build test-memory-leaks
           zig build test-comprehensive-memory
 
+      - name: Deterministic parser fuzzing
+        run: |
+          set -euo pipefail
+          zig build fuzz-parser --summary all
+
       - name: File-backed storage sanity
         run: |
           set -euo pipefail

@@ -7,6 +7,7 @@ Working examples demonstrating core ZQLite features:
 | Example | Description |
 |---------|-------------|
 | `simple_api_test.zig` | Basic API usage: parsing, binding, transactions, migrations |
+| `secure_by_default_app.zig` | Stable secure-by-default pattern: prepared statements, resource limits, ATTACH policy, durable flush |
 | `improved_api_demo.zig` | API demo: migrations, parameter binding, transactions |
 | `insert_memory_regression_test.zig` | Memory management regression test for INSERT operations |
 | `datetime_test.zig` | Date/time functions |

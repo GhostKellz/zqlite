@@ -160,6 +160,8 @@ const char* zqlite_version(void);
 int zqlite_pq_available(void);
 const char* zqlite_pq_status(void);
 const char* zqlite_pq_backend(void);
+const char* zqlite_pq_liboqs_status(void);
+const char* zqlite_pq_diagnostics_json(void);
 void zqlite_shutdown(void);
 void zqlite_free_string(const char* str);
 ```
@@ -173,11 +175,20 @@ int zqlite_pq_available(void);
 // Returns a human-readable runtime status message.
 const char* zqlite_pq_status(void);
 
-// Returns the backend tag name: "none" or "native_fallback".
+// Returns the backend tag name:
+// "none", "native_fallback", "simulated", "hybrid", or "pqc".
 const char* zqlite_pq_backend(void);
+
+// Returns liboqs integration status:
+// "not_configured", "configured_but_unlinked", or future "linked_active".
+const char* zqlite_pq_liboqs_status(void);
+
+// Returns allocated JSON diagnostics. Release with zqlite_free_string().
+// The JSON includes "requested_provider", "provider", and "liboqs_status".
+const char* zqlite_pq_diagnostics_json(void);
 ```
 
-These functions are status/introspection helpers. The stable default reports no active PQ backend; they do not imply that PQ cryptography is production-ready.
+These functions are status/introspection helpers. The stable default reports no active PQ backend. Simulated and fallback states are never production PQC; `zqlite_pq_available()` returns `1` only for a real active backend. `-Dliboqs=true` currently reports `configured_but_unlinked`; it does not link liboqs or make liboqs production-ready.
 
 ## Example
 
@@ -218,4 +229,18 @@ int main() {
 
 ## ABI Contract
 
-`include/zqlite.h` is the source of truth for supported C functions. Build validation compares its declarations and numeric constants with implementation exports. Undeclared implementation details and functions absent from the installed header are not part of the stable ABI.
+`include/zqlite.h` is the source of truth for supported C functions.
+`include/zqlite_c.symbols` is the checked export manifest. Build validation
+compares the header declarations, implementation exports, manifest entries,
+numeric constants, and any built `libzqlite_c.so` exports.
+
+Use:
+
+```bash
+zig build check-c-api
+./scripts/check-abi-compat.sh /path/to/prior-zqlite-source-package.tar.gz
+```
+
+The compatibility script fails if the current manifest removes a symbol present
+in a prior release archive. Undeclared implementation details and functions
+absent from the installed header are not part of the stable ABI.

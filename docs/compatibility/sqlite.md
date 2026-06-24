@@ -15,9 +15,12 @@ ZQLite aims to be a strong embedded SQLite-style database, not a byte-for-byte S
 | Window functions | Partial | `PARTITION BY` present, advanced framing limited |
 | PRAGMA | Partial | Focused subset only |
 | FTS5-style virtual tables | Partial | MATCH works, persistence/features limited |
-| ATTACH / DETACH | Supported | With security policy controls |
+| ATTACH / DETACH | Supported | With security policy controls and `schema.table` access |
 | SAVEPOINT / RELEASE / ROLLBACK TO | Supported | DML savepoints; DDL/catalog changes inside savepoints return an explicit error |
 | Named prepared parameters | Supported | `:name`, `@name`, `$name` |
+| Read-only / immutable open | Supported | Main database file is opened read-only; WAL is not opened or replayed |
+| Busy timeout / interrupt | Supported | Cooperative connection-level timeout and interrupt checks during parse/plan/VM execution |
+| VACUUM | Partial | Maintenance command rebuilds indexes/catalog and validates integrity; file-size shrink is not yet promised |
 
 ## Intentional Deviations
 
@@ -25,13 +28,19 @@ ZQLite aims to be a strong embedded SQLite-style database, not a byte-for-byte S
 - Experimental modules are separated from the stable core instead of being implied by default.
 - FTS support is intentionally smaller than full SQLite FTS5 behavior.
 - Query result caching is optional and connection-local rather than an invisible global SQLite behavior.
+- Read-only and immutable opens are inspection modes over the main database file; checkpoint first if you need pending WAL content visible.
+- Busy timeout is currently a cooperative operation timeout, not complete SQLite file-lock waiting semantics.
 
 ## Verified Compatibility Areas
 
 - `PRAGMA table_info(...)` and `PRAGMA database_list`
+- `PRAGMA user_version` / `PRAGMA user_version = N` and read-only `PRAGMA schema_version`
+- `PRAGMA integrity_check` as a lightweight ZQLite storage/catalog consistency check returning `ok` or one diagnostic row
+- `VACUUM` as a ZQLite maintenance command, not full SQLite file rewrite parity
 - `ATTACH DATABASE` / `DETACH DATABASE` with explicit path-policy enforcement
+- schema-qualified attached database DDL/DML for `CREATE TABLE`, `CREATE INDEX`, `DROP INDEX`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, and `DROP TABLE`
 - `CREATE VIRTUAL TABLE ... USING fts5(...)` plus basic `MATCH` queries
-- prepared statement bind, execute, reset, and reuse lifecycle
+- prepared statement bind, execute, reset, reuse lifecycle, and explicit `error.PreparedStatementExpired` after schema-changing DDL
 - named prepared parameters and repeated-name binding
 - DML `SAVEPOINT`, `RELEASE`, and `ROLLBACK TO`
 

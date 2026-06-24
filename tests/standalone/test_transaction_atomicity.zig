@@ -19,6 +19,7 @@ pub fn main(init: std.process.Init) !void {
     try testNestedSavepoints(allocator);
     try testReleaseSavepoint(allocator);
     try testOuterSavepointReleasePersists(allocator);
+    try testNoDirtyReadsAcrossFileBackedConnections(allocator);
     try testSavepointWithForeignKeyCascade(allocator);
     try testSavepointWithUniqueIndex(allocator);
     try testDDLRejectedInsideSavepoint(allocator);
@@ -248,6 +249,47 @@ fn testOuterSavepointReleasePersists(allocator: std.mem.Allocator) !void {
         std.debug.assert(resultHasIntegerId(&result, 1));
         std.log.info("[PASS] Outer savepoint release persisted after reopen", .{});
     }
+}
+
+fn testNoDirtyReadsAcrossFileBackedConnections(allocator: std.mem.Allocator) !void {
+    std.log.info("[TEST] File-backed readers do not see uncommitted writer rows", .{});
+    const path = try test_dir.dbPath("no_dirty_reads.db");
+    defer allocator.free(path);
+
+    {
+        var setup = try zqlite.open(allocator, path);
+        defer setup.close();
+        try setup.execute("CREATE TABLE IF NOT EXISTS isolation_test (id INTEGER, name TEXT)");
+        try setup.execute("DELETE FROM isolation_test");
+        try setup.flush();
+    }
+
+    var writer = try zqlite.open(allocator, path);
+    defer writer.close();
+    var reader = try zqlite.open(allocator, path);
+    defer reader.close();
+
+    try writer.execute("BEGIN");
+    try writer.execute("INSERT INTO isolation_test VALUES (1, 'uncommitted')");
+
+    {
+        var before_commit = try reader.query("SELECT * FROM isolation_test");
+        defer before_commit.deinit();
+        std.debug.assert(before_commit.rows.items.len == 0);
+    }
+
+    try writer.execute("COMMIT");
+
+    {
+        var reopened = try zqlite.open(allocator, path);
+        defer reopened.close();
+        var after_reopen = try reopened.query("SELECT * FROM isolation_test");
+        defer after_reopen.deinit();
+        std.debug.assert(after_reopen.rows.items.len == 1);
+        std.debug.assert(resultHasIntegerId(&after_reopen, 1));
+    }
+
+    std.log.info("[PASS] Uncommitted file-backed rows stay invisible until commit", .{});
 }
 
 fn testSavepointWithForeignKeyCascade(allocator: std.mem.Allocator) !void {

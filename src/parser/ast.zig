@@ -19,6 +19,8 @@ pub const Statement = union(enum) {
     // PostgreSQL compatibility statements
     With: WithStatement, // Common Table Expressions
     Pragma: PragmaStatement, // PRAGMA statements for introspection
+    Analyze: AnalyzeStatement, // ANALYZE planner statistics
+    Vacuum: VacuumStatement, // VACUUM / storage maintenance
     Explain: ExplainStatement, // EXPLAIN / EXPLAIN QUERY PLAN
     CompoundSelect: CompoundSelectStatement, // UNION/INTERSECT/EXCEPT
     Attach: AttachStatement, // ATTACH DATABASE
@@ -43,6 +45,8 @@ pub const Statement = union(enum) {
             .DropTable => |*stmt| stmt.deinit(allocator),
             .With => |*stmt| stmt.deinit(allocator),
             .Pragma => |*stmt| stmt.deinit(allocator),
+            .Analyze => |*stmt| stmt.deinit(allocator),
+            .Vacuum => {},
             .Explain => |*stmt| stmt.deinit(allocator),
             .CompoundSelect => |*stmt| stmt.deinit(allocator),
             .Attach => |*stmt| stmt.deinit(allocator),
@@ -51,6 +55,8 @@ pub const Statement = union(enum) {
         }
     }
 };
+
+pub const VacuumStatement = struct {};
 
 /// Set operation type for compound SELECT
 pub const SetOperation = enum {
@@ -91,12 +97,21 @@ pub const CompoundSelectStatement = struct {
 pub const PragmaStatement = struct {
     name: []const u8, // e.g., "table_info"
     argument: ?[]const u8, // e.g., table name for table_info
+    value: ?i64 = null, // e.g., PRAGMA user_version = 7
 
     pub fn deinit(self: *PragmaStatement, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         if (self.argument) |arg| {
             allocator.free(arg);
         }
+    }
+};
+
+pub const AnalyzeStatement = struct {
+    table_name: ?[]const u8,
+
+    pub fn deinit(self: *AnalyzeStatement, allocator: std.mem.Allocator) void {
+        if (self.table_name) |table_name| allocator.free(table_name);
     }
 };
 
@@ -399,10 +414,14 @@ pub const ColumnExpression = union(enum) {
 pub const AggregateFunction = struct {
     function_type: AggregateFunctionType,
     column: ?[]const u8, // NULL for COUNT(*)
+    function_name: ?[]const u8 = null,
 
     pub fn deinit(self: *AggregateFunction, allocator: std.mem.Allocator) void {
         if (self.column) |col| {
             allocator.free(col);
+        }
+        if (self.function_name) |name| {
+            allocator.free(name);
         }
     }
 };
@@ -418,6 +437,7 @@ pub const AggregateFunctionType = enum {
     CountDistinct,
     Stddev, // Standard deviation
     Variance, // Statistical variance
+    UserDefined,
 };
 
 /// Column definition in CREATE TABLE
@@ -506,16 +526,28 @@ pub const ColumnConstraint = union(enum) {
     Unique,
     AutoIncrement,
     Default: DefaultValue,
+    Generated: GeneratedColumn,
     ForeignKey: ForeignKeyConstraint,
     Check: CheckConstraint,
 
     pub fn deinit(self: ColumnConstraint, allocator: std.mem.Allocator) void {
         switch (self) {
             .Default => |default| default.deinit(allocator),
+            .Generated => |generated| generated.deinit(allocator),
             .ForeignKey => |fk| fk.deinit(allocator),
             .Check => |check| check.deinit(allocator),
             else => {},
         }
+    }
+};
+
+pub const GeneratedColumn = struct {
+    expression: Expression,
+    stored: bool,
+
+    pub fn deinit(self: GeneratedColumn, allocator: std.mem.Allocator) void {
+        var expression = self.expression;
+        expression.deinit(allocator);
     }
 };
 
@@ -838,6 +870,8 @@ pub const CreateIndexStatement = struct {
     index_name: []const u8,
     table_name: []const u8,
     columns: [][]const u8,
+    expressions: []Expression = &.{},
+    where_clause: ?WhereClause = null,
     unique: bool,
     if_not_exists: bool,
 
@@ -848,6 +882,13 @@ pub const CreateIndexStatement = struct {
             allocator.free(col);
         }
         allocator.free(self.columns);
+        for (self.expressions) |*expression| {
+            expression.deinit(allocator);
+        }
+        if (self.expressions.len > 0) allocator.free(self.expressions);
+        if (self.where_clause) |*where| {
+            where.deinit(allocator);
+        }
     }
 };
 
@@ -984,12 +1025,12 @@ pub const FrameType = enum {
 };
 
 /// Window frame bound
-pub const FrameBound = enum {
+pub const FrameBound = union(enum) {
     UnboundedPreceding,
     UnboundedFollowing,
     CurrentRow,
-    Preceding,
-    Following,
+    Preceding: u32,
+    Following: u32,
 };
 
 /// Window definition (for WINDOW clause)

@@ -160,6 +160,7 @@ pub const BTree = struct {
     /// Initialize a new B-tree with optional caching
     pub fn initWithCache(allocator: std.mem.Allocator, page_manager: *pager.Pager, enable_cache: bool, cache_size: usize) !*Self {
         var tree = try allocator.create(Self);
+        errdefer allocator.destroy(tree);
         tree.allocator = allocator;
         tree.pager = page_manager;
         tree.order = DEFAULT_ORDER;
@@ -173,6 +174,10 @@ pub const BTree = struct {
             const cache = try allocator.create(NodeCache);
             cache.* = NodeCache.init(allocator, actual_cache_size);
             tree.node_cache = cache;
+            errdefer {
+                cache.deinit();
+                allocator.destroy(cache);
+            }
         } else {
             tree.node_cache = null;
         }

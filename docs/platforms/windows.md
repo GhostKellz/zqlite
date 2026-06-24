@@ -59,9 +59,9 @@ if (comptime native_os == .windows) {
 
 ## Test Considerations
 
-- Tests using `/tmp` paths need Windows alternatives (`std.fs.tmpDir()` or env-based)
-- File permission modes (0o644) don't apply on Windows
-- Path separators handled by std.fs automatically
+- Standalone storage tests use per-run repo-local `.zig-cache` scratch directories instead of fixed system temp paths.
+- File permission modes (0o644) don't apply on Windows.
+- Path separators should be handled through `std.fs` APIs.
 
 ## Migration Steps
 

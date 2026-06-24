@@ -1,8 +1,9 @@
 const std = @import("std");
 const zqlite = @import("zqlite");
+const temp_dir = @import("temp_dir.zig");
 
 /// Test filesystem error handling
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -10,7 +11,7 @@ pub fn main() !void {
     std.log.info("=== Filesystem Error Handling Tests ===", .{});
 
     try testInvalidPath(allocator);
-    try testDirectoryAsDatabase(allocator);
+    try testDirectoryAsDatabase(init.io, allocator);
     try testPermissionDenied(allocator);
 
     std.log.info("=== ALL FILESYSTEM ERROR TESTS PASSED ===", .{});
@@ -31,11 +32,13 @@ fn testInvalidPath(allocator: std.mem.Allocator) !void {
     }
 }
 
-fn testDirectoryAsDatabase(allocator: std.mem.Allocator) !void {
+fn testDirectoryAsDatabase(io: std.Io, allocator: std.mem.Allocator) !void {
     std.log.info("[TEST] Directory as database path", .{});
+    var tmp = try temp_dir.TempDir.init(io, allocator, "zqlite-fs-errors");
+    defer tmp.deinit();
 
     // Try to open a directory as a database file
-    const result = zqlite.open(allocator, "/tmp");
+    const result = zqlite.open(allocator, tmp.path);
     if (result) |conn| {
         conn.close();
         std.log.err("Should have failed opening directory as database!", .{});

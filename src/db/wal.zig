@@ -1,13 +1,10 @@
 const std = @import("std");
-const posix = std.posix;
-const builtin = @import("builtin");
-const native_os = builtin.os.tag;
-const Io = std.Io;
+const file_io = @import("file_io.zig");
 
 /// Write-Ahead Log for transaction safety and durability
 pub const WriteAheadLog = struct {
     allocator: std.mem.Allocator,
-    fd: ?posix.fd_t,
+    fd: ?file_io.File,
     is_transaction_active: bool,
     transaction_id: u64,
     log_entries: std.ArrayListUnmanaged(LogEntry),
@@ -31,8 +28,26 @@ pub const WriteAheadLog = struct {
         truncate,
     };
 
+    pub const Stats = struct {
+        path: []const u8,
+        size_bytes: u64,
+        active_transaction: bool,
+        transaction_id: u64,
+        buffered_entries: usize,
+    };
+
     pub fn injectFaultOnce(self: *Self, point: FaultPoint) void {
         self.fault_once = point;
+    }
+
+    pub fn getStats(self: *Self) !Stats {
+        return .{
+            .path = self.wal_path,
+            .size_bytes = try self.getFileSize(),
+            .active_transaction = self.is_transaction_active,
+            .transaction_id = self.transaction_id,
+            .buffered_entries = self.log_entries.items.len,
+        };
     }
 
     fn consumeFault(self: *Self, point: FaultPoint) bool {
@@ -60,20 +75,7 @@ pub const WriteAheadLog = struct {
         errdefer allocator.free(wal_path);
         wal.wal_path = wal_path;
 
-        if (comptime native_os == .windows) {
-            allocator.free(wal_path);
-            allocator.destroy(wal);
-            return error.Unsupported;
-        }
-
-        const wal_path_z = try allocator.dupeSentinel(u8, wal_path, 0);
-        defer allocator.free(wal_path_z);
-
-        // Open or create the WAL file (POSIX path)
-        const fd = posix.openat(posix.AT.FDCWD, wal_path_z, .{
-            .ACCMODE = .RDWR,
-            .CREAT = true,
-        }, 0o644) catch |err| {
+        const fd = file_io.open(allocator, wal_path, .read_write_create) catch |err| {
             allocator.free(wal_path);
             allocator.destroy(wal);
             return err;
@@ -166,7 +168,7 @@ pub const WriteAheadLog = struct {
         // Sync to ensure commit is durable
         if (self.fd) |fd| {
             if (self.consumeFault(.sync)) return error.InjectedSyncFailure;
-            try posix.fdatasync(fd);
+            try file_io.sync(fd);
         }
 
         self.is_transaction_active = false;
@@ -474,7 +476,7 @@ pub const WriteAheadLog = struct {
 
     fn getFileSize(self: *Self) !u64 {
         if (self.fd) |fd_val| {
-            return getFdSize(fd_val);
+            return file_io.size(fd_val);
         }
         return error.FileNotOpen;
     }
@@ -482,7 +484,7 @@ pub const WriteAheadLog = struct {
     fn readAt(self: *Self, buf: []u8, offset: i64) !usize {
         if (self.fd) |fd_val| {
             if (self.consumeFault(.read)) return error.InjectedReadFailure;
-            return preadAll(fd_val, buf, offset);
+            return file_io.readAtAll(fd_val, buf, offset);
         }
         return error.FileNotOpen;
     }
@@ -492,10 +494,10 @@ pub const WriteAheadLog = struct {
             if (self.consumeFault(.write)) return error.InjectedWriteFailure;
             if (self.consumeFault(.partial_write)) {
                 const partial_len = @max(@as(usize, 1), buf.len / 2);
-                try pwriteAll(fd_val, buf[0..partial_len], offset);
+                try file_io.writeAtAll(fd_val, buf[0..partial_len], offset);
                 return error.InjectedPartialWrite;
             }
-            return pwriteAll(fd_val, buf, offset);
+            return file_io.writeAtAll(fd_val, buf, offset);
         }
         return error.FileNotOpen;
     }
@@ -503,14 +505,7 @@ pub const WriteAheadLog = struct {
     fn truncateFile(self: *Self) !void {
         if (self.consumeFault(.truncate)) return error.InjectedTruncateFailure;
         if (self.fd) |wal_fd| {
-            if (comptime native_os == .windows) {
-                return error.Unsupported;
-            } else if (comptime native_os == .linux) {
-                const rc = std.os.linux.ftruncate(wal_fd, 0);
-                if (std.os.linux.errno(rc) != .SUCCESS) return error.TruncateError;
-            } else {
-                if (std.c.ftruncate(wal_fd, 0) != 0) return error.TruncateError;
-            }
+            try file_io.truncate(wal_fd, 0);
             return;
         }
         return error.FileNotOpen;
@@ -542,114 +537,13 @@ pub const WriteAheadLog = struct {
         self.log_entries.deinit(self.allocator);
 
         if (self.fd) |fd| {
-            Io.Threaded.closeFd(fd);
+            file_io.close(fd);
         }
 
         self.allocator.free(self.wal_path);
         self.allocator.destroy(self);
     }
 };
-
-/// Get file size (cross-platform with platform-specific implementations)
-fn getFdSize(fd: posix.fd_t) !u64 {
-    const SEEK_END = 2;
-    const SEEK_SET = 0;
-
-    if (comptime native_os == .windows) {
-        return error.Unsupported;
-    } else if (comptime native_os == .linux) {
-        const end_rc = std.os.linux.lseek(fd, 0, SEEK_END);
-        if (@as(isize, @bitCast(end_rc)) < 0) {
-            return error.SeekError;
-        }
-        const start_rc = std.os.linux.lseek(fd, 0, SEEK_SET);
-        if (@as(isize, @bitCast(start_rc)) < 0) {
-            return error.SeekError;
-        }
-        return end_rc;
-    } else if (comptime native_os.isDarwin()) {
-        // macOS/Darwin
-        const end_rc = std.c.lseek(fd, 0, SEEK_END);
-        if (end_rc < 0) return error.SeekError;
-        _ = std.c.lseek(fd, 0, SEEK_SET);
-        return @intCast(end_rc);
-    } else {
-        // Fallback for other POSIX systems
-        const end_rc = std.c.lseek(fd, 0, SEEK_END);
-        if (end_rc < 0) return error.SeekError;
-        _ = std.c.lseek(fd, 0, SEEK_SET);
-        return @intCast(end_rc);
-    }
-}
-
-/// Cross-platform pread
-fn preadAll(fd: posix.fd_t, buf: []u8, offset: i64) !usize {
-    var total_read: usize = 0;
-    while (total_read < buf.len) {
-        const current_offset = offset + @as(i64, @intCast(total_read));
-        const remaining = buf.len - total_read;
-
-        const bytes_read: usize = blk: {
-            if (comptime native_os == .windows) {
-                return error.Unsupported;
-            } else if (comptime native_os == .linux) {
-                const rc = std.os.linux.pread(fd, buf.ptr + total_read, remaining, current_offset);
-                const signed_rc = @as(isize, @bitCast(rc));
-                if (signed_rc < 0) {
-                    const errno: usize = @bitCast(-signed_rc);
-                    if (errno == 4) continue; // EINTR
-                    return error.ReadError;
-                }
-                break :blk @bitCast(signed_rc);
-            } else {
-                const rc = std.c.pread(fd, buf.ptr + total_read, remaining, current_offset);
-                if (rc < 0) {
-                    if (std.c._errno().* == 4) continue; // EINTR
-                    return error.ReadError;
-                }
-                break :blk @intCast(rc);
-            }
-        };
-
-        if (bytes_read == 0) break;
-        total_read += bytes_read;
-    }
-    return total_read;
-}
-
-/// Cross-platform pwrite
-fn pwriteAll(fd: posix.fd_t, buf: []const u8, offset: i64) !void {
-    var total_written: usize = 0;
-    while (total_written < buf.len) {
-        const current_offset = offset + @as(i64, @intCast(total_written));
-        const remaining = buf.len - total_written;
-
-        const bytes_written: usize = blk: {
-            if (comptime native_os == .windows) {
-                return error.Unsupported;
-            } else if (comptime native_os == .linux) {
-                const rc = std.os.linux.pwrite(fd, buf.ptr + total_written, remaining, current_offset);
-                const signed_rc = @as(isize, @bitCast(rc));
-                if (signed_rc < 0) {
-                    const errno: usize = @bitCast(-signed_rc);
-                    if (errno == 4) continue; // EINTR
-                    return error.WriteError;
-                }
-                break :blk @bitCast(signed_rc);
-            } else {
-                const rc = std.c.pwrite(fd, buf.ptr + total_written, remaining, current_offset);
-                if (rc < 0) {
-                    if (std.c._errno().* == 4) continue; // EINTR
-                    return error.WriteError;
-                }
-                break :blk @intCast(rc);
-            }
-        };
-
-        if (bytes_written == 0) return error.WriteError;
-        total_written += bytes_written;
-    }
-}
 
 /// WAL log entry types
 pub const LogEntryType = enum(u8) {
@@ -773,11 +667,17 @@ pub const LogEntry = struct {
 
 test "wal creation and basic operations" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/zqlite_wal_test.db";
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const test_path = try std.fs.path.join(allocator, &.{ tmp_dir.path, "zqlite_wal_test.db" });
+    defer allocator.free(test_path);
+    const wal_path = try std.fmt.allocPrint(allocator, "{s}-wal", .{test_path});
+    defer allocator.free(wal_path);
 
     // Clean up
     std.fs.cwd().deleteFile(test_path) catch {};
-    std.fs.cwd().deleteFile("/tmp/zqlite_wal_test.db-wal") catch {};
+    std.fs.cwd().deleteFile(wal_path) catch {};
 
     const wal = try WriteAheadLog.init(allocator, test_path);
     defer wal.deinit();
@@ -792,15 +692,21 @@ test "wal creation and basic operations" {
 
     // Clean up
     std.fs.cwd().deleteFile(test_path) catch {};
-    std.fs.cwd().deleteFile("/tmp/zqlite_wal_test.db-wal") catch {};
+    std.fs.cwd().deleteFile(wal_path) catch {};
 }
 
 test "wal rollback" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/zqlite_wal_rollback_test.db";
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const test_path = try std.fs.path.join(allocator, &.{ tmp_dir.path, "zqlite_wal_rollback_test.db" });
+    defer allocator.free(test_path);
+    const wal_path = try std.fmt.allocPrint(allocator, "{s}-wal", .{test_path});
+    defer allocator.free(wal_path);
 
     std.fs.cwd().deleteFile(test_path) catch {};
-    std.fs.cwd().deleteFile("/tmp/zqlite_wal_rollback_test.db-wal") catch {};
+    std.fs.cwd().deleteFile(wal_path) catch {};
 
     const wal = try WriteAheadLog.init(allocator, test_path);
     defer wal.deinit();
@@ -812,15 +718,21 @@ test "wal rollback" {
     try std.testing.expect(!wal.is_transaction_active);
 
     std.fs.cwd().deleteFile(test_path) catch {};
-    std.fs.cwd().deleteFile("/tmp/zqlite_wal_rollback_test.db-wal") catch {};
+    std.fs.cwd().deleteFile(wal_path) catch {};
 }
 
 test "wal handles truncated entry safely" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/zqlite_wal_truncated.db";
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const test_path = try std.fs.path.join(allocator, &.{ tmp_dir.path, "zqlite_wal_truncated.db" });
+    defer allocator.free(test_path);
+    const wal_path = try std.fmt.allocPrint(allocator, "{s}-wal", .{test_path});
+    defer allocator.free(wal_path);
 
     std.fs.cwd().deleteFile(test_path) catch {};
-    std.fs.cwd().deleteFile("/tmp/zqlite_wal_truncated.db-wal") catch {};
+    std.fs.cwd().deleteFile(wal_path) catch {};
 
     const wal = try WriteAheadLog.init(allocator, test_path);
     defer wal.deinit();
@@ -838,5 +750,5 @@ test "wal handles truncated entry safely" {
     try wal.checkpoint();
 
     std.fs.cwd().deleteFile(test_path) catch {};
-    std.fs.cwd().deleteFile("/tmp/zqlite_wal_truncated.db-wal") catch {};
+    std.fs.cwd().deleteFile(wal_path) catch {};
 }

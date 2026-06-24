@@ -11,8 +11,8 @@ This document describes features that are experimental, proof-of-concept, or not
 | Feature | Status | Usable |
 |---------|--------|--------|
 | Post-Quantum QUIC Transport | Experimental | No |
-| ML-KEM-768 Key Encapsulation | Experimental | No |
-| ML-DSA-65 Digital Signatures | Experimental | No |
+| ML-KEM-768 Key Encapsulation | Experimental | Limited |
+| ML-DSA-65 Digital Signatures | Experimental | Limited |
 | Distributed Query Engine | Experimental | No |
 | Cluster Manager | Experimental | No |
 | Hot Standby Replication | Experimental | No |
@@ -53,25 +53,29 @@ A demonstration of post-quantum secure database transport combining QUIC with ML
 
 ---
 
-### ML-KEM-768 / ML-DSA-65 (`src/crypto/secure_storage.zig`)
+### ML-KEM-768 / ML-DSA-65 (`src/crypto/pqc_backend.zig`)
 
-**Status:** Placeholder - Requires external library
+**Status:** Experimental stdlib-backed adapter
 
 Post-quantum key encapsulation and digital signatures based on NIST standards.
 
 **Current Limitations:**
-- PQ algorithms (ML-KEM, ML-DSA) are experimental scaffolding only
-- `hybrid_mode` flag signals intent but falls back to classical crypto
-- No actual ML-KEM encapsulation or ML-DSA signing
+- Direct Zig stdlib-backed ML-KEM-768 and ML-DSA-65 operations exist and are covered by `zig build test-pqc`
+- PQC/hybrid mode is not active by default; it requires `-Dcrypto=true` and a runtime PQC/hybrid request
+- Strict PQC/hybrid requests fail closed unless classical fallback is explicitly allowed
+- PQ transport remains simulated and does not perform real ML-KEM network key exchange
 - ZKP (zero-knowledge proofs) support is stubbed
 
-**Fallback Behavior (v1.5.2+):**
-When PQ crypto is requested but unavailable, the system logs a warning and falls back to Ed25519 for signatures and X25519 for key exchange.
+**Fallback Behavior:**
+Classical fallback is explicit and observable through the PQ capability state. Fallback is never reported as production-ready PQC.
 
 **Requirements for Production:**
-- Integration with NIST-approved PQ implementation
+- Official known-answer vectors and reproducible release-package tests
 - Cryptographic audit by third-party security experts
+- Backend version pinning, with liboqs remaining the likely long-term optional C backend
 - Hardware security module (HSM) support for key storage
+
+See [Future liboqs Backend](liboqs-backend.md) for the optional-provider integration plan.
 
 ---
 
@@ -302,9 +306,9 @@ There is no global `zqlite.features.pq_crypto` or `zqlite.features.cluster` runt
 Some experimental areas degrade or fall back gracefully, but this is feature-specific and should not be assumed globally:
 
 ```zig
-// PQ crypto falls back to classical
-const keypair = try crypto_engine.generateKeyPair();
-// If PQ unavailable, returns Ed25519 keypair with warning
+// Check PQ capability before relying on PQ behavior.
+const pq = zqlite.getPQCapability();
+if (!pq.isAvailable()) return error.PQCUnavailable;
 
 // Cluster queries fall back to local
 const result = try cluster.routeQuery(query);

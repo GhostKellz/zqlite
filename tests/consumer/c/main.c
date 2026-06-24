@@ -8,6 +8,18 @@ int main(void) {
     if (conn == NULL) return 1;
     if (zqlite_abi_version_major() != ZQLITE_ABI_VERSION_MAJOR) return 16;
     if (zqlite_abi_version() < 10000) return 17;
+    if (zqlite_pq_available() != 0) return 34;
+    if (strcmp(zqlite_pq_backend(), "none") != 0) return 35;
+    if (strcmp(zqlite_pq_liboqs_status(), "not_configured") != 0) return 36;
+    const char *pq_status = zqlite_pq_status();
+    if (pq_status == NULL || strlen(pq_status) == 0) return 37;
+    const char *pq_json = zqlite_pq_diagnostics_json();
+    if (pq_json == NULL) return 38;
+    if (strstr(pq_json, "\"available\":false") == NULL) return 39;
+    if (strstr(pq_json, "\"backend\":\"none\"") == NULL) return 40;
+    if (strstr(pq_json, "\"provider\":\"stdlib\"") == NULL) return 41;
+    if (strstr(pq_json, "\"liboqs_status\":\"not_configured\"") == NULL) return 42;
+    zqlite_free_string(pq_json);
 
     if (zqlite_execute(conn, "CREATE TABLE smoke (id INTEGER, name TEXT)") != ZQLITE_OK) return 2;
     if (zqlite_execute(conn, "INSERT INTO smoke VALUES (1, 'package-ok')") != ZQLITE_OK) return 3;
