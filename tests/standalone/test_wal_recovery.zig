@@ -126,7 +126,7 @@ fn testTruncatedPayload(io: std.Io, allocator: std.mem.Allocator) !void {
     defer cleanup(io, paths.path, paths.wal_path);
 
     var header: [25]u8 = undefined;
-    header[0] = @intFromEnum(LogEntryType.PageWrite);
+    header[0] = @backingInt(LogEntryType.PageWrite);
     std.mem.writeInt(u64, header[1..9], 1, .little);
     std.mem.writeInt(u32, header[9..13], 2, .little);
     std.mem.writeInt(u32, header[13..17], 0, .little);
@@ -149,7 +149,7 @@ fn testOversizedLengthField(io: std.Io, allocator: std.mem.Allocator) !void {
     defer cleanup(io, paths.path, paths.wal_path);
 
     var header: [25]u8 = undefined;
-    header[0] = @intFromEnum(LogEntryType.PageWrite);
+    header[0] = @backingInt(LogEntryType.PageWrite);
     std.mem.writeInt(u64, header[1..9], 1, .little);
     std.mem.writeInt(u32, header[9..13], 2, .little);
     std.mem.writeInt(u32, header[13..17], 0, .little);

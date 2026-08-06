@@ -23,13 +23,27 @@ Use the stable test set as the coverage workload:
 ./scripts/coverage-report.sh
 ```
 
-The script runs the stable core tests with normal project cache behavior and prints the files/scopes that should be fed into a runner-level coverage collector such as `kcov`, `llvm-cov`, or the Zig coverage mode selected for the release runner.
+The script requires `kcov`, builds stable test executables in Debug mode, runs
+each executable under the collector, and merges the results. It writes the HTML
+report and Cobertura XML under `zig-out/coverage/report/kcov-merged/`. Crypto,
+transport, distributed, cluster, and wallet sources are excluded from this
+stable-core report.
+
+The run also writes `zig-out/coverage/report/summary.json` with stable
+`lines_valid`, `line_rate`, and `branch_rate` fields. It fails closed when the
+collector reports zero valid project lines. Set `ZQLITE_MIN_LINE_COVERAGE` to enforce
+a previously observed clean-run line-rate floor. Keep it unset while collecting
+a new runner baseline; never guess a percentage from a machine without `kcov`.
+
+The Arch `kcov 43` package, a locally rebuilt BFD-enabled `kcov 43`, and current
+upstream `kcov` all reject the pinned Zig DWARF as zero project lines. Coverage
+therefore remains informational: CI skips collection when `kcov` is absent and
+does not upload an artifact when collection fails or reports zero valid lines.
 
 ## Release Expectation
 
-For v1.7.0, coverage reporting is informational. Do not fail release builds on a percentage until:
+Coverage reporting remains informational. Do not fail release builds on a percentage until:
 
-- the CI runner has one selected coverage collector
 - generated files and experimental modules are excluded consistently
 - line and branch thresholds are recorded here
 - the threshold has passed on at least one clean release validation run

@@ -16,6 +16,7 @@ pub const Statement = union(enum) {
     CreateIndex: CreateIndexStatement,
     DropIndex: DropIndexStatement,
     DropTable: DropTableStatement,
+    AlterTable: AlterTableStatement,
     // PostgreSQL compatibility statements
     With: WithStatement, // Common Table Expressions
     Pragma: PragmaStatement, // PRAGMA statements for introspection
@@ -43,6 +44,7 @@ pub const Statement = union(enum) {
             .CreateIndex => |*stmt| stmt.deinit(allocator),
             .DropIndex => |*stmt| stmt.deinit(allocator),
             .DropTable => |*stmt| stmt.deinit(allocator),
+            .AlterTable => |*stmt| stmt.deinit(allocator),
             .With => |*stmt| stmt.deinit(allocator),
             .Pragma => |*stmt| stmt.deinit(allocator),
             .Analyze => |*stmt| stmt.deinit(allocator),
@@ -52,6 +54,36 @@ pub const Statement = union(enum) {
             .Attach => |*stmt| stmt.deinit(allocator),
             .Detach => |*stmt| stmt.deinit(allocator),
             .CreateVirtualTable => |*stmt| stmt.deinit(allocator),
+        }
+    }
+};
+
+pub const AlterTableStatement = struct {
+    table_name: []const u8,
+    action: Action,
+
+    pub const Action = union(enum) {
+        RenameTable: []const u8,
+        RenameColumn: struct {
+            old_name: []const u8,
+            new_name: []const u8,
+        },
+        AddColumn: ColumnDefinition,
+    };
+
+    pub fn deinit(self: *AlterTableStatement, allocator: std.mem.Allocator) void {
+        allocator.free(self.table_name);
+        switch (self.action) {
+            .RenameTable => |new_name| allocator.free(new_name),
+            .RenameColumn => |rename| {
+                allocator.free(rename.old_name);
+                allocator.free(rename.new_name);
+            },
+            .AddColumn => |column| {
+                allocator.free(column.name);
+                for (column.constraints) |constraint| constraint.deinit(allocator);
+                allocator.free(column.constraints);
+            },
         }
     }
 };
@@ -781,17 +813,28 @@ pub const SortDirection = enum {
 /// Foreign key constraint
 pub const ForeignKeyConstraint = struct {
     column: ?[]const u8, // null for column-level, set for table-level
+    columns: ?[][]const u8 = null,
     reference_table: []const u8,
     reference_column: []const u8,
+    reference_columns: ?[][]const u8 = null,
     on_delete: ?ForeignKeyAction,
     on_update: ?ForeignKeyAction,
+    deferred: bool = false,
 
     pub fn deinit(self: ForeignKeyConstraint, allocator: std.mem.Allocator) void {
         if (self.column) |col| {
             allocator.free(col);
         }
+        if (self.columns) |columns| {
+            for (columns) |col| allocator.free(col);
+            allocator.free(columns);
+        }
         allocator.free(self.reference_table);
         allocator.free(self.reference_column);
+        if (self.reference_columns) |columns| {
+            for (columns) |col| allocator.free(col);
+            allocator.free(columns);
+        }
     }
 };
 

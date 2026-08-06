@@ -36,6 +36,7 @@ typedef struct zqlite_stmt zqlite_stmt_t;
 #define ZQLITE_LOCKED       6
 #define ZQLITE_NOMEM        7
 #define ZQLITE_READONLY     8
+#define ZQLITE_INTERRUPT    9
 #define ZQLITE_IOERR       10
 #define ZQLITE_CORRUPT     11
 #define ZQLITE_CONSTRAINT  19

@@ -20,6 +20,7 @@ pub const ZQLITE_BUSY = 5;
 pub const ZQLITE_LOCKED = 6;
 pub const ZQLITE_NOMEM = 7;
 pub const ZQLITE_READONLY = 8;
+pub const ZQLITE_INTERRUPT = 9;
 pub const ZQLITE_IOERR = 10;
 pub const ZQLITE_CORRUPT = 11;
 pub const ZQLITE_CONSTRAINT = 19;
@@ -101,6 +102,7 @@ const ConnectionWrapper = struct {
 
 const StatementWrapper = struct {
     statement: *zqlite.db.PreparedStatement,
+    owner_handle: usize,
     result: ?zqlite.vm.ExecutionResult = null,
     row_index: usize = 0,
     text_buffer: ?[:0]u8 = null,
@@ -139,7 +141,9 @@ fn getResult(result: ?*zqlite_result_t) ?*QueryResult {
 fn getStatement(stmt: ?*zqlite_stmt_t) ?*StatementWrapper {
     const s = stmt orelse return null;
     if (!isLiveHandle(.statement, @ptrCast(s))) return null;
-    return @ptrCast(@alignCast(s));
+    const wrapper: *StatementWrapper = @ptrCast(@alignCast(s));
+    if (!isLiveHandle(.connection, @ptrFromInt(wrapper.owner_handle))) return null;
+    return wrapper;
 }
 
 // Default global allocator for C API. SafeAllocator is thread-safe when backed
@@ -310,15 +314,19 @@ export fn zqlite_execute(conn: ?*zqlite_connection_t, sql: [*:0]const u8) c_int 
 fn mapErrorToCode(err: anyerror) c_int {
     return switch (err) {
         error.OutOfMemory => ZQLITE_NOMEM,
-        error.TableNotFound => ZQLITE_ERROR,
-        error.ColumnNotFound => ZQLITE_ERROR,
-        error.SyntaxError => ZQLITE_ERROR,
+        error.TableNotFound, error.TableAlreadyExists, error.ColumnNotFound, error.SchemaNotFound, error.SyntaxError, error.ParseError => ZQLITE_ERROR,
         error.TypeMismatch => ZQLITE_MISMATCH,
-        error.ConstraintViolation, error.UniqueConstraintViolation, error.MissingRequiredValue => ZQLITE_CONSTRAINT,
+        error.ConstraintViolation, error.UniqueConstraintViolation, error.MissingRequiredValue, error.InvalidForeignKey, error.CannotWriteGeneratedColumn => ZQLITE_CONSTRAINT,
         error.InvalidParameterIndex, error.ParameterIndexOutOfBounds, error.NamedParameterNotFound => ZQLITE_RANGE,
-        error.SavepointNotFound, error.TransactionAlreadyActive, error.TransactionActive, error.UnsupportedDDLInSavepoint, error.PreparedStatementExpired => ZQLITE_MISUSE,
-        error.IoError => ZQLITE_IOERR,
-        error.CorruptData => ZQLITE_CORRUPT,
+        error.SavepointNotFound, error.TransactionAlreadyActive, error.TransactionActive, error.UnsupportedDDLInSavepoint, error.PreparedStatementExpired, error.ResourceLimitExceeded, error.FeatureUnavailable => ZQLITE_MISUSE,
+        error.ReadOnlyDatabase, error.ReadOnlyFileSystem => ZQLITE_READONLY,
+        error.Interrupted => ZQLITE_INTERRUPT,
+        error.OperationTimedOut, error.DatabaseBusy, error.WouldBlock, error.FileBusy, error.DeviceBusy => ZQLITE_BUSY,
+        error.FileLocksUnsupported => ZQLITE_NOLFS,
+        error.PathNotInAllowedRoots, error.PathTraversalDetected, error.RelativePathNotAllowed, error.RelativePathWithRootsNotSupported, error.InvalidPathCharacter, error.MemoryDatabaseNotAllowed => ZQLITE_AUTH,
+        error.IoError, error.InputOutput, error.AccessDenied, error.PermissionDenied, error.DiskQuota, error.FileTooBig, error.NoSpaceLeft, error.FileNotFound, error.NotDir, error.IsDir, error.ReadError, error.WriteError, error.SeekError, error.TruncateError => ZQLITE_IOERR,
+        error.CorruptData, error.CorruptCatalog, error.InvalidMetadata => ZQLITE_CORRUPT,
+        error.UnsupportedDatabaseFormat, error.UnsupportedFormatVersion, error.InvalidFormatVersion => ZQLITE_FORMAT,
         else => ZQLITE_ERROR,
     };
 }
@@ -328,7 +336,7 @@ fn mapCodeToCategory(code: c_int) c_int {
         ZQLITE_OK => ZQLITE_ERROR_CATEGORY_OK,
         ZQLITE_CONSTRAINT => ZQLITE_ERROR_CATEGORY_CONSTRAINT,
         ZQLITE_IOERR, ZQLITE_READONLY, ZQLITE_NOLFS => ZQLITE_ERROR_CATEGORY_IO,
-        ZQLITE_MISUSE, ZQLITE_RANGE, ZQLITE_BUSY, ZQLITE_LOCKED => ZQLITE_ERROR_CATEGORY_MISUSE,
+        ZQLITE_MISUSE, ZQLITE_RANGE, ZQLITE_BUSY, ZQLITE_LOCKED, ZQLITE_INTERRUPT => ZQLITE_ERROR_CATEGORY_MISUSE,
         ZQLITE_NOMEM => ZQLITE_ERROR_CATEGORY_MEMORY,
         ZQLITE_AUTH => ZQLITE_ERROR_CATEGORY_AUTHORIZATION,
         ZQLITE_CORRUPT, ZQLITE_FORMAT, ZQLITE_NOTADB => ZQLITE_ERROR_CATEGORY_FORMAT,
@@ -587,7 +595,10 @@ export fn zqlite_prepare(conn: ?*zqlite_connection_t, sql: [*:0]const u8) ?*zqli
         wrapper.error_info.set(ZQLITE_NOMEM, "OutOfMemory", sql);
         return null;
     };
-    stmt_wrapper.* = .{ .statement = stmt };
+    stmt_wrapper.* = .{
+        .statement = stmt,
+        .owner_handle = @intFromPtr(conn.?),
+    };
     const handle = @as(*zqlite_stmt_t, @ptrCast(stmt_wrapper));
     if (!registerHandle(.statement, @ptrCast(handle))) {
         stmt_wrapper.statement.deinit();
@@ -1076,6 +1087,28 @@ test "c api misuse returns stable errors" {
 
     zqlite_close(conn);
     try testing.expectEqual(ZQLITE_MISUSE, zqlite_execute(conn, "SELECT 1"));
+}
+
+test "c api maps public storage and policy errors" {
+    const cases = [_]struct {
+        err: anyerror,
+        code: c_int,
+        category: c_int,
+    }{
+        .{ .err = error.ReadOnlyDatabase, .code = ZQLITE_READONLY, .category = ZQLITE_ERROR_CATEGORY_IO },
+        .{ .err = error.Interrupted, .code = ZQLITE_INTERRUPT, .category = ZQLITE_ERROR_CATEGORY_MISUSE },
+        .{ .err = error.OperationTimedOut, .code = ZQLITE_BUSY, .category = ZQLITE_ERROR_CATEGORY_MISUSE },
+        .{ .err = error.PathNotInAllowedRoots, .code = ZQLITE_AUTH, .category = ZQLITE_ERROR_CATEGORY_AUTHORIZATION },
+        .{ .err = error.CorruptCatalog, .code = ZQLITE_CORRUPT, .category = ZQLITE_ERROR_CATEGORY_FORMAT },
+        .{ .err = error.UnsupportedDatabaseFormat, .code = ZQLITE_FORMAT, .category = ZQLITE_ERROR_CATEGORY_FORMAT },
+        .{ .err = error.NoSpaceLeft, .code = ZQLITE_IOERR, .category = ZQLITE_ERROR_CATEGORY_IO },
+    };
+
+    for (cases) |case| {
+        const code = mapErrorToCode(case.err);
+        try std.testing.expectEqual(case.code, code);
+        try std.testing.expectEqual(case.category, mapCodeToCategory(code));
+    }
 }
 
 test "c api string and blob ownership" {

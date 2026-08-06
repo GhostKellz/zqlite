@@ -3,32 +3,97 @@ name: CI
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  linux-release-gate:
-    name: Linux release gate
-    runs-on: self-hosted
+  preflight:
+    name: Lint and contracts
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - run: ./scripts/test-release.sh
+      - uses: actions/checkout@v6
+      - run: ./scripts/check-zig-version.sh
+      - run: zig fmt --check src/ examples/ tests/
+      - run: |
+          bash scripts/check-repository-hygiene.sh
+          bash scripts/check-c-api.sh
+
+  build-test:
+    name: Build and unit tests
+    needs: preflight
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - run: ./scripts/check-zig-version.sh
+      - run: zig build
+      - run: |
+          zig build -Dprofile=core
+          zig build -Dprofile=advanced
+          zig build -Dprofile=experimental
+          zig build -Dprofile=full
+      - run: zig build test --summary all
+      - run: zig build test-release-package
+
+  memory-tests:
+    name: Memory regression tests
+    needs: build-test
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - run: ./scripts/check-zig-version.sh
+      - run: zig build test-memory-leaks
+      - run: zig build test-comprehensive-memory
+
+  benchmarks:
+    name: Benchmark validation
+    needs: build-test
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - run: ./scripts/check-zig-version.sh
+      - run: zig build bench-validate
+      - run: zig build bench-storage-evidence
+
+  extended-tests:
+    name: Extended test suite
+    needs: build-test
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - run: ./scripts/check-zig-version.sh
+      - run: zig build test-security
+      - run: zig build test-comprehensive
+      - run: zig build test-storage
+      - run: zig build test-advanced
+      - run: zig build test-c-api
 
   profile-matrix:
     name: Profile ${{ matrix.profile }} / ${{ matrix.optimize }}
-    runs-on: self-hosted
+    needs: preflight
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         profile: [core, advanced, experimental, full]
         optimize: [Debug, ReleaseSafe, ReleaseFast]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+      - run: ./scripts/check-zig-version.sh
       - run: zig build test -Dprofile=${{ matrix.profile }} -Doptimize=${{ matrix.optimize }} --summary all
 
-  linux-arch-cross-compile:
+  linux-cross-compile:
     name: Linux cross compile ${{ matrix.target }}
-    runs-on: self-hosted
+    needs: preflight
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -36,31 +101,37 @@ jobs:
           - x86_64-linux-gnu
           - aarch64-linux-gnu
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+      - run: ./scripts/check-zig-version.sh
       - run: zig build -Dtarget=${{ matrix.target }} -Dprofile=advanced
 
-  macos-file-backed:
-    name: macOS file-backed smoke
-    runs-on: self-hosted
-    steps:
-      - uses: actions/checkout@v4
-      - run: zig build test-storage --summary all
-
-  minimum-zig:
-    name: Minimum Zig compatibility
-    runs-on: self-hosted
-    steps:
-      - uses: actions/checkout@v4
-      - run: zig build test --summary all
-
   stable-core-coverage:
-    name: Stable core coverage workload
-    runs-on: self-hosted
+    name: Stable core coverage
+    needs: build-test
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - run: mkdir -p zig-out/coverage
-      - run: ./scripts/coverage-report.sh | tee zig-out/coverage/stable-core-coverage.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/checkout@v6
+      - run: ./scripts/check-zig-version.sh
+      - name: Detect coverage collector
+        id: coverage-tool
+        run: |
+          if command -v kcov >/dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::kcov is not installed; skipping informational coverage collection"
+          fi
+      - name: Generate coverage report
+        id: coverage-report
+        if: steps.coverage-tool.outputs.available == 'true'
+        continue-on-error: true
+        run: ./scripts/coverage-report.sh
+      - uses: actions/upload-artifact@v7
+        if: steps.coverage-report.outcome == 'success'
         with:
           name: stable-core-coverage
-          path: zig-out/coverage/stable-core-coverage.txt
+          path: |
+            zig-out/coverage/report/summary.json
+            zig-out/coverage/report/kcov-merged/cobertura.xml
+          if-no-files-found: error

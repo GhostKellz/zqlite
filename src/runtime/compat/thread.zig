@@ -41,8 +41,8 @@ pub const Instant = struct {
             .windows => {
                 var counter: i64 = undefined;
                 var freq: i64 = undefined;
-                if (QueryPerformanceCounter(&counter) == 0) return 0;
-                if (QueryPerformanceFrequency(&freq) == 0 or freq == 0) return 0;
+                if (!QueryPerformanceCounter(&counter).toBool()) return 0;
+                if (!QueryPerformanceFrequency(&freq).toBool() or freq == 0) return 0;
                 return @divFloor(@as(i128, counter) * std.time.ns_per_s, freq);
             },
             else => {
@@ -157,7 +157,7 @@ pub const Mutex = struct {
         }
 
         while (self.state.swap(.contended, .acquire) != .unlocked) {
-            futexWait(@ptrCast(&self.state.raw), @intFromEnum(State.contended));
+            futexWait(@ptrCast(&self.state.raw), @backingInt(State.contended));
         }
     }
 

@@ -1,9 +1,11 @@
 name: Release
+run-name: Release ${{ github.ref_name }}
 
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -11,7 +13,8 @@ permissions:
 jobs:
   release-linux:
     name: Build Linux Release
-    runs-on: self-hosted
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -65,7 +68,7 @@ jobs:
   create-release:
     name: Create GitHub Release
     needs: [release-linux]
-    runs-on: self-hosted
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -73,13 +76,16 @@ jobs:
       - name: Download release artifacts
         uses: actions/download-artifact@v8
         with:
+          name: linux-release
           path: release-artifacts
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          name: ZQLite ${{ github.ref_name }}
           files: |
-            release-artifacts/linux-release/*
+            release-artifacts/*
+          fail_on_unmatched_files: true
           draft: false
           prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
           generate_release_notes: true

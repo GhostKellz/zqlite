@@ -9,6 +9,10 @@ ZIG="${ZIG:-zig}"
 echo "=== ZQLite Release Validation ==="
 echo ""
 
+echo "--- Toolchain Check ---"
+bash scripts/check-zig-version.sh
+echo ""
+
 echo "--- Format Check ---"
 $ZIG fmt --check src/
 $ZIG fmt --check examples/

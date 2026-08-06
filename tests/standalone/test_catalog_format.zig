@@ -337,8 +337,11 @@ fn testLegacyMigration(io: std.Io, allocator: std.mem.Allocator) !void {
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 2), result.rows.items.len);
 
-        // Force a metadata rewrite to trigger migration to the new format.
+        // Schema evolution itself must be able to migrate a legacy catalog.
+        try conn.execute("ALTER TABLE users RENAME COLUMN name TO display_name");
+        try conn.execute("ALTER TABLE users RENAME TO customers");
         try conn.execute("CREATE TABLE extra (id INTEGER)");
+        try conn.execute("ALTER TABLE extra ADD COLUMN label TEXT DEFAULT 'new'");
     }
 
     // 4. Page 1 must now be a superblock, and data is still intact.
@@ -350,10 +353,10 @@ fn testLegacyMigration(io: std.Io, allocator: std.mem.Allocator) !void {
         const conn = try zqlite.open(allocator, path);
         defer conn.close();
         try std.testing.expect(!conn.storage_engine.legacy_format);
-        var users = try conn.query("SELECT * FROM users");
-        defer users.deinit();
-        try std.testing.expectEqual(@as(usize, 2), users.rows.items.len);
-        var extra = try conn.query("SELECT * FROM extra");
+        var customers = try conn.query("SELECT id, display_name FROM customers");
+        defer customers.deinit();
+        try std.testing.expectEqual(@as(usize, 2), customers.rows.items.len);
+        var extra = try conn.query("SELECT id, label FROM extra");
         defer extra.deinit();
         try std.testing.expectEqual(@as(usize, 0), extra.rows.items.len);
     }

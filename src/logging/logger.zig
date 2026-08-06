@@ -79,7 +79,7 @@ pub const Logger = struct {
     }
 
     pub fn log(self: *Self, level: LogLevel, comptime fmt: []const u8, args: anytype) void {
-        if (@intFromEnum(level) < @intFromEnum(self.config.level)) {
+        if (@backingInt(level) < @backingInt(self.config.level)) {
             return; // Below minimum log level
         }
 

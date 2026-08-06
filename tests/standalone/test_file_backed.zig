@@ -27,6 +27,7 @@ pub fn main(init: std.process.Init) !void {
     try testCheckConstraintPersists(allocator);
     try testForeignKeyConstraintPersists(allocator);
     try testForeignKeyActionsPersist(allocator);
+    try testCompositeAndDeferredForeignKeysPersist(allocator);
     try testInsertDefaultValues(allocator);
     try testCheckpointWalStatsAndBackup(allocator);
     try testReadOnlyAndImmutableOpenModes(allocator);
@@ -38,8 +39,62 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("=== ALL FILE-BACKED TESTS PASSED ===", .{});
 }
 
+fn testCompositeAndDeferredForeignKeysPersist(allocator: std.mem.Allocator) !void {
+    std.log.info("[TEST] Composite and deferred foreign keys persist", .{});
+    const path = try test_dir.dbPath("composite_deferred_fk.db");
+    defer allocator.free(path);
+
+    {
+        const conn = try zqlite.open(allocator, path);
+        defer conn.close();
+        try conn.execute("CREATE TABLE parents (tenant_id INTEGER, id INTEGER)");
+        try conn.execute("CREATE TABLE children (tenant_id INTEGER, parent_id INTEGER, FOREIGN KEY (tenant_id, parent_id) REFERENCES parents (tenant_id, id))");
+        var composite_info = try conn.query("PRAGMA foreign_key_list(children)");
+        defer composite_info.deinit();
+        try std.testing.expectEqual(@as(usize, 2), composite_info.rows.items.len);
+        try conn.execute("INSERT INTO parents VALUES (1, 10)");
+        try conn.execute("INSERT INTO children VALUES (1, 10)");
+        try conn.execute("INSERT INTO children VALUES (NULL, 999)");
+        try std.testing.expectError(error.ConstraintViolation, conn.execute("INSERT INTO children VALUES (2, 10)"));
+        try std.testing.expectError(error.ConstraintViolation, conn.execute("DELETE FROM parents WHERE tenant_id = 1 AND id = 10"));
+
+        try conn.execute("CREATE TABLE deferred_parents (id INTEGER)");
+        try conn.execute("CREATE TABLE deferred_children (parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES deferred_parents (id) DEFERRABLE INITIALLY DEFERRED)");
+        try conn.execute("BEGIN");
+        try conn.execute("INSERT INTO deferred_children VALUES (7)");
+        try conn.execute("INSERT INTO deferred_parents VALUES (7)");
+        try conn.execute("COMMIT");
+
+        try conn.execute("BEGIN");
+        try conn.execute("DELETE FROM deferred_parents WHERE id = 7");
+        try std.testing.expectError(error.ConstraintViolation, conn.execute("COMMIT"));
+        try conn.execute("ROLLBACK");
+
+        try conn.execute("BEGIN");
+        try conn.execute("INSERT INTO deferred_children VALUES (8)");
+        try std.testing.expectError(error.ConstraintViolation, conn.execute("COMMIT"));
+        try std.testing.expect(conn.in_transaction);
+        try conn.execute("ROLLBACK");
+        try std.testing.expectError(error.ConstraintViolation, conn.execute("INSERT INTO deferred_children VALUES (9)"));
+    }
+
+    {
+        const reopened = try zqlite.open(allocator, path);
+        defer reopened.close();
+        const composite = reopened.storage_engine.getTable("children").?.schema.foreign_keys[0];
+        try std.testing.expectEqual(@as(usize, 2), composite.columns.?.len);
+        const deferred = reopened.storage_engine.getTable("deferred_children").?.schema.foreign_keys[0];
+        try std.testing.expect(deferred.deferred);
+        try std.testing.expectError(error.ConstraintViolation, reopened.execute("INSERT INTO children VALUES (1, 11)"));
+        var rows = try reopened.query("SELECT * FROM deferred_children");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 1), rows.rows.items.len);
+    }
+    std.log.info("[PASS] Composite matching and commit-time deferred checks survived reopen", .{});
+}
+
 fn testVacuumMaintenanceCommand(allocator: std.mem.Allocator) !void {
-    std.log.info("[TEST] VACUUM maintenance command rebuilds indexes and validates integrity", .{});
+    std.log.info("[TEST] VACUUM reclaims pages and refreshes existing readers", .{});
     const path = try test_dir.dbPath("vacuum_maintenance.db");
     defer allocator.free(path);
 
@@ -49,9 +104,38 @@ fn testVacuumMaintenanceCommand(allocator: std.mem.Allocator) !void {
 
         try conn.execute("CREATE TABLE vacuum_items (id INTEGER, name TEXT)");
         try conn.execute("CREATE UNIQUE INDEX idx_vacuum_items_id ON vacuum_items (id)");
-        try conn.execute("INSERT INTO vacuum_items VALUES (1, 'one')");
-        try conn.execute("INSERT INTO vacuum_items VALUES (2, 'two')");
-        try conn.execute("DELETE FROM vacuum_items WHERE id = 1");
+        for (0..10) |id| {
+            var sql: [96]u8 = undefined;
+            try conn.execute(try std.fmt.bufPrint(&sql, "INSERT INTO vacuum_items VALUES ({d}, 'kept')", .{id}));
+        }
+        try conn.execute("CREATE TABLE discarded_pages (id INTEGER, payload TEXT)");
+        const payload = try allocator.alloc(u8, 1500);
+        defer allocator.free(payload);
+        @memset(payload, 'x');
+        try conn.begin();
+        for (0..80) |id| {
+            const sql = try std.fmt.allocPrint(allocator, "INSERT INTO discarded_pages VALUES ({d}, '{s}')", .{ id, payload });
+            defer allocator.free(sql);
+            try conn.execute(sql);
+        }
+        try conn.commit();
+        try conn.execute("DROP TABLE discarded_pages");
+        try conn.flush();
+
+        const before_file = try std.Io.Dir.cwd().openFile(test_io, path, .{});
+        const before_size = try before_file.length(test_io);
+        before_file.close(test_io);
+        const observer = try zqlite.open(allocator, path);
+        defer observer.close();
+
+        conn.storage_engine.pager.injectFaultOnce(.sync);
+        try std.testing.expectError(error.InjectedSyncFailure, conn.query("VACUUM"));
+        conn.interrupt();
+        try std.testing.expectError(error.Interrupted, conn.query("VACUUM"));
+        conn.clearInterrupt();
+        var unchanged = try conn.query("SELECT * FROM vacuum_items");
+        defer unchanged.deinit();
+        try std.testing.expectEqual(@as(usize, 10), unchanged.rows.items.len);
 
         var result = try conn.query("VACUUM");
         defer result.deinit();
@@ -62,9 +146,17 @@ fn testVacuumMaintenanceCommand(allocator: std.mem.Allocator) !void {
         defer check.deinit();
         try std.testing.expectEqualStrings("ok", check.rows.items[0].values[0].Text);
         try conn.flush();
-    }
 
-    std.log.info("[PASS] VACUUM maintenance command completed and preserved integrity", .{});
+        const after_file = try std.Io.Dir.cwd().openFile(test_io, path, .{});
+        const after_size = try after_file.length(test_io);
+        after_file.close(test_io);
+        try std.testing.expect(after_size < before_size);
+
+        var visible = try observer.query("SELECT * FROM vacuum_items");
+        defer visible.deinit();
+        try std.testing.expectEqual(@as(usize, 10), visible.rows.items.len);
+        std.log.info("[PASS] VACUUM reduced database from {d} to {d} bytes", .{ before_size, after_size });
+    }
 }
 
 fn testIntegrityCheckPragma(allocator: std.mem.Allocator) !void {

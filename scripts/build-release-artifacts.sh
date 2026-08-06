@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ZIG="${ZIG:-zig}"
 OUT_DIR="${1:-$ROOT/zig-out/release}"
+if [[ "$OUT_DIR" != /* ]]; then
+    OUT_DIR="$ROOT/$OUT_DIR"
+fi
 PKG_DIR="$OUT_DIR/package"
 ARCHIVE="$OUT_DIR/zqlite-source-package.tar.gz"
 SBOM="$OUT_DIR/SBOM.txt"
@@ -12,6 +15,7 @@ CHECKSUMS="$OUT_DIR/SHA256SUMS"
 rm -rf "$OUT_DIR"
 mkdir -p "$PKG_DIR"
 
+cd "$ROOT"
 "$ZIG" build --prefix "$PKG_DIR" -Dprofile=advanced -Doptimize=ReleaseSafe
 
 cp "$ROOT/build.zig" "$ROOT/build.zig.zon" "$ROOT/README.md" \

@@ -473,8 +473,8 @@ fn compareOperations(context: void, a: DeterministicOperation, b: DeterministicO
     _ = context;
 
     // First compare by operation type
-    if (@intFromEnum(a.operation_type) != @intFromEnum(b.operation_type)) {
-        return @intFromEnum(a.operation_type) < @intFromEnum(b.operation_type);
+    if (@backingInt(a.operation_type) != @backingInt(b.operation_type)) {
+        return @backingInt(a.operation_type) < @backingInt(b.operation_type);
     }
 
     // Then by table name

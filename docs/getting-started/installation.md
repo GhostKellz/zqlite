@@ -2,8 +2,8 @@
 
 ## Requirements
 
-- Zig version satisfying `build.zig.zon`
-- Linux (primary), macOS, or Windows (limited)
+- The exact Zig version declared in `build.zig.zon`
+- Linux, macOS x86_64, or Windows x86_64
 
 ## Zig Package Manager
 
@@ -62,4 +62,10 @@ chmod +x install.sh
 ZQLITE_REF=<tag> ./install.sh
 ```
 
-Note: review `install.sh` before relying on it in automation. The canonical verified paths are `zig fetch` for tagged consumption and `zig build` from source.
+The helper verifies the release archive checksum and fails closed if download or
+verification fails. It never silently substitutes a source checkout. To request
+an explicit source build instead, set `ZQLITE_SOURCE_INSTALL=1`; the checkout's
+`build.zig.zon` determines the required Zig version.
+
+Review `install.sh` before relying on it in automation. The canonical verified
+paths are `zig fetch` for tagged consumption and `zig build` from source.

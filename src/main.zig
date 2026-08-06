@@ -9,7 +9,8 @@ pub fn main(init: std.process.Init) !void {
     var args_list: std.ArrayListUnmanaged([]const u8) = .empty;
     defer args_list.deinit(allocator);
 
-    var args_iter = std.process.Args.Iterator.init(init.minimal.args);
+    var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    defer args_iter.deinit();
     while (args_iter.next()) |arg| {
         try args_list.append(allocator, arg);
     }
@@ -21,7 +22,10 @@ pub fn main(init: std.process.Init) !void {
         try cli.runShell();
     } else {
         // Process command line arguments
-        try cli.executeCommand(allocator, args);
+        cli.executeCommand(allocator, args) catch |err| {
+            std.debug.print("zqlite: error: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
     }
 }
 

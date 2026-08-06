@@ -1,6 +1,7 @@
 const std = @import("std");
 const storage = @import("storage.zig");
 const wal = @import("wal.zig");
+const file_io = @import("file_io.zig");
 const btree = @import("btree.zig");
 const ast = @import("../parser/ast.zig");
 const parser = @import("../parser/parser.zig");
@@ -10,7 +11,6 @@ const vm = @import("../executor/vm.zig");
 const cache_manager = @import("../performance/cache_manager.zig");
 const query_cache = @import("../performance/query_cache.zig");
 const runtime_compat = @import("../runtime/compat/thread.zig");
-const posix = std.posix;
 
 /// Context for WAL page write callback during transactions
 const WalCallbackContext = struct {
@@ -29,29 +29,37 @@ fn walPageWriteCallback(ctx_ptr: *anyopaque, page_id: u32, old_data: []const u8)
 /// Controls which paths can be attached to prevent path traversal attacks
 pub const AttachPathPolicy = struct {
     /// Allowed root directories for ATTACH operations
-    /// If empty, all paths are allowed (insecure - use only for testing)
+    /// Filesystem ATTACH is denied when this is empty unless allow_any_path is set.
     allowed_roots: []const []const u8,
     /// Whether to allow :memory: databases
     allow_memory: bool,
     /// Whether to allow relative paths (resolved relative to current working directory)
     allow_relative: bool,
+    /// Allow filesystem paths without root confinement. Intended only for compatibility mode.
+    allow_any_path: bool = false,
 
     pub const ALLOW_ALL = AttachPathPolicy{
         .allowed_roots = &[_][]const u8{},
         .allow_memory = true,
         .allow_relative = true,
+        .allow_any_path = true,
     };
 
     pub const SECURE_DEFAULT = AttachPathPolicy{
         .allowed_roots = &[_][]const u8{},
         .allow_memory = true,
         .allow_relative = false, // Require absolute paths
+        .allow_any_path = false,
     };
 
     /// Check if a path is under a root directory with proper segment boundary checking
     /// Prevents "/var/db" from matching "/var/database" (must have separator or end)
     fn isPathUnderRoot(path: []const u8, root: []const u8) bool {
-        if (!std.mem.startsWith(u8, path, root)) return false;
+        const starts_with_root = if (@import("builtin").os.tag == .windows)
+            std.ascii.startsWithIgnoreCase(path, root)
+        else
+            std.mem.startsWith(u8, path, root);
+        if (!starts_with_root) return false;
 
         // Exact match is allowed
         if (path.len == root.len) return true;
@@ -67,6 +75,49 @@ pub const AttachPathPolicy = struct {
         return path[root_len] == std.fs.path.sep;
     }
 
+    fn hasParentTraversal(path: []const u8) bool {
+        var components = std.fs.path.componentIterator(path);
+        while (components.next()) |component| {
+            if (std.mem.eql(u8, component.name, "..")) return true;
+        }
+        return false;
+    }
+
+    fn canonicalizeExistingPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+
+        var dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch |dir_err| switch (dir_err) {
+            error.NotDir => {
+                var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+                defer file.close(io);
+                const len = try file.realPath(io, &buffer);
+                return allocator.dupe(u8, buffer[0..len]);
+            },
+            else => return dir_err,
+        };
+        defer dir.close(io);
+        const dir_file = std.Io.File{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
+        const len = try dir_file.realPath(io, &buffer);
+        return allocator.dupe(u8, buffer[0..len]);
+    }
+
+    /// Resolve symlinks for an existing target, or resolve the existing parent
+    /// directory before appending a not-yet-created database filename.
+    fn canonicalizePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+        return canonicalizeExistingPath(allocator, path) catch |err| switch (err) {
+            error.FileNotFound => {
+                const parent = std.fs.path.dirname(path) orelse ".";
+                const canonical_parent = try canonicalizeExistingPath(allocator, parent);
+                defer allocator.free(canonical_parent);
+                return std.fs.path.join(allocator, &.{ canonical_parent, std.fs.path.basename(path) });
+            },
+            else => return err,
+        };
+    }
+
     /// Validate and canonicalize a path against this policy
     pub fn validatePath(self: AttachPathPolicy, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
         // Allow :memory: if permitted
@@ -77,8 +128,8 @@ pub const AttachPathPolicy = struct {
             return error.MemoryDatabaseNotAllowed;
         }
 
-        // Check for path traversal attempts (.. sequences)
-        if (std.mem.indexOf(u8, path, "..") != null) {
+        // Reject traversal components without rejecting legitimate names such as data..db.
+        if (hasParentTraversal(path)) {
             return error.PathTraversalDetected;
         }
 
@@ -95,30 +146,29 @@ pub const AttachPathPolicy = struct {
             return error.RelativePathNotAllowed;
         }
 
-        // Normalize the path (remove redundant separators, etc.)
-        // For security, we work with the path as-is after basic validation
-        const validated_path = try allocator.dupe(u8, path);
+        const validated_path = try canonicalizePath(allocator, path);
         errdefer allocator.free(validated_path);
 
-        // If allowed_roots is empty, allow all paths
-        if (self.allowed_roots.len == 0) {
+        if (self.allow_any_path) {
             return validated_path;
         }
 
+        if (self.allowed_roots.len == 0) return error.PathNotInAllowedRoots;
+
         // For relative paths with allowed_roots, we need absolute path to check
         if (!is_absolute) {
-            allocator.free(validated_path);
             return error.RelativePathWithRootsNotSupported;
         }
 
         // Check if path is under an allowed root (segment-aware boundary check)
         for (self.allowed_roots) |allowed_root| {
-            if (isPathUnderRoot(validated_path, allowed_root)) {
+            const canonical_root = try canonicalizeExistingPath(allocator, allowed_root);
+            defer allocator.free(canonical_root);
+            if (isPathUnderRoot(validated_path, canonical_root)) {
                 return validated_path;
             }
         }
 
-        allocator.free(validated_path);
         return error.PathNotInAllowedRoots;
     }
 };
@@ -219,6 +269,26 @@ const ResourceUsage = struct {
     next_progress_units: u64 = 0,
 };
 
+const DatabaseStamp = struct {
+    inode: std.Io.File.INode,
+    size: u64,
+    mtime_ns: i96,
+    ctime_ns: i96,
+
+    fn fromStat(stat: std.Io.File.Stat) DatabaseStamp {
+        return .{
+            .inode = stat.inode,
+            .size = stat.size,
+            .mtime_ns = stat.mtime.nanoseconds,
+            .ctime_ns = stat.ctime.nanoseconds,
+        };
+    }
+
+    fn eql(a: DatabaseStamp, b: DatabaseStamp) bool {
+        return a.inode == b.inode and a.size == b.size and a.mtime_ns == b.mtime_ns and a.ctime_ns == b.ctime_ns;
+    }
+};
+
 pub const PlannerTableStats = planner.PlannerTableStats;
 pub const PlannerIndexStats = planner.PlannerIndexStats;
 
@@ -253,8 +323,206 @@ pub const Connection = struct {
     planner_index_stats: std.ArrayListUnmanaged(PlannerIndexStats),
     /// WAL callback context for transaction page logging
     wal_callback_ctx: ?*WalCallbackContext,
+    /// A separate handle keeps advisory locks independent from pager lifecycle.
+    database_lock_file: ?file_io.File,
+    database_lock_held: bool,
+    database_lock_mode: file_io.Lock,
+    writer_lock_held: bool,
+    database_stamp: ?DatabaseStamp,
+    closing: bool,
+    shared_storage_mutex: ?*runtime_compat.Mutex,
+    shared_storage_lock_held: bool,
 
     const Self = @This();
+
+    fn acquireInitialDatabaseLock(file: file_io.File, mode: file_io.Lock, timeout_ms: ?u64) !void {
+        const started = (runtime_compat.Instant.now() catch unreachable).timestamp;
+        const deadline = if (timeout_ms) |timeout|
+            started + @as(i128, timeout) * std.time.ns_per_ms
+        else
+            null;
+
+        while (!try file_io.tryLock(file, mode)) {
+            const limit = deadline orelse return error.DatabaseBusy;
+            if ((runtime_compat.Instant.now() catch unreachable).timestamp >= limit) {
+                return error.OperationTimedOut;
+            }
+            try file_io.waitForLockRetry();
+        }
+    }
+
+    fn acquireDatabaseLock(self: *Self, mode: file_io.Lock) !bool {
+        const file = self.database_lock_file orelse return false;
+        if (self.database_lock_held) {
+            if (self.database_lock_mode != .exclusive and mode == .exclusive) {
+                return error.DatabaseBusy;
+            }
+            return false;
+        }
+
+        const started = (runtime_compat.Instant.now() catch unreachable).timestamp;
+        const deadline = self.operation_deadline_ns orelse if (self.busy_timeout_ms) |timeout|
+            started + @as(i128, timeout) * std.time.ns_per_ms
+        else
+            null;
+
+        while (!try file_io.tryLock(file, mode)) {
+            if (self.interrupted.load(.acquire)) return error.Interrupted;
+            const limit = deadline orelse return error.DatabaseBusy;
+            if ((runtime_compat.Instant.now() catch unreachable).timestamp >= limit) {
+                return error.OperationTimedOut;
+            }
+            try file_io.waitForLockRetry();
+        }
+
+        self.database_lock_held = true;
+        self.database_lock_mode = mode;
+        return true;
+    }
+
+    fn releaseDatabaseLock(self: *Self) void {
+        if (!self.database_lock_held) return;
+        file_io.unlock(self.database_lock_file.?);
+        self.database_lock_held = false;
+        self.database_lock_mode = .none;
+    }
+
+    fn lockDatabaseForClose(self: *Self, mode: file_io.Lock) !void {
+        if (self.database_lock_held) return;
+        const file = self.database_lock_file orelse return;
+        try file_io.lock(file, mode);
+        self.database_lock_held = true;
+        self.database_lock_mode = mode;
+    }
+
+    fn acquireWriterLock(self: *Self) !bool {
+        if (self.writer_lock_held or self.wal == null) return false;
+
+        const started = (runtime_compat.Instant.now() catch unreachable).timestamp;
+        const deadline = self.operation_deadline_ns orelse if (self.busy_timeout_ms) |timeout|
+            started + @as(i128, timeout) * std.time.ns_per_ms
+        else
+            null;
+
+        while (!try self.wal.?.tryLockWriter()) {
+            if (self.interrupted.load(.acquire)) return error.Interrupted;
+            const limit = deadline orelse return error.DatabaseBusy;
+            if ((runtime_compat.Instant.now() catch unreachable).timestamp >= limit) {
+                return error.OperationTimedOut;
+            }
+            try file_io.waitForLockRetry();
+        }
+
+        self.writer_lock_held = true;
+        return true;
+    }
+
+    fn releaseWriterLock(self: *Self) void {
+        if (!self.writer_lock_held) return;
+        self.wal.?.unlockWriter();
+        self.writer_lock_held = false;
+    }
+
+    fn readDatabaseStamp(self: *const Self) !?DatabaseStamp {
+        const path = self.path orelse return null;
+        return DatabaseStamp.fromStat(try file_io.statPath(path));
+    }
+
+    fn recordDatabaseStamp(self: *Self) !void {
+        self.database_stamp = try self.readDatabaseStamp();
+    }
+
+    fn refreshStorageFromDisk(self: *Self) !void {
+        if (self.is_memory or !self.owns_storage or self.path == null or self.in_transaction) return;
+
+        const current_stamp = try self.readDatabaseStamp();
+        if (self.database_stamp != null and current_stamp != null and DatabaseStamp.eql(self.database_stamp.?, current_stamp.?)) return;
+
+        const old_schema_version = self.storage_engine.getSchemaVersion();
+        const pager_mode: @import("pager.zig").Pager.OpenMode = if (self.access_mode == .read_write) .read_write else .read_only;
+        const refreshed = try storage.StorageEngine.initWithMode(self.allocator, self.path.?, pager_mode);
+        errdefer refreshed.deinit();
+        try refreshed.pager.setMaxPageCount(self.resource_limits.max_page_count);
+        refreshed.pager.setCachePageLimit(self.resource_limits.max_cache_pages);
+
+        if (self.wal) |w| try w.checkpointToPager(refreshed.pager);
+
+        self.storage_engine.deinit();
+        self.storage_engine = refreshed;
+        self.clearPlannerStats();
+        if (self.result_cache) |cache| cache.clear();
+
+        if (old_schema_version != refreshed.getSchemaVersion()) {
+            if (self.plan_cache) |*cache| {
+                cache.deinit();
+                self.plan_cache = try cache_manager.QueryPlanCache.init(self.allocator, 100);
+            }
+        }
+        try self.recordDatabaseStamp();
+    }
+
+    fn openOwnedStorage(self: *Self) !*storage.StorageEngine {
+        const pager_mode: @import("pager.zig").Pager.OpenMode = if (self.access_mode == .read_write) .read_write else .read_only;
+        const reopened = try storage.StorageEngine.initWithMode(self.allocator, self.path.?, pager_mode);
+        errdefer reopened.deinit();
+        try reopened.pager.setMaxPageCount(self.resource_limits.max_page_count);
+        reopened.pager.setCachePageLimit(self.resource_limits.max_cache_pages);
+        return reopened;
+    }
+
+    fn beginStatementAccess(self: *Self, statement: *const ast.Statement) !bool {
+        if (self.is_memory or !self.owns_storage or self.in_transaction) return false;
+        switch (statement.*) {
+            .BeginTransaction => return false,
+            else => {},
+        }
+        const mode: file_io.Lock = if (statementIsReadOnly(statement.*)) .shared else .exclusive;
+        const writer_acquired = if (mode == .exclusive) try self.acquireWriterLock() else false;
+        errdefer if (writer_acquired) self.releaseWriterLock();
+        const acquired = try self.acquireDatabaseLock(mode);
+        errdefer if (acquired) self.releaseDatabaseLock();
+        try self.refreshStorageFromDisk();
+        return acquired;
+    }
+
+    fn finishStatementAccess(self: *Self, acquired: bool, statement: *const ast.Statement) !void {
+        if (!statementIsReadOnly(statement.*) and !self.in_transaction) {
+            try self.flush();
+            try self.recordDatabaseStamp();
+        }
+        if (!self.in_transaction) {
+            if (acquired) self.releaseDatabaseLock();
+            self.releaseWriterLock();
+        }
+    }
+
+    fn abortStatementAccess(self: *Self, acquired: bool) void {
+        if (self.in_transaction) return;
+        if (acquired) self.releaseDatabaseLock();
+        self.releaseWriterLock();
+    }
+
+    fn acquireSharedStorageLock(self: *Self) bool {
+        const mutex = self.shared_storage_mutex orelse return false;
+        if (self.shared_storage_lock_held) return false;
+        mutex.lock();
+        self.shared_storage_lock_held = true;
+        return true;
+    }
+
+    fn releaseSharedStorageLock(self: *Self) void {
+        if (!self.shared_storage_lock_held) return;
+        self.shared_storage_mutex.?.unlock();
+        self.shared_storage_lock_held = false;
+    }
+
+    fn ensureSharedStorageLock(self: *Self) void {
+        if (self.acquireSharedStorageLock()) return;
+    }
+
+    pub fn setSharedStorageMutex(self: *Self, mutex: *runtime_compat.Mutex) void {
+        self.shared_storage_mutex = mutex;
+    }
 
     /// Open a database file with default options (backwards compatible)
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !*Self {
@@ -268,6 +536,25 @@ pub const Connection = struct {
 
         conn.allocator = allocator;
         const pager_mode: @import("pager.zig").Pager.OpenMode = if (options.access_mode == .read_write) .read_write else .read_only;
+        const lock_path = try std.fmt.allocPrint(allocator, "{s}-lock", .{path});
+        defer allocator.free(lock_path);
+        conn.database_lock_file = try file_io.open(allocator, lock_path, .read_write_create);
+        conn.database_lock_held = false;
+        conn.database_lock_mode = .none;
+        conn.writer_lock_held = false;
+        conn.database_stamp = null;
+        conn.closing = false;
+        conn.shared_storage_mutex = null;
+        conn.shared_storage_lock_held = false;
+        errdefer if (conn.database_lock_file) |file| {
+            if (conn.database_lock_held) file_io.unlock(file);
+            file_io.close(file);
+        };
+        const initial_lock_mode: file_io.Lock = if (options.access_mode == .read_write) .exclusive else .shared;
+        try acquireInitialDatabaseLock(conn.database_lock_file.?, initial_lock_mode, options.busy_timeout_ms);
+        conn.database_lock_held = true;
+        conn.database_lock_mode = initial_lock_mode;
+
         conn.storage_engine = try storage.StorageEngine.initWithMode(allocator, path, pager_mode);
         errdefer conn.storage_engine.deinit();
         try conn.storage_engine.pager.setMaxPageCount(options.resource_limits.max_page_count);
@@ -321,6 +608,9 @@ pub const Connection = struct {
             try w.checkpointToPager(conn.storage_engine.pager);
         }
 
+        try conn.recordDatabaseStamp();
+        conn.releaseDatabaseLock();
+
         return conn;
     }
 
@@ -350,6 +640,14 @@ pub const Connection = struct {
         conn.result_cache = null;
         conn.attached_databases = std.StringHashMap(*Self).init(allocator);
         conn.wal_callback_ctx = null;
+        conn.database_lock_file = null;
+        conn.database_lock_held = false;
+        conn.database_lock_mode = .none;
+        conn.writer_lock_held = false;
+        conn.database_stamp = null;
+        conn.closing = false;
+        conn.shared_storage_mutex = null;
+        conn.shared_storage_lock_held = false;
         conn.access_mode = options.access_mode;
         conn.busy_timeout_ms = options.busy_timeout_ms;
         conn.operation_deadline_ns = null;
@@ -402,6 +700,14 @@ pub const Connection = struct {
         conn.result_cache = null;
         conn.attached_databases = std.StringHashMap(*Self).init(allocator);
         conn.wal_callback_ctx = null;
+        conn.database_lock_file = null;
+        conn.database_lock_held = false;
+        conn.database_lock_mode = .none;
+        conn.writer_lock_held = false;
+        conn.database_stamp = null;
+        conn.closing = false;
+        conn.shared_storage_mutex = null;
+        conn.shared_storage_lock_held = false;
         conn.access_mode = options.access_mode;
         conn.busy_timeout_ms = options.busy_timeout_ms;
         conn.operation_deadline_ns = null;
@@ -430,6 +736,8 @@ pub const Connection = struct {
 
     /// Execute a SQL statement
     pub fn execute(self: *Self, sql: []const u8) !void {
+        const shared_storage_acquired = self.acquireSharedStorageLock();
+        defer if (shared_storage_acquired and !self.in_transaction) self.releaseSharedStorageLock();
         self.beginOperation();
         defer self.endOperation();
         try self.checkStatementSize(sql);
@@ -441,8 +749,24 @@ pub const Connection = struct {
         try self.checkOperation();
         try self.ensureStatementAllowed(&parsed.statement);
 
+        const auto_transaction = !self.in_transaction and statementNeedsAutoTransaction(parsed.statement);
+        const acquired = if (auto_transaction) blk: {
+            try self.beginTransaction();
+            break :blk false;
+        } else try self.beginStatementAccess(&parsed.statement);
+        errdefer if (auto_transaction and self.in_transaction) {
+            self.rollbackTransaction() catch |rollback_err| {
+                std.log.err("autocommit rollback failed: {s}", .{@errorName(rollback_err)});
+            };
+        } else self.abortStatementAccess(acquired);
+
         // Execute via virtual machine
         try vm.execute(self, &parsed.statement);
+        if (auto_transaction) {
+            try self.commitTransaction();
+        } else {
+            try self.finishStatementAccess(acquired, &parsed.statement);
+        }
     }
 
     pub fn isReadOnly(self: *const Self) bool {
@@ -799,15 +1123,31 @@ pub const Connection = struct {
 
     fn statementIsReadOnly(statement: ast.Statement) bool {
         return switch (statement) {
-            .Select, .With, .CompoundSelect, .Explain, .Pragma, .Analyze => true,
+            .Select, .With, .CompoundSelect, .Explain, .Analyze => true,
+            .Pragma => |pragma| pragma.value == null,
+            else => false,
+        };
+    }
+
+    fn statementNeedsAutoTransaction(statement: ast.Statement) bool {
+        return switch (statement) {
+            .Insert, .Update, .Delete => true,
             else => false,
         };
     }
 
     /// Begin a transaction
     pub fn beginTransaction(self: *Self) !void {
+        const shared_storage_acquired = self.acquireSharedStorageLock();
+        errdefer if (shared_storage_acquired and !self.in_transaction) self.releaseSharedStorageLock();
         try self.ensureWritable();
         if (self.in_transaction) return error.TransactionAlreadyActive;
+        const writer_acquired = try self.acquireWriterLock();
+        errdefer if (writer_acquired) self.releaseWriterLock();
+        const database_acquired = try self.acquireDatabaseLock(.shared);
+        errdefer if (database_acquired) self.releaseDatabaseLock();
+        if (database_acquired) try self.refreshStorageFromDisk();
+        if (database_acquired) self.releaseDatabaseLock();
         if (self.wal) |w| {
             try w.beginTransaction();
             self.storage_engine.pager.beginTransaction();
@@ -850,6 +1190,17 @@ pub const Connection = struct {
     /// Commit a transaction
     pub fn commitTransaction(self: *Self) !void {
         try self.ensureWritable();
+        if (!self.in_transaction) return error.NoActiveTransaction;
+        var constraint_vm = vm.VirtualMachine.init(self.allocator, self);
+        defer constraint_vm.deinitVM();
+        try constraint_vm.validateDeferredForeignKeys();
+        const database_acquired = try self.acquireDatabaseLock(.exclusive);
+        errdefer if (database_acquired) self.releaseDatabaseLock();
+        defer if (!self.in_transaction and !self.closing) {
+            self.releaseDatabaseLock();
+            self.releaseWriterLock();
+            self.releaseSharedStorageLock();
+        };
 
         // Clear btree callbacks first
         self.clearTransactionCallbacks();
@@ -877,6 +1228,7 @@ pub const Connection = struct {
         self.undo_log.clearRetainingCapacity();
         self.clearSavepoints();
         self.in_transaction = false;
+        try self.recordDatabaseStamp();
     }
 
     /// Commit a transaction (alias)
@@ -890,6 +1242,12 @@ pub const Connection = struct {
         if (self.in_transaction) return error.TransactionActive;
         if (self.isReadOnly()) return;
 
+        const writer_acquired = try self.acquireWriterLock();
+        defer if (writer_acquired) self.releaseWriterLock();
+        const database_acquired = try self.acquireDatabaseLock(.exclusive);
+        defer if (database_acquired) self.releaseDatabaseLock();
+        if (database_acquired) try self.refreshStorageFromDisk();
+
         if (self.wal) |w| {
             try w.checkpointToPager(self.storage_engine.pager);
         }
@@ -899,6 +1257,7 @@ pub const Connection = struct {
         if (self.owns_storage) {
             try self.storage_engine.pager.flush();
         }
+        try self.recordDatabaseStamp();
     }
 
     pub fn getUserVersion(self: *const Self) u32 {
@@ -908,10 +1267,16 @@ pub const Connection = struct {
     pub fn setUserVersion(self: *Self, version: u32) !void {
         try self.ensureWritable();
         if (self.in_transaction) return error.TransactionActive;
+        const writer_acquired = try self.acquireWriterLock();
+        defer if (writer_acquired) self.releaseWriterLock();
+        const database_acquired = try self.acquireDatabaseLock(.exclusive);
+        defer if (database_acquired) self.releaseDatabaseLock();
+        if (database_acquired) try self.refreshStorageFromDisk();
         try self.storage_engine.setUserVersion(version);
         if (self.owns_storage and !self.is_memory) {
             try self.storage_engine.pager.flush();
         }
+        try self.recordDatabaseStamp();
     }
 
     pub fn getSchemaVersion(self: *const Self) u32 {
@@ -919,6 +1284,9 @@ pub const Connection = struct {
     }
 
     pub fn integrityCheck(self: *Self) !storage.IntegrityCheckResult {
+        const database_acquired = try self.acquireDatabaseLock(.shared);
+        defer if (database_acquired) self.releaseDatabaseLock();
+        if (database_acquired) try self.refreshStorageFromDisk();
         return self.storage_engine.validateIntegrity(self.allocator);
     }
 
@@ -926,14 +1294,67 @@ pub const Connection = struct {
         try self.ensureWritable();
         if (self.in_transaction) return error.TransactionActive;
 
+        const writer_acquired = try self.acquireWriterLock();
+        defer if (writer_acquired) self.releaseWriterLock();
+        const database_acquired = try self.acquireDatabaseLock(.exclusive);
+        defer if (database_acquired) self.releaseDatabaseLock();
+        if (database_acquired) try self.refreshStorageFromDisk();
+
         try self.flush();
-        var index_iter = self.storage_engine.indexes.iterator();
-        while (index_iter.next()) |entry| {
-            try self.storage_engine.refreshIndexesForTable(entry.value_ptr.*.table_name);
+        if (self.is_memory) {
+            var index_iter = self.storage_engine.indexes.iterator();
+            while (index_iter.next()) |entry| {
+                try self.storage_engine.refreshIndexesForTable(entry.value_ptr.*.table_name);
+            }
+            return self.storage_engine.validateIntegrity(self.allocator);
         }
-        try self.storage_engine.saveAllMetadata();
-        try self.storage_engine.pager.flush();
-        return self.integrityCheck();
+
+        const nonce = (runtime_compat.Instant.now() catch unreachable).timestamp;
+        const compact_path = try std.fmt.allocPrint(self.allocator, "{s}.vacuum-{d}", .{ self.path.?, nonce });
+        defer self.allocator.free(compact_path);
+        defer file_io.delete(compact_path) catch {};
+        const backup_path = try std.fmt.allocPrint(self.allocator, "{s}.pre-vacuum-{d}", .{ self.path.?, nonce });
+        defer self.allocator.free(backup_path);
+
+        try self.storage_engine.compactTo(compact_path);
+        // Validate the compact image before replacing the live database.
+        const validation = try storage.StorageEngine.init(self.allocator, compact_path);
+        var compact_check = try validation.validateIntegrity(self.allocator);
+        validation.deinit();
+        if (!compact_check.ok) {
+            compact_check.deinit(self.allocator);
+            return error.IntegrityCheckFailed;
+        }
+        compact_check.deinit(self.allocator);
+
+        self.storage_engine.deinit();
+        file_io.renamePreserve(self.path.?, backup_path) catch |err| {
+            self.storage_engine = try self.openOwnedStorage();
+            return err;
+        };
+        file_io.renamePreserve(compact_path, self.path.?) catch |err| {
+            file_io.renamePreserve(backup_path, self.path.?) catch {};
+            self.storage_engine = try self.openOwnedStorage();
+            return err;
+        };
+
+        self.storage_engine = self.openOwnedStorage() catch |err| {
+            file_io.renamePreserve(self.path.?, compact_path) catch {};
+            file_io.renamePreserve(backup_path, self.path.?) catch {};
+            self.storage_engine = try self.openOwnedStorage();
+            return err;
+        };
+        file_io.delete(backup_path) catch |err| {
+            std.log.warn("vacuum retained backup {s}: {s}", .{ backup_path, @errorName(err) });
+        };
+        self.clearPlannerStats();
+        if (self.result_cache) |cache| cache.clear();
+        if (self.plan_cache) |*plan_cache| {
+            plan_cache.deinit();
+            self.plan_cache = try cache_manager.QueryPlanCache.init(self.allocator, 100);
+        }
+        try self.recordDatabaseStamp();
+        return self.storage_engine.validateIntegrity(self.allocator);
     }
 
     /// Run storage maintenance and write a flushed compact backup copy.
@@ -964,6 +1385,12 @@ pub const Connection = struct {
     /// In-memory databases cannot be backed up through this file-copy API.
     pub fn backupToFile(self: *Self, io: std.Io, dest_path: []const u8) !void {
         if (self.is_memory or self.path == null) return error.BackupRequiresFileDatabase;
+        const writer_acquired = if (!self.isReadOnly()) try self.acquireWriterLock() else false;
+        defer if (writer_acquired) self.releaseWriterLock();
+        const database_mode: file_io.Lock = if (self.isReadOnly()) .shared else .exclusive;
+        const database_acquired = try self.acquireDatabaseLock(database_mode);
+        defer if (database_acquired) self.releaseDatabaseLock();
+        if (database_acquired) try self.refreshStorageFromDisk();
         if (!self.isReadOnly()) try self.flush();
         const cwd = std.Io.Dir.cwd();
         if (std.fs.path.isAbsolute(self.path.?) and std.fs.path.isAbsolute(dest_path)) {
@@ -976,6 +1403,12 @@ pub const Connection = struct {
     /// Rollback a transaction
     pub fn rollbackTransaction(self: *Self) !void {
         try self.ensureWritable();
+        if (!self.in_transaction) return error.NoActiveTransaction;
+        defer if (!self.in_transaction and !self.closing) {
+            self.releaseDatabaseLock();
+            self.releaseWriterLock();
+            self.releaseSharedStorageLock();
+        };
 
         // Clear btree callbacks first
         self.clearTransactionCallbacks();
@@ -1188,29 +1621,44 @@ pub const Connection = struct {
 
     /// Execute SQL and return structured results (SQLite-style)
     pub fn query(self: *Self, sql: []const u8) !ResultSet {
+        const shared_storage_acquired = self.acquireSharedStorageLock();
+        defer if (shared_storage_acquired and !self.in_transaction) self.releaseSharedStorageLock();
         self.beginOperation();
         defer self.endOperation();
         try self.checkStatementSize(sql);
         try self.checkOperation();
-
-        if (self.result_cache) |cache| {
-            const sql_hash = query_cache.QueryHasher.hashQuery(sql);
-            if (cache.get(sql_hash)) |cached_result| {
-                return ResultSet{
-                    .allocator = self.allocator,
-                    .connection = self,
-                    .rows = try cloneCachedRows(self.allocator, cached_result.rows),
-                    .current_index = 0,
-                    .column_names = try self.extractColumnNamesFromSql(sql),
-                };
-            }
-        }
 
         // Parse the SQL
         var parsed = try parser.parse(self.allocator, sql);
         defer parsed.deinit();
         try self.checkOperation();
         try self.ensureStatementAllowed(&parsed.statement);
+
+        const auto_transaction = !self.in_transaction and statementNeedsAutoTransaction(parsed.statement);
+        const acquired = if (auto_transaction) blk: {
+            try self.beginTransaction();
+            break :blk false;
+        } else try self.beginStatementAccess(&parsed.statement);
+        errdefer if (auto_transaction and self.in_transaction) {
+            self.rollbackTransaction() catch |rollback_err| {
+                std.log.err("autocommit rollback failed: {s}", .{@errorName(rollback_err)});
+            };
+        } else self.abortStatementAccess(acquired);
+
+        if (self.result_cache) |cache| {
+            const sql_hash = query_cache.QueryHasher.hashQuery(sql);
+            if (cache.get(sql_hash)) |cached_result| {
+                const result = ResultSet{
+                    .allocator = self.allocator,
+                    .connection = self,
+                    .rows = try cloneCachedRows(self.allocator, cached_result.rows),
+                    .current_index = 0,
+                    .column_names = try self.extractColumnNamesFromSql(sql),
+                };
+                try self.finishStatementAccess(acquired, &parsed.statement);
+                return result;
+            }
+        }
 
         // Try to get cached plan first
         var plan_ptr: *planner.ExecutionPlan = undefined;
@@ -1265,6 +1713,12 @@ pub const Connection = struct {
             self.result_cache.?.put(sql_hash, sql, result_set.rows.items) catch {};
         }
 
+        if (auto_transaction) {
+            try self.commitTransaction();
+        } else {
+            try self.finishStatementAccess(acquired, &parsed.statement);
+        }
+
         return result_set;
     }
 
@@ -1277,14 +1731,16 @@ pub const Connection = struct {
     }
 
     pub fn openCursor(self: *Self, sql: []const u8) !Cursor {
+        const shared_storage_acquired = self.acquireSharedStorageLock();
+        defer if (shared_storage_acquired and !self.in_transaction) self.releaseSharedStorageLock();
         try self.checkStatementSize(sql);
         var parsed = try parser.parse(self.allocator, sql);
         defer parsed.deinit();
         try self.ensureStatementAllowed(&parsed.statement);
 
-        if (try self.openSimpleTableCursor(&parsed.statement, null)) |cursor| {
+        if (self.is_memory and self.shared_storage_mutex == null) if (try self.openSimpleTableCursor(&parsed.statement, null)) |cursor| {
             return cursor;
-        }
+        };
 
         return Cursor{
             .mode = .{ .materialized = try self.query(sql) },
@@ -1631,6 +2087,12 @@ pub const Connection = struct {
     /// Cleanup always completes; the first durability error is returned afterward.
     pub fn closeFallible(self: *Self) !void {
         var first_error: ?anyerror = null;
+        self.closing = true;
+        self.ensureSharedStorageLock();
+        const close_lock_mode: file_io.Lock = if (self.isReadOnly()) .shared else .exclusive;
+        self.lockDatabaseForClose(close_lock_mode) catch |err| {
+            first_error = err;
+        };
 
         // Close all attached databases
         var attached_iter = self.attached_databases.iterator();
@@ -1684,22 +2146,18 @@ pub const Connection = struct {
         }
         self.savepoints.deinit(self.allocator);
 
-        // Checkpoint any remaining WAL entries before closing.
+        // A clean connection must not checkpoint a WAL that may belong to a
+        // different active writer. This connection's own unfinished
+        // transaction was rolled back above.
         if (self.wal) |w| {
-            w.checkpointToPager(self.storage_engine.pager) catch |err| {
-                if (first_error == null) first_error = err;
-            };
+            self.releaseWriterLock();
             w.deinit();
         }
 
-        // Persist table metadata on close so non-transaction file-backed writes
-        // keep the latest row counts and B-tree root pages after splits.
+        // Every successful mutating statement now persists before releasing its
+        // lock. The final flush remains fallible so close reports durability
+        // errors without rewriting potentially stale catalog metadata.
         if (self.owns_storage) {
-            if (!self.is_memory and !self.isReadOnly()) {
-                self.storage_engine.saveAllMetadata() catch |err| {
-                    if (first_error == null) first_error = err;
-                };
-            }
             self.storage_engine.pager.flush() catch |err| {
                 if (first_error == null) first_error = err;
             };
@@ -1709,6 +2167,9 @@ pub const Connection = struct {
         if (self.path) |p| {
             self.allocator.free(p);
         }
+        self.releaseDatabaseLock();
+        if (self.database_lock_file) |file| file_io.close(file);
+        self.releaseSharedStorageLock();
         self.allocator.destroy(self);
 
         if (first_error) |err| return err;
@@ -1828,12 +2289,119 @@ pub const Connection = struct {
     pub fn getAttachedDatabase(self: *Self, schema_name: []const u8) ?*Self {
         return self.attached_databases.get(schema_name);
     }
+
+    /// Open bounded incremental access to one BLOB selected by a stable key.
+    /// Writes replace bytes in place and never resize the value.
+    pub fn openBlob(self: *Self, table_name: []const u8, column_name: []const u8, key_column: []const u8, key: storage.Value, writable: bool) !*BlobHandle {
+        if (writable) try self.ensureWritable();
+        if (!isSimpleIdentifier(table_name) or !isSimpleIdentifier(column_name) or !isSimpleIdentifier(key_column)) {
+            return error.InvalidBlobIdentifier;
+        }
+
+        const table = self.storage_engine.getTable(table_name) orelse return error.TableNotFound;
+        const column_index = table.getColumnIndex(column_name) orelse return error.ColumnNotFound;
+        _ = table.getColumnIndex(key_column) orelse return error.ColumnNotFound;
+        if (table.schema.columns[column_index].data_type != .Blob) return error.TypeMismatch;
+
+        const select_sql = try std.fmt.allocPrint(self.allocator, "SELECT {s} FROM {s} WHERE {s} = ?", .{ column_name, table_name, key_column });
+        errdefer self.allocator.free(select_sql);
+        const update_sql = try std.fmt.allocPrint(self.allocator, "UPDATE {s} SET {s} = ? WHERE {s} = ?", .{ table_name, column_name, key_column });
+        errdefer self.allocator.free(update_sql);
+
+        const handle = try self.allocator.create(BlobHandle);
+        errdefer self.allocator.destroy(handle);
+        handle.* = .{
+            .allocator = self.allocator,
+            .connection = self,
+            .select_sql = select_sql,
+            .update_sql = update_sql,
+            .key = try key.clone(self.allocator),
+            .writable = writable,
+        };
+        errdefer handle.key.deinit(self.allocator);
+
+        const initial = try handle.load();
+        defer self.allocator.free(initial);
+        return handle;
+    }
+
+    fn isSimpleIdentifier(name: []const u8) bool {
+        if (name.len == 0 or !(std.ascii.isAlphabetic(name[0]) or name[0] == '_')) return false;
+        for (name[1..]) |byte| if (!(std.ascii.isAlphanumeric(byte) or byte == '_')) return false;
+        return true;
+    }
 };
 
 pub const ConnectionInfo = struct {
     is_memory: bool,
     path: ?[]const u8,
     has_wal: bool,
+};
+
+/// Bounded BLOB slice handle. Each operation currently materializes the full
+/// value; writes use the current transaction or an atomic autocommit statement.
+pub const BlobHandle = struct {
+    allocator: std.mem.Allocator,
+    connection: *Connection,
+    select_sql: []const u8,
+    update_sql: []const u8,
+    key: storage.Value,
+    writable: bool,
+
+    const Self = @This();
+
+    fn load(self: *Self) ![]u8 {
+        var stmt = try self.connection.prepare(self.select_sql);
+        defer stmt.deinit();
+        try stmt.bindParameter(0, self.key);
+        var result = try stmt.execute();
+        defer result.deinit();
+        if (result.rows.items.len == 0) return error.BlobRowNotFound;
+        if (result.rows.items.len != 1 or result.rows.items[0].values.len != 1) return error.BlobKeyNotUnique;
+        return switch (result.rows.items[0].values[0]) {
+            .Blob => |bytes| try self.allocator.dupe(u8, bytes),
+            else => error.TypeMismatch,
+        };
+    }
+
+    pub fn size(self: *Self) !usize {
+        const bytes = try self.load();
+        defer self.allocator.free(bytes);
+        return bytes.len;
+    }
+
+    pub fn read(self: *Self, offset: usize, destination: []u8) !usize {
+        const bytes = try self.load();
+        defer self.allocator.free(bytes);
+        if (offset > bytes.len) return error.BlobRange;
+        const count = @min(destination.len, bytes.len - offset);
+        @memcpy(destination[0..count], bytes[offset..][0..count]);
+        return count;
+    }
+
+    pub fn write(self: *Self, offset: usize, source: []const u8) !void {
+        if (!self.writable) return error.ReadOnlyBlob;
+        var bytes = try self.load();
+        defer self.allocator.free(bytes);
+        const end = std.math.add(usize, offset, source.len) catch return error.BlobRange;
+        if (offset > bytes.len or end > bytes.len) return error.BlobRange;
+        @memcpy(bytes[offset..end], source);
+
+        var stmt = try self.connection.prepare(self.update_sql);
+        defer stmt.deinit();
+        try stmt.bindParameter(0, .{ .Blob = bytes });
+        try stmt.bindParameter(1, self.key);
+        var result = try stmt.execute();
+        defer result.deinit();
+        if (result.affected_rows != 1) return error.BlobKeyNotUnique;
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.key.deinit(self.allocator);
+        self.allocator.free(self.select_sql);
+        self.allocator.free(self.update_sql);
+        self.allocator.destroy(self);
+    }
 };
 
 // ========== BROAD API TYPES (v1.2.2) ==========
@@ -2312,6 +2880,8 @@ pub const PreparedStatement = struct {
 
     /// Prepare a SQL statement
     pub fn prepare(allocator: std.mem.Allocator, connection: *Connection, sql: []const u8) !*Self {
+        const shared_storage_acquired = connection.acquireSharedStorageLock();
+        defer if (shared_storage_acquired and !connection.in_transaction) connection.releaseSharedStorageLock();
         connection.beginOperation();
         defer connection.endOperation();
         try connection.checkStatementSize(sql);
@@ -2333,6 +2903,9 @@ pub const PreparedStatement = struct {
             allocator.destroy(stmt);
             return err;
         };
+
+        const acquired = try connection.beginStatementAccess(&stmt.parsed_statement);
+        defer connection.abortStatementAccess(acquired);
 
         // Create execution plan
         var query_planner = planner.Planner.initWithContext(allocator, &connection.aggregate_function_names, connection.planner_table_stats.items, connection.planner_index_stats.items);
@@ -2393,38 +2966,86 @@ pub const PreparedStatement = struct {
 
     /// Execute the prepared statement
     pub fn execute(self: *Self) !vm.ExecutionResult {
+        const shared_storage_acquired = self.connection.acquireSharedStorageLock();
+        defer if (shared_storage_acquired and !self.connection.in_transaction) self.connection.releaseSharedStorageLock();
         self.connection.beginOperation();
         defer self.connection.endOperation();
         try self.connection.checkOperation();
         try self.connection.ensureStatementAllowed(&self.parsed_statement);
+        const auto_transaction = !self.connection.in_transaction and Connection.statementNeedsAutoTransaction(self.parsed_statement);
+        const acquired = if (auto_transaction) blk: {
+            try self.connection.beginTransaction();
+            break :blk false;
+        } else try self.connection.beginStatementAccess(&self.parsed_statement);
+        errdefer if (auto_transaction and self.connection.in_transaction) {
+            self.connection.rollbackTransaction() catch |rollback_err| {
+                std.log.err("prepared autocommit rollback failed: {s}", .{@errorName(rollback_err)});
+            };
+        } else self.connection.abortStatementAccess(acquired);
         try self.ensureSchemaCurrent(self.connection);
         var virtual_machine = vm.VirtualMachine.init(self.connection.allocator, self.connection);
         defer virtual_machine.deinitVM();
-        return virtual_machine.executeWithParameters(&self.execution_plan, self.parameters);
+        const result = try virtual_machine.executeWithParameters(&self.execution_plan, self.parameters);
+        if (auto_transaction) {
+            try self.connection.commitTransaction();
+        } else {
+            try self.connection.finishStatementAccess(acquired, &self.parsed_statement);
+        }
+        return result;
     }
 
     /// Execute the prepared statement with explicit connection (for backwards compatibility)
     pub fn executeWithConnection(self: *Self, connection: *Connection) !vm.ExecutionResult {
+        const shared_storage_acquired = connection.acquireSharedStorageLock();
+        defer if (shared_storage_acquired and !connection.in_transaction) connection.releaseSharedStorageLock();
         connection.beginOperation();
         defer connection.endOperation();
         try connection.checkOperation();
         try connection.ensureStatementAllowed(&self.parsed_statement);
+        const auto_transaction = !connection.in_transaction and Connection.statementNeedsAutoTransaction(self.parsed_statement);
+        const acquired = if (auto_transaction) blk: {
+            try connection.beginTransaction();
+            break :blk false;
+        } else try connection.beginStatementAccess(&self.parsed_statement);
+        errdefer if (auto_transaction and connection.in_transaction) {
+            connection.rollbackTransaction() catch |rollback_err| {
+                std.log.err("prepared autocommit rollback failed: {s}", .{@errorName(rollback_err)});
+            };
+        } else connection.abortStatementAccess(acquired);
         try self.ensureSchemaCurrent(connection);
         var virtual_machine = vm.VirtualMachine.init(connection.allocator, connection);
         defer virtual_machine.deinitVM();
-        return virtual_machine.executeWithParameters(&self.execution_plan, self.parameters);
+        const result = try virtual_machine.executeWithParameters(&self.execution_plan, self.parameters);
+        if (auto_transaction) {
+            try connection.commitTransaction();
+        } else {
+            try connection.finishStatementAccess(acquired, &self.parsed_statement);
+        }
+        return result;
     }
 
     pub fn openCursor(self: *Self) !Cursor {
+        const shared_storage_acquired = self.connection.acquireSharedStorageLock();
+        defer if (shared_storage_acquired and !self.connection.in_transaction) self.connection.releaseSharedStorageLock();
         self.connection.beginOperation();
         defer self.connection.endOperation();
         try self.connection.checkOperation();
         try self.connection.ensureStatementAllowed(&self.parsed_statement);
+        const auto_transaction = !self.connection.in_transaction and Connection.statementNeedsAutoTransaction(self.parsed_statement);
+        const acquired = if (auto_transaction) blk: {
+            try self.connection.beginTransaction();
+            break :blk false;
+        } else try self.connection.beginStatementAccess(&self.parsed_statement);
+        errdefer if (auto_transaction and self.connection.in_transaction) {
+            self.connection.rollbackTransaction() catch |rollback_err| {
+                std.log.err("prepared cursor autocommit rollback failed: {s}", .{@errorName(rollback_err)});
+            };
+        } else self.connection.abortStatementAccess(acquired);
         try self.ensureSchemaCurrent(self.connection);
 
-        if (try self.connection.openSimpleTableCursor(&self.parsed_statement, self.parameters)) |cursor| {
+        if (self.connection.is_memory and self.connection.shared_storage_mutex == null) if (try self.connection.openSimpleTableCursor(&self.parsed_statement, self.parameters)) |cursor| {
             return cursor;
-        }
+        };
 
         var virtual_machine = vm.VirtualMachine.init(self.connection.allocator, self.connection);
         defer virtual_machine.deinitVM();
@@ -2440,6 +3061,12 @@ pub const PreparedStatement = struct {
         };
         result_set.rows = result.rows;
         result.rows = .empty;
+
+        if (auto_transaction) {
+            try self.connection.commitTransaction();
+        } else {
+            try self.connection.finishStatementAccess(acquired, &self.parsed_statement);
+        }
 
         return Cursor{ .mode = .{ .materialized = result_set } };
     }
@@ -2630,6 +3257,73 @@ test "UPDATE SET resolves positional prepared parameters" {
     const row = rows.next() orelse return error.NoRowReturned;
     try std.testing.expectEqualStrings("updated", row.getText(0) orelse return error.NullName);
     try std.testing.expectEqual(@as(i64, 42), row.getInt(1) orelse return error.NullN);
+}
+
+test "prepared DML can be rebound without reset" {
+    const allocator = std.testing.allocator;
+    var conn = try Connection.openMemory(allocator);
+    defer conn.deinit();
+
+    try conn.execute("CREATE TABLE rebound (id INTEGER PRIMARY KEY, value TEXT)");
+    var insert = try conn.prepare("INSERT INTO rebound VALUES (?, ?)");
+    defer insert.deinit();
+    for (0..8) |i| {
+        try insert.bind(0, @as(i64, @intCast(i)));
+        try insert.bind(1, @as([]const u8, "value"));
+        var result = try insert.execute();
+        result.deinit();
+    }
+
+    var delete = try conn.prepare("DELETE FROM rebound WHERE id = ?");
+    defer delete.deinit();
+    for (0..6) |i| {
+        try delete.bind(0, @as(i64, @intCast(i)));
+        var result = try delete.execute();
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 1), result.affected_rows);
+    }
+
+    var rows = try conn.query("SELECT id FROM rebound ORDER BY id");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 2), rows.count());
+}
+
+test "bounded blob slice access enforces bounds and transaction semantics" {
+    const allocator = std.testing.allocator;
+    var conn = try Connection.openMemory(allocator);
+    defer conn.deinit();
+
+    try conn.execute("CREATE TABLE blob_items (id INTEGER PRIMARY KEY, payload BLOB)");
+    var insert = try conn.prepare("INSERT INTO blob_items VALUES (?, ?)");
+    defer insert.deinit();
+    try insert.bind(0, @as(i64, 7));
+    try insert.bindParameter(1, .{ .Blob = "abcdefgh" });
+    var inserted = try insert.execute();
+    inserted.deinit();
+
+    const blob = try conn.openBlob("blob_items", "payload", "id", .{ .Integer = 7 }, true);
+    defer blob.deinit();
+    try std.testing.expectEqual(@as(usize, 8), try blob.size());
+    var buffer: [3]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try blob.read(2, &buffer));
+    try std.testing.expectEqualStrings("cde", &buffer);
+    try std.testing.expectError(error.BlobRange, blob.write(7, "XX"));
+
+    try conn.begin();
+    try blob.write(2, "XY");
+    try conn.rollback();
+    var after_rollback: [8]u8 = undefined;
+    _ = try blob.read(0, &after_rollback);
+    try std.testing.expectEqualStrings("abcdefgh", &after_rollback);
+
+    try blob.write(2, "XY");
+    var after_commit: [8]u8 = undefined;
+    _ = try blob.read(0, &after_commit);
+    try std.testing.expectEqualStrings("abXYefgh", &after_commit);
+
+    const read_only = try conn.openBlob("blob_items", "payload", "id", .{ .Integer = 7 }, false);
+    defer read_only.deinit();
+    try std.testing.expectError(error.ReadOnlyBlob, read_only.write(0, "z"));
 }
 
 test "prepared statement expires after schema change" {

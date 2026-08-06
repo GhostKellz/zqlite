@@ -11,7 +11,6 @@ REPO="ghostkellz/zqlite"
 DEFAULT_REF="main"
 INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
 BINARY_NAME="zqlite"
-MIN_ZIG_VERSION="0.17.0-dev.931+84f84267c"
 RELEASE_API="https://api.github.com/repos/${REPO}/releases/tags"
 
 RED='\033[0;31m'
@@ -36,13 +35,6 @@ have_cmd() {
 
 download() {
     curl -fsSL "$1" -o "$2"
-}
-
-version_ge() {
-    [ "$1" = "$2" ] && return 0
-    local highest
-    highest=$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)
-    [ "$highest" = "$1" ]
 }
 
 REF="${ZQLITE_REF:-$DEFAULT_REF}"
@@ -93,20 +85,12 @@ install_from_source() {
         fi
     done
 
-    ZIG_VERSION=$(zig version)
-    if ! version_ge "$ZIG_VERSION" "$MIN_ZIG_VERSION"; then
-        echo -e "${RED}Zig ${ZIG_VERSION} is too old.${NC}"
-        echo -e "${YELLOW}Required: ${MIN_ZIG_VERSION} or newer.${NC}"
-        exit 1
-    fi
-
-    echo -e "${GREEN}Using Zig ${ZIG_VERSION}${NC}"
-
     if [ -n "${ZQLITE_LOCAL_SOURCE:-}" ]; then
         echo -e "${BLUE}Using local source ${ZQLITE_LOCAL_SOURCE}...${NC}"
         mkdir zqlite
         tar \
             --exclude .git \
+            --exclude .scratch \
             --exclude .zig-cache \
             --exclude zig-out \
             -C "${ZQLITE_LOCAL_SOURCE}" \
@@ -117,6 +101,16 @@ install_from_source() {
     fi
     cd zqlite
 
+    REQUIRED_ZIG_VERSION=$(sed -n 's/.*\.minimum_zig_version = "\([^"]*\)".*/\1/p' build.zig.zon)
+    ZIG_VERSION=$(zig version)
+    if [ -z "$REQUIRED_ZIG_VERSION" ] || [ "$ZIG_VERSION" != "$REQUIRED_ZIG_VERSION" ]; then
+        echo -e "${RED}Zig toolchain mismatch.${NC}"
+        echo -e "${YELLOW}Required: ${REQUIRED_ZIG_VERSION:-unknown}; found: ${ZIG_VERSION}.${NC}"
+        exit 1
+    fi
+
+    echo -e "${GREEN}Using pinned Zig ${ZIG_VERSION}${NC}"
+
     echo -e "${BLUE}Building zqlite...${NC}"
     zig build -Doptimize=ReleaseFast
 
@@ -125,7 +119,7 @@ install_from_source() {
 }
 
 if [ -n "${ZQLITE_LOCAL_SOURCE:-}" ]; then
-    ZQLITE_INSTALL_CACHE_DIR="${ZQLITE_INSTALL_CACHE_DIR:-${ZQLITE_LOCAL_SOURCE%/}/.zig-cache}"
+    ZQLITE_INSTALL_CACHE_DIR="${ZQLITE_INSTALL_CACHE_DIR:-${ZQLITE_LOCAL_SOURCE%/}/.scratch}"
 else
     ZQLITE_INSTALL_CACHE_DIR="${ZQLITE_INSTALL_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME}/.cache}/zqlite}"
 fi
@@ -137,9 +131,9 @@ if [ "$USE_SOURCE_INSTALL" = "1" ]; then
     install_from_source
 elif [[ "$REF" == v* ]]; then
     if ! install_from_release "$REF"; then
-        echo -e "${YELLOW}Release artifact install failed, falling back to source build.${NC}"
-        cd "${WORK_DIR}"
-        install_from_source
+        echo -e "${RED}Verified release installation failed; refusing an unverified source fallback.${NC}"
+        echo -e "${YELLOW}Set ZQLITE_SOURCE_INSTALL=1 explicitly to build from source.${NC}"
+        exit 1
     fi
 else
     install_from_source

@@ -61,20 +61,21 @@ zig build test-storage        # Combined (runs both with cleanup)
 
 ## CI Pipeline
 
-```
-lint → build-test → [memory-tests, benchmarks, extended-tests]
-```
-
 | Job | What it runs |
 |-----|--------------|
-| lint | `zig fmt --check` |
-| build-test | `zig build`, `zig build test` |
-| memory-tests | `test-create-table-leaks` |
-| benchmarks | `bench-validate` |
-| extended-tests | `test-security`, `test-comprehensive`, `test-storage` |
+| Lint and contracts | Exact Zig pin, `zig fmt --check`, repository hygiene, and C ABI contracts |
+| Build and unit tests | Default/profile builds, unit tests, and release-package consumers |
+| Memory regression tests | Dedicated and comprehensive memory suites |
+| Benchmark validation | Regression thresholds and storage/WAL evidence |
+| Extended test suite | Security, comprehensive, storage, advanced, and C ABI tests |
+| Profile matrix | Unit tests across all supported profiles and optimization modes |
+| Linux cross compile | x86_64 and aarch64 GNU targets |
+| Stable core coverage | Best-effort `kcov` report; publishes summary JSON and Cobertura only after valid collection |
 
-All jobs run on self-hosted runner.
-Runner Zig configuration should satisfy the minimum Zig version declared in `build.zig.zon`.
+Jobs run on pushes to `main` or manual dispatch on the repository's Linux x86_64
+self-hosted runner. Pull requests are not executed automatically on the
+persistent self-hosted runner.
+Runner Zig configuration must match the exact version declared in `build.zig.zon`.
 
 ## Build Profiles
 
@@ -151,7 +152,11 @@ When a feature is disabled, its optional public API becomes an empty or placehol
 
 `tests/bench/benchmark_baseline.json` records release-facing benchmark categories and minimum target thresholds. `zig build bench-validate` remains the executable source of truth and uses a warning band before failing only severe regressions.
 
-Coverage reporting is informational for v1.7.0. See [coverage.md](coverage.md) for stable-core scope and threshold rules.
+Coverage reporting is informational. CI attempts to generate merged `kcov`
+HTML and Cobertura artifacts for the stable core, skips collection when `kcov`
+is unavailable, and publishes nothing when collection fails or reports zero
+valid project lines. See
+[coverage.md](coverage.md) for scope and threshold rules.
 
 ### Fuzzing
 

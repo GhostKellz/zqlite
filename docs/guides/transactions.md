@@ -69,13 +69,20 @@ behavior for the owning connection and prevents dirty reads across independent
 file-backed connections:
 
 - uncommitted file-backed writes are not visible to other connections
-- committed changes are visible after opening a new connection or reopening the reader
+- committed changes are refreshed automatically before the next statement on an existing connection
+- one writer may hold a transaction while independent readers continue to read the last committed state
+- a second writer waits up to its configured busy timeout, then returns `error.OperationTimedOut`
 - nested `BEGIN` transactions are rejected; use `SAVEPOINT` for nested rollback scopes
+- `COMMIT` and `ROLLBACK` without an active transaction return `error.NoActiveTransaction`
 
-This is still a conservative embedded-database contract rather than a claim of
-full SQLite MVCC parity for every concurrent reader refresh pattern. The covered
-commit, rollback, no-dirty-read, reopen, and savepoint behavior lives in
-`tests/standalone/test_transaction_atomicity.zig`.
+Individual `INSERT`, `UPDATE`, and `DELETE` statements run as WAL-backed
+autocommit transactions when no explicit transaction is active. If any row in
+the statement fails, the entire statement is rolled back.
+
+This is still a conservative one-writer/multiple-reader contract rather than a
+claim of full SQLite MVCC parity. Lock contention, cross-process exclusion,
+cache refresh, commit, rollback, no-dirty-read, reopen, and savepoint behavior
+are covered by `test-concurrent-access` and `test-transaction`.
 
 ## Notes
 

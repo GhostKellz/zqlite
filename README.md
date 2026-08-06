@@ -46,7 +46,7 @@ See [Stability and Compatibility Policy](docs/project/stability-policy.md) for t
 
 ## Install
 
-Requires the minimum Zig version declared in `build.zig.zon`
+Requires the exact Zig version declared in `build.zig.zon`.
 
 Tagged release fetch:
 
@@ -67,7 +67,9 @@ chmod +x install.sh
 ZQLITE_REF=<tag> ./install.sh
 ```
 
-Review `install.sh` before using it in automation.
+The helper verifies tagged release archives and fails closed; it does not
+silently fall back to source. Set `ZQLITE_SOURCE_INSTALL=1` to explicitly request
+a source checkout and build. Review `install.sh` before using it in automation.
 
 ```zig
 // build.zig

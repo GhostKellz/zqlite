@@ -80,7 +80,7 @@ does not remove exported symbols:
 - [ ] Generate and review the release SBOM
 - [ ] Verify release archive contents with `./scripts/verify-release-artifacts.sh`
 - [ ] Generate optional detached signatures when release keys are available
-- [ ] Archive the self-hosted stable-core coverage workload report
+- [ ] Archive the merged stable-core coverage HTML and Cobertura reports
 - [ ] Capture optional `zig build bench-operational` output for release notes when the runner is idle
 - [ ] Tag release: `git tag v1.x.x`
 - [ ] Push tag: `git push origin v1.x.x`

@@ -12,23 +12,26 @@ pub const ConnectionPool = struct {
     // Use compat blocking primitives to avoid requiring Io context
     mutex: compat.Mutex = .{},
     condition: compat.Condition = .{},
+    storage_mutex: compat.Mutex = .{},
     max_connections: u32,
     min_connections: u32,
     current_connections: u32,
     database_path: ?[]const u8, // null for in-memory
     is_memory: bool,
-    shared_storage: *storage.StorageEngine, // Shared storage for all connections
+    shared_storage: ?*storage.StorageEngine, // Shared only by in-memory connections
 
     const Self = @This();
 
     /// Initialize connection pool
     pub fn init(allocator: std.mem.Allocator, database_path: ?[]const u8, min_connections: u32, max_connections: u32) !*Self {
+        if (max_connections == 0 or min_connections > max_connections) return error.InvalidPoolConfiguration;
         var pool = try allocator.create(Self);
         pool.allocator = allocator;
         pool.connections = .empty;
         pool.available_connections = .empty;
         pool.mutex = .{};
         pool.condition = .{};
+        pool.storage_mutex = .{};
         pool.max_connections = max_connections;
         pool.min_connections = min_connections;
         pool.current_connections = 0;
@@ -36,7 +39,7 @@ pub const ConnectionPool = struct {
 
         if (database_path) |path| {
             pool.database_path = try allocator.dupe(u8, path);
-            pool.shared_storage = try storage.StorageEngine.init(allocator, path);
+            pool.shared_storage = null;
         } else {
             pool.database_path = null;
             pool.shared_storage = try storage.StorageEngine.initMemory(allocator);
@@ -62,8 +65,11 @@ pub const ConnectionPool = struct {
     fn createConnection(self: *Self) !*PooledConnection {
         const pooled_conn = try self.allocator.create(PooledConnection);
 
-        // Use shared storage for all connections
-        pooled_conn.connection = try connection.Connection.openWithSharedStorage(self.allocator, self.shared_storage);
+        pooled_conn.connection = if (self.database_path) |path|
+            try connection.Connection.open(self.allocator, path)
+        else
+            try connection.Connection.openWithSharedStorage(self.allocator, self.shared_storage.?);
+        if (self.shared_storage != null) pooled_conn.connection.setSharedStorageMutex(&self.storage_mutex);
 
         pooled_conn.pool = self;
         pooled_conn.is_in_use = false;
@@ -83,6 +89,12 @@ pub const ConnectionPool = struct {
 
     /// Acquire a connection from the pool
     pub fn acquire(self: *Self) !*PooledConnection {
+        return self.acquireWithTimeout(null);
+    }
+
+    /// Acquire a connection, returning `PoolAcquireTimeout` if the pool stays
+    /// exhausted for the requested interval. A null timeout waits indefinitely.
+    pub fn acquireWithTimeout(self: *Self, timeout_ms: ?u64) !*PooledConnection {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -106,9 +118,18 @@ pub const ConnectionPool = struct {
             return new_conn;
         }
 
-        // Wait for a connection to become available
+        const started = try compat.Instant.now();
         while (self.available_connections.items.len == 0) {
-            self.condition.wait(&self.mutex);
+            const limit_ms = timeout_ms orelse {
+                self.condition.wait(&self.mutex);
+                continue;
+            };
+            const elapsed_ns = (try compat.Instant.now()).since(started);
+            const limit_ns = std.math.mul(u64, limit_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+            if (elapsed_ns >= limit_ns) return error.PoolAcquireTimeout;
+            if (!self.condition.waitTimeout(&self.mutex, limit_ns - elapsed_ns) and self.available_connections.items.len == 0) {
+                return error.PoolAcquireTimeout;
+            }
         }
 
         const conn = self.available_connections.orderedRemove(0);
@@ -126,6 +147,7 @@ pub const ConnectionPool = struct {
         if (!pooled_conn.is_in_use) {
             return error.ConnectionNotInUse;
         }
+        if (pooled_conn.connection.in_transaction) return error.TransactionActive;
 
         pooled_conn.is_in_use = false;
         const ts = time_utils.getTimespec();
@@ -195,7 +217,7 @@ pub const ConnectionPool = struct {
         self.available_connections.deinit(self.allocator);
 
         // Clean up shared storage
-        self.shared_storage.deinit();
+        if (self.shared_storage) |shared_storage| shared_storage.deinit();
 
         if (self.database_path) |path| {
             self.allocator.free(path);
@@ -296,4 +318,17 @@ test "connection pool with SQL execution" {
     // Test executing SQL through pooled connection
     try conn.execute("CREATE TABLE test (id INTEGER, name TEXT);");
     try conn.execute("INSERT INTO test VALUES (1, 'Hello');");
+}
+
+test "connection pool validates limits and supports acquisition timeout" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(error.InvalidPoolConfiguration, ConnectionPool.init(allocator, null, 2, 1));
+    try std.testing.expectError(error.InvalidPoolConfiguration, ConnectionPool.init(allocator, null, 0, 0));
+
+    const pool = try ConnectionPool.init(allocator, null, 1, 1);
+    defer pool.deinit();
+    const held = try pool.acquire();
+    defer held.release() catch {};
+    try std.testing.expectError(error.PoolAcquireTimeout, pool.acquireWithTimeout(5));
 }

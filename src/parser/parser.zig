@@ -74,6 +74,7 @@ pub const Parser = struct {
             .Savepoint => try self.parseSavepoint(),
             .Release => try self.parseRelease(),
             .Drop => try self.parseDrop(),
+            .Alter => try self.parseAlterTable(),
             .Pragma => try self.parsePragma(),
             .Analyze => try self.parseAnalyze(),
             .Vacuum => ast.Statement{ .Vacuum = .{} },
@@ -82,6 +83,46 @@ pub const Parser = struct {
             .Detach => try self.parseDetach(),
             .With => try self.parseWith(),
             else => error.UnexpectedToken,
+        };
+    }
+
+    fn parseAlterTable(self: *Self) !ast.Statement {
+        try self.expect(.Alter);
+        try self.expect(.Table);
+        const table_name = try self.expectQualifiedIdentifier();
+        errdefer self.allocator.free(table_name);
+
+        const action: ast.AlterTableStatement.Action = switch (std.meta.activeTag(self.current_token)) {
+            .Rename => blk: {
+                try self.advance();
+                if (self.currentTokenIsIdentifier("column")) {
+                    try self.advance();
+                    const old_name = try self.expectIdentifierOrKeyword();
+                    errdefer self.allocator.free(old_name);
+                    try self.expect(.To);
+                    break :blk .{ .RenameColumn = .{
+                        .old_name = old_name,
+                        .new_name = try self.expectIdentifierOrKeyword(),
+                    } };
+                }
+                try self.expect(.To);
+                break :blk .{ .RenameTable = try self.expectIdentifierOrKeyword() };
+            },
+            .Add => blk: {
+                try self.advance();
+                if (self.currentTokenIsIdentifier("column")) try self.advance();
+                break :blk .{ .AddColumn = try self.parseColumnDefinition() };
+            },
+            else => return error.UnexpectedToken,
+        };
+
+        return .{ .AlterTable = .{ .table_name = table_name, .action = action } };
+    }
+
+    fn currentTokenIsIdentifier(self: *const Self, expected: []const u8) bool {
+        return switch (self.current_token) {
+            .Identifier => |identifier| std.ascii.eqlIgnoreCase(identifier, expected),
+            else => false,
         };
     }
 
@@ -2163,6 +2204,7 @@ pub const Parser = struct {
                 return error.ExpectedDeleteOrUpdate;
             }
         }
+        const deferred = try self.parseDeferredForeignKeySuffix();
 
         return ast.ForeignKeyConstraint{
             .column = null, // column-level constraint
@@ -2170,7 +2212,18 @@ pub const Parser = struct {
             .reference_column = ref_column,
             .on_delete = on_delete,
             .on_update = on_update,
+            .deferred = deferred,
         };
+    }
+
+    fn parseDeferredForeignKeySuffix(self: *Self) !bool {
+        if (!self.currentTokenIsIdentifier("deferrable")) return false;
+        try self.advance();
+        if (!self.currentTokenIsIdentifier("initially")) return error.UnsupportedForeignKeyDeferral;
+        try self.advance();
+        if (!self.currentTokenIsIdentifier("deferred")) return error.UnsupportedForeignKeyDeferral;
+        try self.advance();
+        return true;
     }
 
     /// Parse foreign key action
@@ -2937,14 +2990,30 @@ pub const Parser = struct {
                 try self.advance(); // consume FOREIGN
                 try self.expect(.Key); // expect KEY
                 try self.expect(.LeftParen);
-                const column = try self.expectIdentifier();
+                var child_columns: std.ArrayListUnmanaged([]const u8) = .empty;
+                defer child_columns.deinit(self.allocator);
+                errdefer for (child_columns.items) |column| self.allocator.free(column);
+                while (true) {
+                    try child_columns.append(self.allocator, try self.expectIdentifier());
+                    if (std.meta.activeTag(self.current_token) != .Comma) break;
+                    try self.advance();
+                }
                 try self.expect(.RightParen);
 
                 try self.expect(.References);
                 const ref_table_name = try self.expectIdentifier();
+                errdefer self.allocator.free(ref_table_name);
                 try self.expect(.LeftParen);
-                const ref_column_name = try self.expectIdentifier();
+                var parent_columns: std.ArrayListUnmanaged([]const u8) = .empty;
+                defer parent_columns.deinit(self.allocator);
+                errdefer for (parent_columns.items) |column| self.allocator.free(column);
+                while (true) {
+                    try parent_columns.append(self.allocator, try self.expectIdentifier());
+                    if (std.meta.activeTag(self.current_token) != .Comma) break;
+                    try self.advance();
+                }
                 try self.expect(.RightParen);
+                if (child_columns.items.len != parent_columns.items.len) return error.ForeignKeyColumnCountMismatch;
 
                 var on_delete: ?ast.ForeignKeyAction = null;
                 var on_update: ?ast.ForeignKeyAction = null;
@@ -2961,13 +3030,32 @@ pub const Parser = struct {
                         return error.ExpectedDeleteOrUpdate;
                     }
                 }
+                const deferred = try self.parseDeferredForeignKeySuffix();
+
+                if (child_columns.items.len == 1) {
+                    const column = child_columns.items[0];
+                    const ref_column_name = parent_columns.items[0];
+                    child_columns.clearRetainingCapacity();
+                    parent_columns.clearRetainingCapacity();
+                    return ast.TableConstraint{ .ForeignKey = .{
+                        .column = column,
+                        .reference_table = ref_table_name,
+                        .reference_column = ref_column_name,
+                        .on_delete = on_delete,
+                        .on_update = on_update,
+                        .deferred = deferred,
+                    } };
+                }
 
                 return ast.TableConstraint{ .ForeignKey = ast.ForeignKeyConstraint{
-                    .column = column,
+                    .column = null,
+                    .columns = try child_columns.toOwnedSlice(self.allocator),
                     .reference_table = ref_table_name,
-                    .reference_column = ref_column_name,
+                    .reference_column = try self.allocator.dupe(u8, parent_columns.items[0]),
+                    .reference_columns = try parent_columns.toOwnedSlice(self.allocator),
                     .on_delete = on_delete,
                     .on_update = on_update,
+                    .deferred = deferred,
                 } };
             },
             .Unique => {

@@ -19,8 +19,14 @@ ZQLite aims to be a strong embedded SQLite-style database, not a byte-for-byte S
 | SAVEPOINT / RELEASE / ROLLBACK TO | Supported | DML savepoints; DDL/catalog changes inside savepoints return an explicit error |
 | Named prepared parameters | Supported | `:name`, `@name`, `$name` |
 | Read-only / immutable open | Supported | Main database file is opened read-only; WAL is not opened or replayed |
+| `ALTER TABLE RENAME TO` | Partial | Supported when the table has no index, FTS, or foreign-key dependencies |
+| `ALTER TABLE RENAME COLUMN` | Partial | Supported when the column is not referenced by an index, generated/check expression, or foreign key |
+| `ALTER TABLE ADD COLUMN` | Partial | Supported for never-populated tables with nullable/`NOT NULL` columns and optional defaults; key, unique, generated, check, and foreign-key additions are rejected |
+| Composite foreign keys | Partial | Multi-column matching, NULL-key behavior, parent protection, and catalog persistence are supported; composite CASCADE/SET NULL rewrites are rejected |
+| Deferred foreign keys | Partial | `DEFERRABLE INITIALLY DEFERRED` NO ACTION constraints validate at commit and remain transaction-active on failure |
+| Partial/expression indexes | Partial | Definitions and unique enforcement persist; deterministic same-row expressions/predicates only |
 | Busy timeout / interrupt | Supported | Cooperative connection-level timeout and interrupt checks during parse/plan/VM execution |
-| VACUUM | Partial | Maintenance command rebuilds indexes/catalog and validates integrity; file-size shrink is not yet promised |
+| VACUUM | Partial | Rebuilds live rows, indexes, FTS metadata, and catalog state into a validated compact image; tested to reclaim deleted-row space, without claiming full SQLite VACUUM parity |
 
 ## Intentional Deviations
 
@@ -29,6 +35,7 @@ ZQLite aims to be a strong embedded SQLite-style database, not a byte-for-byte S
 - FTS support is intentionally smaller than full SQLite FTS5 behavior.
 - Query result caching is optional and connection-local rather than an invisible global SQLite behavior.
 - Read-only and immutable opens are inspection modes over the main database file; checkpoint first if you need pending WAL content visible.
+- Unsupported `ALTER TABLE` rewrites fail before catalog mutation with a specific error. Schema changes inside explicit transactions are rejected because transactional DDL rollback is not part of the stable contract.
 - Busy timeout is currently a cooperative operation timeout, not complete SQLite file-lock waiting semantics.
 
 ## Verified Compatibility Areas
@@ -50,7 +57,6 @@ ZQLite aims to be a strong embedded SQLite-style database, not a byte-for-byte S
 - DDL/catalog rollback through savepoints; schema changes inside active savepoints return `error.UnsupportedDDLInSavepoint`
 - Full FTS phrase and boolean query support
 - Full SQLite edge-case compatibility across all planner/executor paths
-- Foreign-key deferral and multi-column FK references
 
 ## Tested Expectations
 

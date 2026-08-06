@@ -286,12 +286,7 @@ pub const Shell = struct {
             std.mem.startsWith(u8, trimmed_upper, "PRAGMA"))
         {
             // Execute as query and display results
-            var result_set = conn.query(sql) catch |err| {
-                try writeAll("Error: ");
-                try writeAll(@errorName(err));
-                try writeAll("\n");
-                return;
-            };
+            var result_set = try conn.query(sql);
             defer result_set.deinit();
 
             // Print column headers
@@ -333,12 +328,7 @@ pub const Shell = struct {
             try writeAll(")\n");
         } else {
             // Execute as statement
-            const affected = conn.exec(sql) catch |err| {
-                try writeAll("Error: ");
-                try writeAll(@errorName(err));
-                try writeAll("\n");
-                return;
-            };
+            const affected = try conn.exec(sql);
 
             if (std.mem.startsWith(u8, trimmed_upper, "INSERT")) {
                 try writeAll("Inserted ");
@@ -449,20 +439,22 @@ fn printValue(value: storage.Value) !void {
 }
 
 fn readLine(buffer: []u8) ![]const u8 {
-    const stdin_fd: std.posix.fd_t = std.posix.STDIN_FILENO;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const stdin_file = std.Io.File.stdin();
     var pos: usize = 0;
 
     while (pos < buffer.len) {
         var byte: [1]u8 = undefined;
-        const n = std.posix.read(stdin_fd, &byte) catch |err| switch (err) {
+        const n = stdin_file.readStreaming(io, &.{&byte}) catch |err| switch (err) {
             error.WouldBlock => continue,
+            error.EndOfStream => {
+                if (pos == 0) return error.EndOfStream;
+                break;
+            },
             else => return err,
         };
 
-        if (n == 0) {
-            if (pos == 0) return error.EndOfStream;
-            break;
-        }
+        if (n == 0) continue;
 
         if (byte[0] == '\n') break;
         buffer[pos] = byte[0];
@@ -506,17 +498,17 @@ pub fn executeCommand(allocator: std.mem.Allocator, args: []const []const u8) !v
             show_pq_status = true;
             pq_status_json = true;
         } else if (std.mem.eql(u8, arg, "--sql") or std.mem.eql(u8, arg, "-c")) {
-            if (i + 1 < args.len) {
-                i += 1;
-                sql_command = args[i];
-            }
+            if (i + 1 >= args.len) return error.MissingSqlArgument;
+            i += 1;
+            sql_command = args[i];
         } else if (std.mem.eql(u8, arg, "--db") or std.mem.eql(u8, arg, "-d")) {
-            if (i + 1 < args.len) {
-                i += 1;
-                database_path = args[i];
-            }
+            if (i + 1 >= args.len) return error.MissingDatabaseArgument;
+            i += 1;
+            database_path = args[i];
         } else if (!std.mem.startsWith(u8, arg, "-") and database_path == null) {
             database_path = arg;
+        } else {
+            return error.UnknownArgument;
         }
     }
 

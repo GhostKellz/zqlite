@@ -5,6 +5,7 @@ const file_io = @import("file_io.zig");
 pub const WriteAheadLog = struct {
     allocator: std.mem.Allocator,
     fd: ?file_io.File,
+    writer_lock_fd: ?file_io.File,
     is_transaction_active: bool,
     transaction_id: u64,
     log_entries: std.ArrayListUnmanaged(LogEntry),
@@ -58,6 +59,14 @@ pub const WriteAheadLog = struct {
         return false;
     }
 
+    pub fn tryLockWriter(self: *Self) !bool {
+        return file_io.tryLock(self.writer_lock_fd orelse return error.WalClosed, .exclusive);
+    }
+
+    pub fn unlockWriter(self: *Self) void {
+        if (self.writer_lock_fd) |fd| file_io.unlock(fd);
+    }
+
     /// Initialize WAL
     pub fn init(allocator: std.mem.Allocator, db_path: []const u8) !*Self {
         var wal = try allocator.create(Self);
@@ -65,6 +74,7 @@ pub const WriteAheadLog = struct {
 
         wal.allocator = allocator;
         wal.fd = null;
+        wal.writer_lock_fd = null;
         wal.is_transaction_active = false;
         wal.transaction_id = 0;
         wal.log_entries = .empty;
@@ -75,12 +85,17 @@ pub const WriteAheadLog = struct {
         errdefer allocator.free(wal_path);
         wal.wal_path = wal_path;
 
-        const fd = file_io.open(allocator, wal_path, .read_write_create) catch |err| {
-            allocator.free(wal_path);
-            allocator.destroy(wal);
-            return err;
-        };
+        const fd = try file_io.open(allocator, wal_path, .read_write_create);
+        errdefer file_io.close(fd);
         wal.fd = fd;
+
+        // Keep writer reservation locks off the WAL data file. Windows file
+        // locks block positional reads, which would otherwise prevent another
+        // connection from opening and reaching the normal busy-timeout path.
+        const writer_lock_path = try std.fmt.allocPrint(allocator, "{s}-writer", .{db_path});
+        defer allocator.free(writer_lock_path);
+        wal.writer_lock_fd = try file_io.open(allocator, writer_lock_path, .read_write_create);
+        errdefer file_io.close(wal.writer_lock_fd.?);
 
         // Recover from existing WAL if present
         try wal.recover();
@@ -539,6 +554,7 @@ pub const WriteAheadLog = struct {
         if (self.fd) |fd| {
             file_io.close(fd);
         }
+        if (self.writer_lock_fd) |fd| file_io.close(fd);
 
         self.allocator.free(self.wal_path);
         self.allocator.destroy(self);
@@ -569,7 +585,7 @@ pub const LogEntry = struct {
 
         var pos: usize = 0;
 
-        buffer[pos] = @intFromEnum(self.entry_type);
+        buffer[pos] = @backingInt(self.entry_type);
         pos += 1;
 
         std.mem.writeInt(u64, buffer[pos..][0..8], self.transaction_id, .little);
@@ -738,7 +754,7 @@ test "wal handles truncated entry safely" {
     defer wal.deinit();
 
     var header: [25]u8 = undefined;
-    header[0] = @intFromEnum(LogEntryType.PageWrite);
+    header[0] = @backingInt(LogEntryType.PageWrite);
     std.mem.writeInt(u64, header[1..9], 1, .little);
     std.mem.writeInt(u32, header[9..13], 1, .little);
     std.mem.writeInt(u32, header[13..17], 0, .little);

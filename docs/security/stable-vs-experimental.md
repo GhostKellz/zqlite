@@ -20,6 +20,7 @@ These features have stable APIs and are the primary focus:
 | Full-Text Search | Stable with phrase, boolean, and file-backed reopen coverage |
 | ATTACH DATABASE | Stable |
 | Secure Mode | Stable |
+| Windows x86_64 | Stable core, storage, CLI, and C ABI validated natively |
 
 ## Experimental (Not Ready)
 
@@ -35,7 +36,6 @@ These are proof-of-concept or incomplete:
 | Two-Phase Commit | Single-node simulation |
 | Window Functions | Partial, PARTITION BY present but advanced framing remains limited |
 | Query Cache | Partial, connection-local invalidation only |
-| Windows Platform | WAL/pager unsupported |
 
 ## Do Not Use Experimental Features For
 

@@ -113,11 +113,12 @@ pub const ErrorCategory = enum(c_int) {
 pub fn categorizeError(err: anyerror) ErrorCategory {
     return switch (err) {
         error.OutOfMemory => .memory,
-        error.SyntaxError, error.TableNotFound, error.ColumnNotFound, error.TypeMismatch => .sql,
-        error.ConstraintViolation, error.UniqueConstraintViolation, error.MissingRequiredValue => .constraint,
-        error.IoError, error.InputOutput, error.AccessDenied, error.DiskQuota, error.FileTooBig, error.NoSpaceLeft => .io,
-        error.InvalidParameterIndex, error.ParameterIndexOutOfBounds, error.NoParametersProvided, error.NamedParameterNotFound, error.SavepointNotFound, error.TransactionAlreadyActive, error.TransactionActive, error.UnsupportedDDLInSavepoint, error.ReadOnlyDatabase, error.Interrupted, error.OperationTimedOut, error.ResourceLimitExceeded, error.FeatureUnavailable => .misuse,
-        error.CorruptData, error.UnsupportedFormatVersion, error.InvalidFormatVersion => .format,
+        error.SyntaxError, error.ParseError, error.TableNotFound, error.TableAlreadyExists, error.ColumnNotFound, error.SchemaNotFound, error.TypeMismatch => .sql,
+        error.ConstraintViolation, error.UniqueConstraintViolation, error.MissingRequiredValue, error.InvalidForeignKey, error.CannotWriteGeneratedColumn => .constraint,
+        error.IoError, error.InputOutput, error.AccessDenied, error.PermissionDenied, error.DiskQuota, error.FileTooBig, error.NoSpaceLeft, error.ReadOnlyFileSystem, error.ReadOnlyDatabase, error.FileNotFound, error.NotDir, error.IsDir, error.ReadError, error.WriteError, error.SeekError, error.TruncateError => .io,
+        error.InvalidParameterIndex, error.ParameterIndexOutOfBounds, error.NoParametersProvided, error.NamedParameterNotFound, error.SavepointNotFound, error.TransactionAlreadyActive, error.TransactionActive, error.UnsupportedDDLInSavepoint, error.PreparedStatementExpired, error.Interrupted, error.OperationTimedOut, error.DatabaseBusy, error.ResourceLimitExceeded, error.FeatureUnavailable => .misuse,
+        error.PathNotInAllowedRoots, error.PathTraversalDetected, error.RelativePathNotAllowed, error.RelativePathWithRootsNotSupported, error.InvalidPathCharacter, error.MemoryDatabaseNotAllowed => .authorization,
+        error.CorruptData, error.CorruptCatalog, error.InvalidMetadata, error.UnsupportedFormatVersion, error.InvalidFormatVersion, error.UnsupportedDatabaseFormat => .format,
         else => .unknown,
     };
 }

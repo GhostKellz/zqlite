@@ -202,6 +202,161 @@ pub const StorageEngine = struct {
         }
     }
 
+    /// Rename an independent table without rewriting row pages. Tables with
+    /// indexes, FTS state, or foreign-key dependencies are rejected until those
+    /// catalog objects can be migrated as one unit.
+    pub fn renameTable(self: *Self, old_name: []const u8, new_name: []const u8) !void {
+        try self.ensureWritable();
+        const table = self.tables.get(old_name) orelse return error.TableNotFound;
+        if (self.tables.contains(new_name)) return error.TableAlreadyExists;
+        if (self.fts_indexes.contains(old_name)) return error.UnsupportedAlterTableDependency;
+        var index_it = self.indexes.iterator();
+        while (index_it.next()) |entry| {
+            if (std.mem.eql(u8, entry.value_ptr.*.table_name, old_name)) return error.UnsupportedAlterTableDependency;
+        }
+        var table_it = self.tables.iterator();
+        while (table_it.next()) |entry| {
+            for (entry.value_ptr.*.schema.foreign_keys) |foreign_key| {
+                if (std.mem.eql(u8, entry.value_ptr.*.name, old_name) or
+                    std.mem.eql(u8, foreign_key.reference_table, old_name))
+                {
+                    return error.UnsupportedAlterTableDependency;
+                }
+            }
+        }
+
+        try self.tables.ensureUnusedCapacity(1);
+        const new_key = try self.allocator.dupe(u8, new_name);
+        errdefer self.allocator.free(new_key);
+        const new_table_name = try self.allocator.dupe(u8, new_name);
+        errdefer self.allocator.free(new_table_name);
+        const old_schema_version = self.schema_version;
+        const old_table_name = table.name;
+        const entry = self.tables.fetchRemove(old_name).?;
+        table.name = new_table_name;
+        self.tables.putAssumeCapacity(new_key, table);
+        self.bumpSchemaVersion();
+
+        self.rewriteAllMetadata() catch |err| {
+            const inserted = self.tables.fetchRemove(new_name).?;
+            _ = inserted;
+            table.name = old_table_name;
+            self.tables.putAssumeCapacity(entry.key, table);
+            self.schema_version = old_schema_version;
+            return err;
+        };
+        self.allocator.free(entry.key);
+        self.allocator.free(old_table_name);
+    }
+
+    /// Rename a column whose name is not referenced by another schema object.
+    pub fn renameColumn(self: *Self, table_name: []const u8, old_name: []const u8, new_name: []const u8) !void {
+        try self.ensureWritable();
+        const table = self.tables.get(table_name) orelse return error.TableNotFound;
+        const column_idx = table.getColumnIndex(old_name) orelse return error.ColumnNotFound;
+        if (table.getColumnIndex(new_name) != null) return error.ColumnAlreadyExists;
+        if (table.schema.check_constraints.len != 0) return error.UnsupportedAlterTableDependency;
+        for (table.schema.columns) |column| {
+            if (column.generated != null) return error.UnsupportedAlterTableDependency;
+        }
+        for (table.schema.foreign_keys) |foreign_key| {
+            if (foreign_key.columns) |columns| for (columns) |column| {
+                if (std.mem.eql(u8, column, old_name)) return error.UnsupportedAlterTableDependency;
+            };
+            if (foreign_key.reference_columns) |columns| for (columns) |column| {
+                if (std.mem.eql(u8, column, old_name)) return error.UnsupportedAlterTableDependency;
+            };
+            if ((foreign_key.column != null and std.mem.eql(u8, foreign_key.column.?, old_name)) or
+                std.mem.eql(u8, foreign_key.reference_column, old_name))
+            {
+                return error.UnsupportedAlterTableDependency;
+            }
+        }
+        var other_tables = self.tables.iterator();
+        while (other_tables.next()) |entry| {
+            for (entry.value_ptr.*.schema.foreign_keys) |foreign_key| {
+                if (foreign_key.reference_columns) |columns| for (columns) |column| {
+                    if (std.mem.eql(u8, foreign_key.reference_table, table_name) and std.mem.eql(u8, column, old_name)) {
+                        return error.UnsupportedAlterTableDependency;
+                    }
+                };
+                if (std.mem.eql(u8, foreign_key.reference_table, table_name) and
+                    std.mem.eql(u8, foreign_key.reference_column, old_name))
+                {
+                    return error.UnsupportedAlterTableDependency;
+                }
+            }
+        }
+        var index_it = self.indexes.iterator();
+        while (index_it.next()) |entry| {
+            const index = entry.value_ptr.*;
+            if (!std.mem.eql(u8, index.table_name, table_name)) continue;
+            for (index.column_names) |column_name| {
+                if (std.mem.eql(u8, column_name, old_name)) return error.UnsupportedAlterTableDependency;
+            }
+        }
+
+        const replacement = try self.allocator.dupe(u8, new_name);
+        const old_column_name = table.schema.columns[column_idx].name;
+        const old_schema_version = self.schema_version;
+        table.schema.columns[column_idx].name = replacement;
+        self.bumpSchemaVersion();
+        self.rewriteAllMetadata() catch |err| {
+            table.schema.columns[column_idx].name = old_column_name;
+            self.schema_version = old_schema_version;
+            self.allocator.free(replacement);
+            return err;
+        };
+        self.allocator.free(old_column_name);
+    }
+
+    /// Add a column without rewriting table pages. The current storage format
+    /// requires every stored row to match the schema width, so this subset is
+    /// deliberately limited to tables that have never stored rows.
+    pub fn addColumn(self: *Self, table_name: []const u8, column: Column) !void {
+        try self.ensureWritable();
+        const table = self.tables.get(table_name) orelse return error.TableNotFound;
+        if (table.getColumnIndex(column.name) != null) return error.ColumnAlreadyExists;
+        if (table.row_count != 0) return error.AlterTableRequiresRewrite;
+        if (column.is_primary_key or column.is_unique or column.generated != null) return error.UnsupportedAlterTableColumn;
+
+        const old_columns = table.schema.columns;
+        const expanded = try self.allocator.alloc(Column, old_columns.len + 1);
+        var expanded_owned = true;
+        errdefer if (expanded_owned) self.allocator.free(expanded);
+        @memcpy(expanded[0..old_columns.len], old_columns);
+        const new_name = try self.allocator.dupe(u8, column.name);
+        var new_name_owned = true;
+        errdefer if (new_name_owned) self.allocator.free(new_name);
+        const new_default = if (column.default_value) |default_value| try default_value.clone(self.allocator) else null;
+        var new_default_owned = true;
+        errdefer if (new_default_owned) if (new_default) |default_value| default_value.deinit(self.allocator);
+        expanded[old_columns.len] = .{
+            .name = new_name,
+            .data_type = column.data_type,
+            .is_primary_key = false,
+            .is_nullable = column.is_nullable,
+            .default_value = new_default,
+            .generated = null,
+            .is_unique = false,
+        };
+        const old_schema_version = self.schema_version;
+        table.schema.columns = expanded;
+        expanded_owned = false;
+        new_name_owned = false;
+        new_default_owned = false;
+        self.bumpSchemaVersion();
+        self.rewriteAllMetadata() catch |err| {
+            table.schema.columns = old_columns;
+            self.schema_version = old_schema_version;
+            self.allocator.free(expanded[old_columns.len].name);
+            if (expanded[old_columns.len].default_value) |default_value| default_value.deinit(self.allocator);
+            self.allocator.free(expanded);
+            return err;
+        };
+        self.allocator.free(old_columns);
+    }
+
     /// Atomically rewrite the catalog using the versioned superblock format.
     ///
     /// The full catalog is serialized into a single owned buffer, written to the
@@ -250,6 +405,53 @@ pub const StorageEngine = struct {
         try self.rewriteAllMetadata();
     }
 
+    /// Rebuild the live catalog, tables, and indexes into a fresh database.
+    /// Deleted rows and unreachable B-tree/catalog pages are intentionally not
+    /// copied, so the destination is a compact logical equivalent.
+    pub fn compactTo(self: *Self, dest_path: []const u8) !void {
+        const compact = try StorageEngine.init(self.allocator, dest_path);
+        errdefer compact.deinit();
+
+        var table_it = self.tables.iterator();
+        while (table_it.next()) |entry| {
+            const source_table = entry.value_ptr.*;
+            try compact.createTable(source_table.name, source_table.schema);
+            const dest_table = compact.getTable(source_table.name).?;
+            const rows = try source_table.select(self.allocator);
+            var transferred: usize = 0;
+            errdefer {
+                for (rows[transferred..]) |row_value| {
+                    var row = row_value;
+                    row.deinit(self.allocator);
+                }
+                self.allocator.free(rows);
+            }
+            for (rows) |row| {
+                _ = try dest_table.insert(self.allocator, row.values);
+                transferred += 1;
+            }
+            self.allocator.free(rows);
+        }
+
+        var index_it = self.indexes.iterator();
+        while (index_it.next()) |entry| {
+            const index = entry.value_ptr.*;
+            try compact.createIndexEx(index.name, index.table_name, index.column_names, index.expressions, index.where_clause, index.is_unique);
+        }
+        var fts_it = self.fts_indexes.iterator();
+        while (fts_it.next()) |entry| {
+            const fts_index = entry.value_ptr.*;
+            try compact.createFTSIndex(fts_index.table_name, fts_index.column_names);
+            try compact.rebuildFTSIndex(compact.getFTSIndex(fts_index.table_name).?);
+        }
+
+        compact.user_version = self.user_version;
+        compact.schema_version = self.schema_version;
+        try compact.saveAllMetadata();
+        try compact.pager.flush();
+        compact.deinit();
+    }
+
     pub fn getUserVersion(self: *const Self) u32 {
         return self.user_version;
     }
@@ -287,34 +489,34 @@ pub const StorageEngine = struct {
 
     fn appendMetadataValue(self: *Self, buf: *std.ArrayListUnmanaged(u8), value: Value) !void {
         switch (value) {
-            .Null => try buf.append(self.allocator, @intFromEnum(MetadataValueTag.Null)),
+            .Null => try buf.append(self.allocator, @backingInt(MetadataValueTag.Null)),
             .Integer => |v| {
-                try buf.append(self.allocator, @intFromEnum(MetadataValueTag.Integer));
+                try buf.append(self.allocator, @backingInt(MetadataValueTag.Integer));
                 try self.appendInt(buf, i64, v);
             },
             .Text => |t| {
-                try buf.append(self.allocator, @intFromEnum(MetadataValueTag.Text));
+                try buf.append(self.allocator, @backingInt(MetadataValueTag.Text));
                 try self.appendInt(buf, u16, @intCast(t.len));
                 try buf.appendSlice(self.allocator, t);
             },
             .Real => |r| {
-                try buf.append(self.allocator, @intFromEnum(MetadataValueTag.Real));
+                try buf.append(self.allocator, @backingInt(MetadataValueTag.Real));
                 try self.appendInt(buf, u64, @bitCast(r));
             },
             .Boolean => |b| {
-                try buf.append(self.allocator, @intFromEnum(MetadataValueTag.Boolean));
+                try buf.append(self.allocator, @backingInt(MetadataValueTag.Boolean));
                 try buf.append(self.allocator, if (b) @as(u8, 1) else 0);
             },
             .SmallInt => |s| {
-                try buf.append(self.allocator, @intFromEnum(MetadataValueTag.SmallInt));
+                try buf.append(self.allocator, @backingInt(MetadataValueTag.SmallInt));
                 try self.appendInt(buf, i16, s);
             },
             .BigInt => |b| {
-                try buf.append(self.allocator, @intFromEnum(MetadataValueTag.BigInt));
+                try buf.append(self.allocator, @backingInt(MetadataValueTag.BigInt));
                 try self.appendInt(buf, i64, b);
             },
             .Blob => |bl| {
-                try buf.append(self.allocator, @intFromEnum(MetadataValueTag.Blob));
+                try buf.append(self.allocator, @backingInt(MetadataValueTag.Blob));
                 try self.appendInt(buf, u16, @intCast(bl.len));
                 try buf.appendSlice(self.allocator, bl);
             },
@@ -325,16 +527,16 @@ pub const StorageEngine = struct {
     fn appendFunctionArgument(self: *Self, buf: *std.ArrayListUnmanaged(u8), arg: Column.FunctionArgument) !void {
         switch (arg) {
             .Literal => |lit| {
-                try buf.append(self.allocator, @intFromEnum(MetadataFunctionArgTag.Literal));
+                try buf.append(self.allocator, @backingInt(MetadataFunctionArgTag.Literal));
                 try self.appendMetadataValue(buf, lit);
             },
             .Column => |col| {
-                try buf.append(self.allocator, @intFromEnum(MetadataFunctionArgTag.Column));
+                try buf.append(self.allocator, @backingInt(MetadataFunctionArgTag.Column));
                 try self.appendInt(buf, u16, @intCast(col.len));
                 try buf.appendSlice(self.allocator, col);
             },
             .Parameter => |p| {
-                try buf.append(self.allocator, @intFromEnum(MetadataFunctionArgTag.Parameter));
+                try buf.append(self.allocator, @backingInt(MetadataFunctionArgTag.Parameter));
                 try self.appendInt(buf, u32, p);
             },
         }
@@ -343,11 +545,11 @@ pub const StorageEngine = struct {
     fn appendDefaultValue(self: *Self, buf: *std.ArrayListUnmanaged(u8), dv: Column.DefaultValue) !void {
         switch (dv) {
             .Literal => |lit| {
-                try buf.append(self.allocator, @intFromEnum(MetadataDefaultTag.Literal));
+                try buf.append(self.allocator, @backingInt(MetadataDefaultTag.Literal));
                 try self.appendMetadataValue(buf, lit);
             },
             .FunctionCall => |fc| {
-                try buf.append(self.allocator, @intFromEnum(MetadataDefaultTag.FunctionCall));
+                try buf.append(self.allocator, @backingInt(MetadataDefaultTag.FunctionCall));
                 try self.appendInt(buf, u16, @intCast(fc.name.len));
                 try buf.appendSlice(self.allocator, fc.name);
                 try self.appendInt(buf, u16, @intCast(fc.arguments.len));
@@ -386,7 +588,7 @@ pub const StorageEngine = struct {
             },
             .BinaryOp => |bin| {
                 try buf.append(self.allocator, 4);
-                try buf.append(self.allocator, @intFromEnum(bin.op));
+                try buf.append(self.allocator, @backingInt(bin.op));
                 try self.appendCheckExpression(buf, bin.left.*);
                 try self.appendCheckExpression(buf, bin.right.*);
             },
@@ -403,7 +605,7 @@ pub const StorageEngine = struct {
         switch (condition) {
             .Comparison => |comp| {
                 try buf.append(self.allocator, 1);
-                try buf.append(self.allocator, @intFromEnum(comp.operator));
+                try buf.append(self.allocator, @backingInt(comp.operator));
                 try self.appendCheckExpression(buf, comp.left);
                 try self.appendCheckExpression(buf, comp.right);
                 if (comp.extra) |extra| {
@@ -415,7 +617,7 @@ pub const StorageEngine = struct {
             },
             .Logical => |logical| {
                 try buf.append(self.allocator, 2);
-                try buf.append(self.allocator, @intFromEnum(logical.operator));
+                try buf.append(self.allocator, @backingInt(logical.operator));
                 try self.appendCheckCondition(buf, logical.left.*);
                 try self.appendCheckCondition(buf, logical.right.*);
             },
@@ -425,7 +627,7 @@ pub const StorageEngine = struct {
     fn appendForeignKeyAction(self: *Self, buf: *std.ArrayListUnmanaged(u8), action: ?ast.ForeignKeyAction) !void {
         if (action) |value| {
             try buf.append(self.allocator, 1);
-            try buf.append(self.allocator, @intFromEnum(value));
+            try buf.append(self.allocator, @backingInt(value));
         } else {
             try buf.append(self.allocator, 0);
         }
@@ -466,7 +668,7 @@ pub const StorageEngine = struct {
             for (table.schema.columns) |column| {
                 try self.appendInt(&buf, u16, @intCast(column.name.len));
                 try buf.appendSlice(self.allocator, column.name);
-                try buf.append(self.allocator, @intFromEnum(column.data_type));
+                try buf.append(self.allocator, @backingInt(column.data_type));
                 var flags: u8 = 0;
                 if (column.is_primary_key) flags |= 0x01;
                 if (column.is_nullable) flags |= 0x02;
@@ -483,7 +685,9 @@ pub const StorageEngine = struct {
             try buf.appendSlice(self.allocator, index.name);
             try self.appendInt(&buf, u16, @intCast(index.table_name.len));
             try buf.appendSlice(self.allocator, index.table_name);
-            try buf.append(self.allocator, if (index.is_unique) @as(u8, 0x01) else 0x00);
+            var index_flags: u8 = if (index.is_unique) 0x01 else 0x00;
+            if (isAdvancedIndexDefinition(index.column_names, index.expressions, index.where_clause)) index_flags |= 0x02;
+            try buf.append(self.allocator, index_flags);
             try self.appendInt(&buf, u16, @intCast(index.column_names.len));
             for (index.column_names) |cn| {
                 try self.appendInt(&buf, u16, @intCast(cn.len));
@@ -571,20 +775,29 @@ pub const StorageEngine = struct {
         var fk_ext_count: u32 = 0;
         var fk_count_it = self.tables.iterator();
         while (fk_count_it.next()) |entry| {
-            if (entry.value_ptr.*.schema.foreign_keys.len > 0) fk_ext_count += 1;
+            for (entry.value_ptr.*.schema.foreign_keys) |foreign_key| {
+                if (foreign_key.columns == null and !foreign_key.deferred) {
+                    fk_ext_count += 1;
+                    break;
+                }
+            }
         }
         try self.appendInt(&buf, u32, fk_ext_count);
 
         var fk_it = self.tables.iterator();
         while (fk_it.next()) |entry| {
             const table = entry.value_ptr.*;
-            if (table.schema.foreign_keys.len == 0) continue;
+            var simple_count: u16 = 0;
+            for (table.schema.foreign_keys) |foreign_key| {
+                if (foreign_key.columns == null and !foreign_key.deferred) simple_count += 1;
+            }
+            if (simple_count == 0) continue;
 
             try self.appendInt(&buf, u16, @intCast(table.name.len));
             try buf.appendSlice(self.allocator, table.name);
-            try self.appendInt(&buf, u16, @intCast(table.schema.foreign_keys.len));
+            try self.appendInt(&buf, u16, simple_count);
             for (table.schema.foreign_keys) |foreign_key| {
-                try self.appendForeignKey(&buf, foreign_key);
+                if (foreign_key.columns == null and !foreign_key.deferred) try self.appendForeignKey(&buf, foreign_key);
             }
         }
 
@@ -593,6 +806,86 @@ pub const StorageEngine = struct {
         try self.appendInt(&buf, u32, 1);
         try self.appendInt(&buf, u32, self.user_version);
         try self.appendInt(&buf, u32, self.schema_version);
+
+        // Optional tail extension for partial predicates and expression keys.
+        // Keeping the base index records unchanged preserves older catalogs.
+        var advanced_index_count: u32 = 0;
+        var advanced_count_it = self.indexes.iterator();
+        while (advanced_count_it.next()) |entry| {
+            const index = entry.value_ptr.*;
+            if (isAdvancedIndexDefinition(index.column_names, index.expressions, index.where_clause)) advanced_index_count += 1;
+        }
+        try self.appendInt(&buf, u32, advanced_index_count);
+        var advanced_it = self.indexes.iterator();
+        while (advanced_it.next()) |entry| {
+            const index = entry.value_ptr.*;
+            if (!isAdvancedIndexDefinition(index.column_names, index.expressions, index.where_clause)) continue;
+            try self.appendInt(&buf, u16, @intCast(index.name.len));
+            try buf.appendSlice(self.allocator, index.name);
+            try self.appendInt(&buf, u16, @intCast(index.expressions.len));
+            for (index.expressions) |expression| try self.appendCheckExpression(&buf, expression);
+            if (index.where_clause) |condition| {
+                try buf.append(self.allocator, 1);
+                try self.appendCheckCondition(&buf, condition);
+            } else {
+                try buf.append(self.allocator, 0);
+            }
+        }
+
+        var advanced_fk_table_count: u32 = 0;
+        var advanced_fk_count_it = self.tables.iterator();
+        while (advanced_fk_count_it.next()) |entry| {
+            for (entry.value_ptr.*.schema.foreign_keys) |foreign_key| {
+                if (foreign_key.columns != null or foreign_key.deferred) {
+                    advanced_fk_table_count += 1;
+                    break;
+                }
+            }
+        }
+        try self.appendInt(&buf, u32, advanced_fk_table_count);
+        var advanced_fk_it = self.tables.iterator();
+        while (advanced_fk_it.next()) |entry| {
+            const table = entry.value_ptr.*;
+            var constraint_count: u16 = 0;
+            for (table.schema.foreign_keys) |foreign_key| {
+                if (foreign_key.columns != null or foreign_key.deferred) constraint_count += 1;
+            }
+            if (constraint_count == 0) continue;
+            try self.appendInt(&buf, u16, @intCast(table.name.len));
+            try buf.appendSlice(self.allocator, table.name);
+            try self.appendInt(&buf, u16, constraint_count);
+            for (table.schema.foreign_keys) |foreign_key| {
+                if (foreign_key.columns == null and !foreign_key.deferred) continue;
+                const child_count: u16 = if (foreign_key.columns) |columns| @intCast(columns.len) else 1;
+                try self.appendInt(&buf, u16, child_count);
+                if (foreign_key.columns) |columns| {
+                    for (columns) |column| {
+                        try self.appendInt(&buf, u16, @intCast(column.len));
+                        try buf.appendSlice(self.allocator, column);
+                    }
+                } else {
+                    const column = foreign_key.column orelse return error.InvalidForeignKey;
+                    try self.appendInt(&buf, u16, @intCast(column.len));
+                    try buf.appendSlice(self.allocator, column);
+                }
+                try self.appendInt(&buf, u16, @intCast(foreign_key.reference_table.len));
+                try buf.appendSlice(self.allocator, foreign_key.reference_table);
+                const reference_count: u16 = if (foreign_key.reference_columns) |columns| @intCast(columns.len) else 1;
+                try self.appendInt(&buf, u16, reference_count);
+                if (foreign_key.reference_columns) |columns| {
+                    for (columns) |column| {
+                        try self.appendInt(&buf, u16, @intCast(column.len));
+                        try buf.appendSlice(self.allocator, column);
+                    }
+                } else {
+                    try self.appendInt(&buf, u16, @intCast(foreign_key.reference_column.len));
+                    try buf.appendSlice(self.allocator, foreign_key.reference_column);
+                }
+                try self.appendForeignKeyAction(&buf, foreign_key.on_delete);
+                try self.appendForeignKeyAction(&buf, foreign_key.on_update);
+                try buf.append(self.allocator, if (foreign_key.deferred) 1 else 0);
+            }
+        }
 
         return buf.toOwnedSlice(self.allocator);
     }
@@ -707,10 +1000,6 @@ pub const StorageEngine = struct {
         is_unique: bool,
     ) !void {
         try self.ensureWritable();
-        if (!self.is_memory and isAdvancedIndexDefinition(column_names, expressions, where_clause)) {
-            return error.UnsupportedPersistentAdvancedIndex;
-        }
-
         const index = try self.registerIndexEx(name, table_name, column_names, expressions, where_clause, is_unique);
         errdefer {
             if (self.indexes.fetchRemove(name)) |entry| {
@@ -1182,7 +1471,7 @@ pub const StorageEngine = struct {
 
     fn readMetadataValue(self: *Self, buffer: []const u8, offset: *usize) !Value {
         if (offset.* >= buffer.len) return error.InvalidMetadata;
-        const tag: MetadataValueTag = @enumFromInt(buffer[offset.*]);
+        const tag: MetadataValueTag = @fromBackingInt(@intCast(buffer[offset.*]));
         offset.* += 1;
 
         return switch (tag) {
@@ -1240,7 +1529,7 @@ pub const StorageEngine = struct {
 
     fn readFunctionArgument(self: *Self, buffer: []const u8, offset: *usize) !Column.FunctionArgument {
         if (offset.* >= buffer.len) return error.InvalidMetadata;
-        const tag: MetadataFunctionArgTag = @enumFromInt(buffer[offset.*]);
+        const tag: MetadataFunctionArgTag = @fromBackingInt(@intCast(buffer[offset.*]));
         offset.* += 1;
 
         return switch (tag) {
@@ -1265,7 +1554,7 @@ pub const StorageEngine = struct {
 
     fn readDefaultValue(self: *Self, buffer: []const u8, offset: *usize) !Column.DefaultValue {
         if (offset.* >= buffer.len) return error.InvalidMetadata;
-        const tag: MetadataDefaultTag = @enumFromInt(buffer[offset.*]);
+        const tag: MetadataDefaultTag = @fromBackingInt(@intCast(buffer[offset.*]));
         offset.* += 1;
 
         return switch (tag) {
@@ -1342,7 +1631,7 @@ pub const StorageEngine = struct {
             },
             4 => blk: {
                 if (offset.* >= buffer.len) return error.InvalidMetadata;
-                const op: ast.ArithmeticOp = @enumFromInt(buffer[offset.*]);
+                const op: ast.ArithmeticOp = @fromBackingInt(@intCast(buffer[offset.*]));
                 offset.* += 1;
                 const left = try self.allocator.create(ast.Expression);
                 errdefer self.allocator.destroy(left);
@@ -1389,7 +1678,7 @@ pub const StorageEngine = struct {
         return switch (tag) {
             1 => blk: {
                 if (offset.* >= buffer.len) return error.InvalidMetadata;
-                const op: ast.ComparisonOperator = @enumFromInt(buffer[offset.*]);
+                const op: ast.ComparisonOperator = @fromBackingInt(@intCast(buffer[offset.*]));
                 offset.* += 1;
                 var condition = ast.Condition{ .Comparison = .{
                     .left = try self.readCheckExpression(buffer, offset),
@@ -1409,7 +1698,7 @@ pub const StorageEngine = struct {
             },
             2 => blk: {
                 if (offset.* >= buffer.len) return error.InvalidMetadata;
-                const op: ast.LogicalOperator = @enumFromInt(buffer[offset.*]);
+                const op: ast.LogicalOperator = @fromBackingInt(@intCast(buffer[offset.*]));
                 offset.* += 1;
                 const left = try self.allocator.create(ast.Condition);
                 errdefer self.allocator.destroy(left);
@@ -1438,7 +1727,7 @@ pub const StorageEngine = struct {
         offset.* += 1;
         if (!has_action) return null;
         if (offset.* >= buffer.len) return error.InvalidMetadata;
-        const action: ast.ForeignKeyAction = @enumFromInt(buffer[offset.*]);
+        const action: ast.ForeignKeyAction = @fromBackingInt(@intCast(buffer[offset.*]));
         offset.* += 1;
         return action;
     }
@@ -1473,6 +1762,24 @@ pub const StorageEngine = struct {
             .on_delete = try self.readForeignKeyAction(buffer, offset),
             .on_update = try self.readForeignKeyAction(buffer, offset),
         };
+    }
+
+    fn readCatalogStringList(self: *Self, buffer: []const u8, offset: *usize, count: usize) ![][]const u8 {
+        const values = try self.allocator.alloc([]const u8, count);
+        var loaded: usize = 0;
+        errdefer {
+            for (values[0..loaded]) |value| self.allocator.free(value);
+            self.allocator.free(values);
+        }
+        while (loaded < count) : (loaded += 1) {
+            if (offset.* + 2 > buffer.len) return error.CorruptCatalog;
+            const len = std.mem.readInt(u16, buffer[offset.*..][0..2], .little);
+            offset.* += 2;
+            if (offset.* + len > buffer.len) return error.CorruptCatalog;
+            values[loaded] = try self.allocator.dupe(u8, buffer[offset.*..][0..len]);
+            offset.* += len;
+        }
+        return values;
     }
 
     fn clearFTSIndex(self: *Self, fts_index: *FTSIndex) void {
@@ -1642,7 +1949,7 @@ pub const StorageEngine = struct {
                 if (offset + col_name_len + 2 > payload.len) return error.CorruptCatalog;
                 columns[col_idx].name = try self.allocator.dupe(u8, payload[offset..][0..col_name_len]);
                 offset += col_name_len;
-                columns[col_idx].data_type = @enumFromInt(payload[offset]);
+                columns[col_idx].data_type = @fromBackingInt(@intCast(payload[offset]));
                 offset += 1;
                 const flags = payload[offset];
                 offset += 1;
@@ -1684,6 +1991,7 @@ pub const StorageEngine = struct {
             const flags = payload[offset];
             offset += 1;
             const is_unique = (flags & 0x01) != 0;
+            const has_advanced_definition = (flags & 0x02) != 0;
             const idx_column_count = std.mem.readInt(u16, payload[offset..][0..2], .little);
             offset += 2;
 
@@ -1703,7 +2011,7 @@ pub const StorageEngine = struct {
             }
 
             const index = try self.registerIndex(index_name, table_name, column_names[0..loaded_columns], is_unique);
-            try self.rebuildIndex(index);
+            if (!has_advanced_definition) try self.rebuildIndex(index);
 
             for (column_names[0..loaded_columns]) |cn| self.allocator.free(cn);
             self.allocator.free(column_names);
@@ -1886,6 +2194,146 @@ pub const StorageEngine = struct {
             self.schema_version = std.mem.readInt(u32, payload[offset..][0..4], .little);
             offset += 4;
         }
+
+        if (offset == payload.len) return;
+        if (offset + 4 > payload.len) return error.CorruptCatalog;
+        const advanced_index_count = std.mem.readInt(u32, payload[offset..][0..4], .little);
+        offset += 4;
+        var advanced_loaded: u32 = 0;
+        while (advanced_loaded < advanced_index_count) : (advanced_loaded += 1) {
+            if (offset + 2 > payload.len) return error.CorruptCatalog;
+            const name_len = std.mem.readInt(u16, payload[offset..][0..2], .little);
+            offset += 2;
+            if (offset + name_len + 2 > payload.len) return error.CorruptCatalog;
+            const index_name = payload[offset..][0..name_len];
+            offset += name_len;
+            const expression_count = std.mem.readInt(u16, payload[offset..][0..2], .little);
+            offset += 2;
+
+            const expressions = try self.allocator.alloc(ast.Expression, expression_count);
+            var expressions_loaded: usize = 0;
+            var expressions_owned = true;
+            errdefer if (expressions_owned) {
+                for (expressions[0..expressions_loaded]) |*expression| expression.deinit(self.allocator);
+                self.allocator.free(expressions);
+            };
+            while (expressions_loaded < expression_count) : (expressions_loaded += 1) {
+                expressions[expressions_loaded] = try self.readCheckExpression(payload, &offset);
+            }
+            if (offset >= payload.len) return error.CorruptCatalog;
+            const has_where = payload[offset];
+            offset += 1;
+            if (has_where > 1) return error.CorruptCatalog;
+            var where_clause: ?ast.Condition = if (has_where == 1) try self.readCheckCondition(payload, &offset) else null;
+            var where_owned = true;
+            errdefer if (where_owned) if (where_clause) |*condition| condition.deinit(self.allocator);
+
+            if (self.getIndex(index_name)) |index| {
+                for (index.expressions) |*expression| expression.deinit(self.allocator);
+                self.allocator.free(index.expressions);
+                if (index.where_clause) |*condition| condition.deinit(self.allocator);
+                index.expressions = expressions;
+                index.where_clause = where_clause;
+                expressions_owned = false;
+                where_owned = false;
+                where_clause = null;
+                try self.rebuildIndex(index);
+            } else {
+                for (expressions) |*expression| expression.deinit(self.allocator);
+                self.allocator.free(expressions);
+                expressions_owned = false;
+                if (where_clause) |*condition| condition.deinit(self.allocator);
+                where_owned = false;
+                where_clause = null;
+            }
+        }
+        if (offset == payload.len) return;
+        if (offset + 4 > payload.len) return error.CorruptCatalog;
+        const advanced_fk_table_count = std.mem.readInt(u32, payload[offset..][0..4], .little);
+        offset += 4;
+        var advanced_fk_tables_loaded: u32 = 0;
+        while (advanced_fk_tables_loaded < advanced_fk_table_count) : (advanced_fk_tables_loaded += 1) {
+            if (offset + 2 > payload.len) return error.CorruptCatalog;
+            const table_name_len = std.mem.readInt(u16, payload[offset..][0..2], .little);
+            offset += 2;
+            if (offset + table_name_len + 2 > payload.len) return error.CorruptCatalog;
+            const table_name = payload[offset..][0..table_name_len];
+            offset += table_name_len;
+            const constraint_count = std.mem.readInt(u16, payload[offset..][0..2], .little);
+            offset += 2;
+            var constraint_idx: u16 = 0;
+            while (constraint_idx < constraint_count) : (constraint_idx += 1) {
+                if (offset + 2 > payload.len) return error.CorruptCatalog;
+                const child_count = std.mem.readInt(u16, payload[offset..][0..2], .little);
+                offset += 2;
+                if (child_count == 0) return error.CorruptCatalog;
+                const child_columns = try self.readCatalogStringList(payload, &offset, child_count);
+                var child_owned = true;
+                errdefer if (child_owned) {
+                    for (child_columns) |column| self.allocator.free(column);
+                    self.allocator.free(child_columns);
+                };
+                if (offset + 2 > payload.len) return error.CorruptCatalog;
+                const reference_table_len = std.mem.readInt(u16, payload[offset..][0..2], .little);
+                offset += 2;
+                if (offset + reference_table_len + 2 > payload.len) return error.CorruptCatalog;
+                const reference_table = try self.allocator.dupe(u8, payload[offset..][0..reference_table_len]);
+                offset += reference_table_len;
+                var reference_table_owned = true;
+                errdefer if (reference_table_owned) self.allocator.free(reference_table);
+                const reference_count = std.mem.readInt(u16, payload[offset..][0..2], .little);
+                offset += 2;
+                if (reference_count != child_count) return error.CorruptCatalog;
+                const reference_columns = try self.readCatalogStringList(payload, &offset, reference_count);
+                var references_owned = true;
+                errdefer if (references_owned) {
+                    for (reference_columns) |column| self.allocator.free(column);
+                    self.allocator.free(reference_columns);
+                };
+                const on_delete = try self.readForeignKeyAction(payload, &offset);
+                const on_update = try self.readForeignKeyAction(payload, &offset);
+                if (offset >= payload.len or payload[offset] > 1) return error.CorruptCatalog;
+                const deferred = payload[offset] == 1;
+                offset += 1;
+
+                var foreign_key: ast.ForeignKeyConstraint = if (child_count == 1) .{
+                    .column = child_columns[0],
+                    .reference_table = reference_table,
+                    .reference_column = reference_columns[0],
+                    .on_delete = on_delete,
+                    .on_update = on_update,
+                    .deferred = deferred,
+                } else .{
+                    .column = null,
+                    .columns = child_columns,
+                    .reference_table = reference_table,
+                    .reference_column = try self.allocator.dupe(u8, reference_columns[0]),
+                    .reference_columns = reference_columns,
+                    .on_delete = on_delete,
+                    .on_update = on_update,
+                    .deferred = deferred,
+                };
+                if (child_count == 1) {
+                    self.allocator.free(child_columns);
+                    self.allocator.free(reference_columns);
+                }
+                child_owned = false;
+                references_owned = false;
+                reference_table_owned = false;
+
+                if (self.getTable(table_name)) |table| {
+                    const previous = table.schema.foreign_keys;
+                    const expanded = try self.allocator.alloc(ast.ForeignKeyConstraint, previous.len + 1);
+                    @memcpy(expanded[0..previous.len], previous);
+                    expanded[previous.len] = foreign_key;
+                    if (previous.len > 0) self.allocator.free(previous);
+                    table.schema.foreign_keys = expanded;
+                } else {
+                    foreign_key.deinit(self.allocator);
+                }
+            }
+        }
+        if (offset != payload.len) return error.CorruptCatalog;
     }
 
     /// Parse the legacy single-page (page 1) catalog format. Retained so existing
@@ -1967,7 +2415,7 @@ pub const StorageEngine = struct {
                 columns[col_idx].name = try self.allocator.dupe(u8, page.data[offset..][0..col_name_len]);
                 offset += col_name_len;
 
-                columns[col_idx].data_type = @enumFromInt(page.data[offset]);
+                columns[col_idx].data_type = @fromBackingInt(@intCast(page.data[offset]));
                 offset += 1;
 
                 const flags = page.data[offset];
@@ -2595,12 +3043,25 @@ pub const TableSchema = struct {
 };
 
 fn cloneAstForeignKey(allocator: std.mem.Allocator, foreign_key: ast.ForeignKeyConstraint) CloneValueError!ast.ForeignKeyConstraint {
+    const columns = if (foreign_key.columns) |source| blk: {
+        const cloned = try allocator.alloc([]const u8, source.len);
+        for (source, 0..) |column, i| cloned[i] = try allocator.dupe(u8, column);
+        break :blk cloned;
+    } else null;
+    const reference_columns = if (foreign_key.reference_columns) |source| blk: {
+        const cloned = try allocator.alloc([]const u8, source.len);
+        for (source, 0..) |column, i| cloned[i] = try allocator.dupe(u8, column);
+        break :blk cloned;
+    } else null;
     return .{
         .column = if (foreign_key.column) |column| try allocator.dupe(u8, column) else null,
+        .columns = columns,
         .reference_table = try allocator.dupe(u8, foreign_key.reference_table),
         .reference_column = try allocator.dupe(u8, foreign_key.reference_column),
+        .reference_columns = reference_columns,
         .on_delete = foreign_key.on_delete,
         .on_update = foreign_key.on_update,
+        .deferred = foreign_key.deferred,
     };
 }
 
@@ -3277,7 +3738,9 @@ pub const Index = struct {
     pub fn insert(self: *Self, key: u64, row_id: u64) !void {
         if (self.is_unique) {
             // Check if key already exists
-            if (try self.btree.search(key)) |_| {
+            if (try self.btree.search(key)) |existing| {
+                var owned = existing;
+                owned.deinit(self.btree.allocator);
                 return error.UniqueConstraintViolation;
             }
         }

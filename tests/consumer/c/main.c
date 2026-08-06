@@ -61,6 +61,11 @@ int main(void) {
     if (named_value == NULL || strcmp(named_value, "package-ok") != 0) return 26;
     if (zqlite_step(named_stmt) != ZQLITE_DONE) return 27;
     if (zqlite_finalize(named_stmt) != ZQLITE_OK) return 28;
+    if (zqlite_finalize(named_stmt) != ZQLITE_MISUSE) return 43;
+    if (zqlite_step(named_stmt) != ZQLITE_MISUSE) return 44;
+    if (zqlite_bind_int(NULL, 0, 1) != ZQLITE_MISUSE) return 45;
+    if (zqlite_bind_int(stmt, -1, 1) != ZQLITE_MISUSE) return 46;
+    zqlite_result_free(result);
 
     if (zqlite_execute(conn, "CREATE TABLE unique_check (id INTEGER UNIQUE)") != ZQLITE_OK) return 29;
     if (zqlite_execute(conn, "INSERT INTO unique_check VALUES (1)") != ZQLITE_OK) return 30;
@@ -68,7 +73,12 @@ int main(void) {
     if (zqlite_errcode(conn) != ZQLITE_CONSTRAINT) return 32;
     if (zqlite_errcategory(conn) != ZQLITE_ERROR_CATEGORY_CONSTRAINT) return 33;
 
+    zqlite_stmt_t *orphan = zqlite_prepare(conn, "SELECT id FROM unique_check");
+    if (orphan == NULL) return 47;
     zqlite_close(conn);
+    zqlite_close(conn);
+    if (zqlite_step(orphan) != ZQLITE_MISUSE) return 48;
+    if (zqlite_finalize(orphan) != ZQLITE_OK) return 49;
     puts("C package consumer passed");
     return 0;
 }

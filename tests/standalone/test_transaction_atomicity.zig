@@ -23,8 +23,51 @@ pub fn main(init: std.process.Init) !void {
     try testSavepointWithForeignKeyCascade(allocator);
     try testSavepointWithUniqueIndex(allocator);
     try testDDLRejectedInsideSavepoint(allocator);
+    try testAutocommitStatementAtomicity(allocator);
+    try testTransactionStateErrors(allocator);
 
     std.log.info("=== ALL TRANSACTION ATOMICITY TESTS PASSED ===", .{});
+}
+
+fn testAutocommitStatementAtomicity(allocator: std.mem.Allocator) !void {
+    std.log.info("[TEST] Autocommit DML rolls back the whole failing statement", .{});
+    const path = try test_dir.dbPath("autocommit-atomic.db");
+    defer allocator.free(path);
+
+    {
+        const conn = try zqlite.open(allocator, path);
+        defer conn.close();
+        try conn.execute("CREATE TABLE atomic_rows (id INTEGER, email TEXT UNIQUE)");
+        try conn.execute("INSERT INTO atomic_rows VALUES (1, 'existing@example.com')");
+        try std.testing.expectError(
+            error.UniqueConstraintViolation,
+            conn.execute("INSERT INTO atomic_rows VALUES (2, 'new@example.com'), (3, 'existing@example.com')"),
+        );
+
+        var rows = try conn.query("SELECT * FROM atomic_rows");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 1), rows.rows.items.len);
+        try std.testing.expect(resultHasIntegerId(&rows, 1));
+    }
+
+    {
+        const reopened = try zqlite.open(allocator, path);
+        defer reopened.close();
+        var rows = try reopened.query("SELECT * FROM atomic_rows");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 1), rows.rows.items.len);
+        try std.testing.expect(resultHasIntegerId(&rows, 1));
+    }
+    std.log.info("[PASS] Failed autocommit statement left no partial rows", .{});
+}
+
+fn testTransactionStateErrors(allocator: std.mem.Allocator) !void {
+    std.log.info("[TEST] COMMIT and ROLLBACK require an active transaction", .{});
+    const conn = try zqlite.open(allocator, ":memory:");
+    defer conn.close();
+    try std.testing.expectError(error.NoActiveTransaction, conn.commit());
+    try std.testing.expectError(error.NoActiveTransaction, conn.rollback());
+    std.log.info("[PASS] Invalid transaction transitions fail explicitly", .{});
 }
 
 fn resultHasIntegerId(result: anytype, id: i64) bool {

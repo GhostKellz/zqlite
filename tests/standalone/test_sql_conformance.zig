@@ -723,6 +723,10 @@ fn runPostgresStyleErrorCategoryCase() !void {
     try std.testing.expectEqual(zqlite.ErrorCategory.constraint, zqlite.categorizeError(error.UniqueConstraintViolation));
     try std.testing.expectEqual(zqlite.ErrorCategory.misuse, zqlite.categorizeError(error.NamedParameterNotFound));
     try std.testing.expectEqual(zqlite.ErrorCategory.format, zqlite.categorizeError(error.CorruptData));
+    try std.testing.expectEqual(zqlite.ErrorCategory.format, zqlite.categorizeError(error.CorruptCatalog));
+    try std.testing.expectEqual(zqlite.ErrorCategory.format, zqlite.categorizeError(error.UnsupportedDatabaseFormat));
+    try std.testing.expectEqual(zqlite.ErrorCategory.io, zqlite.categorizeError(error.ReadOnlyDatabase));
+    try std.testing.expectEqual(zqlite.ErrorCategory.authorization, zqlite.categorizeError(error.PathNotInAllowedRoots));
 }
 
 const ProgressContext = struct {

@@ -32,7 +32,7 @@ Generated from `tests/sql_compatibility.tsv`.
 | User-defined functions | partial | partial | tests/standalone/test_sql_conformance.zig | Connection-scoped Zig callbacks can be registered as scalar functions or single-column aggregate functions and called from SQL. Persistent SQL-defined functions, variadic aggregate state APIs, and C ABI registration are not claimed. |
 | ANALYZE and planner statistics | partial | partial | tests/standalone/test_sql_conformance.zig | ANALYZE refreshes connection-local table/index statistics and PRAGMA planner_stats exposes live row counts, logical row counts, deleted rows, indexed rows, and distinct values. The planner can use analyzed unique equality indexes with estimated rows/cost; persistent sqlite_stat* catalogs and full cost-model parity are not claimed. |
 | EXPLAIN | partial | partial | tests/standalone/test_sql_conformance.zig | Output reflects the current step order and includes estimated rows/cost for planned index scans, but is not full SQLite/PostgreSQL EXPLAIN parity. |
-| ALTER TABLE | unsupported | planned | - | Schema-altering operations are planned with migration tests. |
+| ALTER TABLE | partial | stable-core | `test-schema-evolution` | `RENAME TABLE`, `RENAME COLUMN`, and the no-rewrite `ADD COLUMN` subset are supported; dependent-schema rewrites are rejected. |
 | DDL savepoint rollback | unsupported | planned | tests/standalone/test_transaction_atomicity.zig | Savepoints currently cover DML row changes; schema/catalog changes inside active savepoints are rejected explicitly. |
 | Foreign key deferral | unsupported | planned | - | Immediate enforcement only. |
 | Foreign key multi-column references | unsupported | planned | - | Single-column FK subset only. |

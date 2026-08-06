@@ -5,6 +5,41 @@ All notable changes to ZQLite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.1] - 2026-08-06
+
+### Added
+- **Cross-process concurrency controls** - added cross-platform reader/writer coordination, interruptible busy-timeout waits, one-writer/multiple-reader visibility guarantees, and real threaded and child-process contention tests.
+- **Schema evolution** - added `ALTER TABLE RENAME TABLE`, `ALTER TABLE RENAME COLUMN`, and the safe no-rewrite subset of `ALTER TABLE ADD COLUMN`, with reopen, migration, statement-expiration, and failure-atomicity coverage.
+- **Composite and deferred foreign keys** - added multi-column foreign-key matching and initially deferred constraint checks at commit.
+- **Bounded blob slice access** - added transaction-aware blob handles for bounded reads and same-length writes. The current implementation materializes the complete value for each operation; storage-level incremental I/O remains future work.
+- **Online backup consistency** - backups now capture one complete committed snapshot while coordinating with concurrent writers.
+- **Operational evidence** - added matched-durability SQLite comparison workloads and machine-readable database-growth, WAL-amplification, checkpoint-cost, and allocator-use measurements.
+- **Self-hosted Linux release validation** - expanded concurrency, storage, advanced, C ABI, package-consumer, and default-build coverage on the repository's Linux x86_64 runner.
+
+### Changed
+- **WAL writer reservation** - writable databases now use a dedicated `<database>-writer` sidecar, separate from WAL I/O, so Windows readers can recover committed WAL records while another process owns the writer reservation.
+- **File-backed connection behavior** - independent connections and pooled connections now coordinate writers and refresh stale result, plan, schema, and index state after committed changes.
+- **VACUUM implementation** - `VACUUM` now rebuilds live rows, indexes, FTS metadata, and catalog state into a validated compact image before atomically replacing the database file.
+- **CLI failure behavior** - invalid SQL, missing option arguments, and unknown arguments now produce stable errors and non-zero exit status instead of reporting success.
+- **Coverage reporting** - coverage collection now fails closed when the collector reports zero valid project lines, preventing misleading empty coverage artifacts from being published.
+- **Toolchain requirement** - updated the pinned minimum Zig development toolchain used by local, CI, install, and release validation paths.
+
+### Fixed
+- **Windows WAL lock violations** - separated writer reservation locking from positional WAL reads, fixing cross-process recovery failures on Windows.
+- **Prepared DML reuse** - verified reusable prepared INSERT and DELETE statements correctly consume rebound values without requiring a reset between executions.
+- **C ABI handle lifetime** - statement handles now retain parent-connection identity and reject use after their connection closes; expanded double-close, double-finalize, stale-handle, null-bind, and repeated-result-free coverage.
+- **Transactional failure semantics** - failing autocommit statements roll back atomically, invalid transaction transitions fail explicitly, and writer waits remain cooperatively interruptible.
+- **Schema and result invalidation** - existing readers and prepared statements no longer retain stale state after another connection commits DML, DDL, or an atomic database replacement.
+- **Advanced index persistence** - supported partial and expression index definitions, enforcement state, and planner metadata survive close and reopen.
+
+### Verified
+- `zig build check --summary all`
+- `zig build test-c-api --summary all`
+- `bash scripts/test-release-package.sh`
+- `./scripts/sqlite-comparison.sh`
+- Full Linux x86_64 release sweep on the self-hosted runner
+- C99, C++, and Zig release-package consumer smoke tests
+
 ## [1.7.0] - 2026-06-24
 
 ### Added

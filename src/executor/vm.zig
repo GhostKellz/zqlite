@@ -255,6 +255,7 @@ pub const VirtualMachine = struct {
             .CreateIndex => |*create_idx| try self.executeCreateIndex(create_idx, result),
             .DropIndex => |*drop_idx| try self.executeDropIndex(drop_idx, result),
             .DropTable => |*drop_tbl| try self.executeDropTable(drop_tbl, result),
+            .AlterTable => |*alter| try self.executeAlterTable(alter, result),
             .CreateCTE => |*cte| try self.executeCreateCTE(cte, result),
             .Pragma => |*pragma| try self.executePragma(pragma, result),
             .Analyze => |*analyze| try self.executeAnalyze(analyze, result),
@@ -348,6 +349,7 @@ pub const VirtualMachine = struct {
             .CreateIndex => |*create_idx| try self.executeCreateIndex(create_idx, result),
             .DropIndex => |*drop_idx| try self.executeDropIndex(drop_idx, result),
             .DropTable => |*drop_tbl| try self.executeDropTable(drop_tbl, result),
+            .AlterTable => |*alter| try self.executeAlterTable(alter, result),
             .CreateCTE => {
                 // CTEs within CTEs are not supported in this version
                 return error.NestedCTENotSupported;
@@ -1579,23 +1581,98 @@ pub const VirtualMachine = struct {
             if (skip_foreign_key) |skip| {
                 if (sameForeignKey(foreign_key, skip.*)) continue;
             }
-            const child_column = foreign_key.column orelse return error.ConstraintViolation;
-            const child_idx = table.getColumnIndex(child_column) orelse return error.ConstraintViolation;
-            if (child_idx >= row_values.len) return error.ConstraintViolation;
-            const child_value = row_values[child_idx];
+            if (foreign_key.deferred and self.connection.in_transaction) continue;
+            try self.validateOneForeignKey(table, row_values, foreign_key);
+        }
+    }
 
-            // SQL FK semantics: NULL child keys do not require a parent row.
-            if (child_value == .Null) continue;
+    fn validateOneForeignKey(self: *Self, table: *storage.Table, row_values: []const storage.Value, foreign_key: ast.ForeignKeyConstraint) !void {
+        const parent_table = self.connection.storage_engine.getTable(foreign_key.reference_table) orelse return error.ConstraintViolation;
+        if (foreign_key.columns) |child_columns| {
+            const parent_columns = foreign_key.reference_columns orelse return error.ConstraintViolation;
+            if (child_columns.len == 0 or child_columns.len != parent_columns.len) return error.ConstraintViolation;
+            for (child_columns) |column| {
+                const idx = table.getColumnIndex(column) orelse return error.ConstraintViolation;
+                if (idx >= row_values.len) return error.ConstraintViolation;
+                if (row_values[idx] == .Null) return;
+            }
+            if (!try self.tableHasCompositeValue(parent_table, parent_columns, table, child_columns, row_values)) return error.ConstraintViolation;
+            return;
+        }
 
-            const parent_table = self.connection.storage_engine.getTable(foreign_key.reference_table) orelse return error.ConstraintViolation;
-            const parent_idx = parent_table.getColumnIndex(foreign_key.reference_column) orelse return error.ConstraintViolation;
-            if (!try self.tableHasValue(parent_table, parent_idx, child_value)) {
-                return error.ConstraintViolation;
+        const child_column = foreign_key.column orelse return error.ConstraintViolation;
+        const child_idx = table.getColumnIndex(child_column) orelse return error.ConstraintViolation;
+        if (child_idx >= row_values.len) return error.ConstraintViolation;
+        const child_value = row_values[child_idx];
+        if (child_value == .Null) return;
+        const parent_idx = parent_table.getColumnIndex(foreign_key.reference_column) orelse return error.ConstraintViolation;
+        if (!try self.tableHasValue(parent_table, parent_idx, child_value)) return error.ConstraintViolation;
+    }
+
+    fn tableHasCompositeValue(self: *Self, parent_table: *storage.Table, parent_columns: []const []const u8, child_table: *storage.Table, child_columns: []const []const u8, child_values: []const storage.Value) !bool {
+        const rows = try parent_table.selectWithKeys(self.connection.allocator);
+        defer {
+            for (rows) |item| {
+                var row = item.row;
+                row.deinit(self.connection.allocator);
+            }
+            self.connection.allocator.free(rows);
+        }
+        for (rows) |item| {
+            var matches = true;
+            for (parent_columns, child_columns) |parent_column, child_column| {
+                const parent_idx = parent_table.getColumnIndex(parent_column) orelse return error.ConstraintViolation;
+                const child_idx = child_table.getColumnIndex(child_column) orelse return error.ConstraintViolation;
+                if (parent_idx >= item.row.values.len or child_idx >= child_values.len or
+                    !self.valuesEqual(item.row.values[parent_idx], child_values[child_idx]))
+                {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) return true;
+        }
+        return false;
+    }
+
+    pub fn validateDeferredForeignKeys(self: *Self) !void {
+        var table_it = self.connection.storage_engine.tables.iterator();
+        while (table_it.next()) |entry| {
+            const table = entry.value_ptr.*;
+            var has_deferred = false;
+            for (table.schema.foreign_keys) |foreign_key| {
+                if (foreign_key.deferred) {
+                    has_deferred = true;
+                    break;
+                }
+            }
+            if (!has_deferred) continue;
+            const rows = try table.selectWithKeys(self.connection.allocator);
+            defer {
+                for (rows) |item| {
+                    var row = item.row;
+                    row.deinit(self.connection.allocator);
+                }
+                self.connection.allocator.free(rows);
+            }
+            for (rows) |item| {
+                for (table.schema.foreign_keys) |foreign_key| {
+                    if (foreign_key.deferred) try self.validateOneForeignKey(table, item.row.values, foreign_key);
+                }
             }
         }
     }
 
     fn sameForeignKey(a: ast.ForeignKeyConstraint, b: ast.ForeignKeyConstraint) bool {
+        if (a.columns) |a_columns| {
+            const b_columns = b.columns orelse return false;
+            const a_refs = a.reference_columns orelse return false;
+            const b_refs = b.reference_columns orelse return false;
+            if (a_columns.len != b_columns.len or a_refs.len != b_refs.len) return false;
+            for (a_columns, b_columns) |left, right| if (!std.mem.eql(u8, left, right)) return false;
+            for (a_refs, b_refs) |left, right| if (!std.mem.eql(u8, left, right)) return false;
+            return std.mem.eql(u8, a.reference_table, b.reference_table);
+        }
         const a_column = a.column orelse return b.column == null;
         const b_column = b.column orelse return false;
         return std.mem.eql(u8, a_column, b_column) and
@@ -1627,6 +1704,17 @@ pub const VirtualMachine = struct {
             const child_table = entry.value_ptr.*;
             for (child_table.schema.foreign_keys) |foreign_key| {
                 if (!std.mem.eql(u8, foreign_key.reference_table, parent_table.name)) continue;
+                if (foreign_key.columns != null) {
+                    if (foreign_key.deferred and self.connection.in_transaction and (foreign_key.on_delete orelse .NoAction) == .NoAction) continue;
+                    if (try self.childReferencesCompositeParent(child_table, foreign_key, parent_table, parent_values)) {
+                        switch (foreign_key.on_delete orelse .NoAction) {
+                            .Restrict, .NoAction => return error.ConstraintViolation,
+                            .Cascade, .SetNull => return error.UnsupportedCompositeForeignKeyAction,
+                        }
+                    }
+                    continue;
+                }
+                if (foreign_key.deferred and self.connection.in_transaction and (foreign_key.on_delete orelse .NoAction) == .NoAction) continue;
                 const parent_idx = parent_table.getColumnIndex(foreign_key.reference_column) orelse return error.ConstraintViolation;
                 if (parent_idx >= parent_values.len or parent_values[parent_idx] == .Null) continue;
                 if (try self.childReferencesValue(child_table, foreign_key, parent_values[parent_idx])) {
@@ -1646,6 +1734,23 @@ pub const VirtualMachine = struct {
             const child_table = entry.value_ptr.*;
             for (child_table.schema.foreign_keys) |foreign_key| {
                 if (!std.mem.eql(u8, foreign_key.reference_table, parent_table.name)) continue;
+                if (foreign_key.columns != null) {
+                    const references_old = try self.childReferencesCompositeParent(child_table, foreign_key, parent_table, old_values);
+                    if (!references_old) continue;
+                    const refs = foreign_key.reference_columns orelse return error.ConstraintViolation;
+                    var changed = false;
+                    for (refs) |column| {
+                        const idx = parent_table.getColumnIndex(column) orelse return error.ConstraintViolation;
+                        if (idx >= old_values.len or idx >= new_values.len) return error.ConstraintViolation;
+                        if (!self.valuesEqual(old_values[idx], new_values[idx])) changed = true;
+                    }
+                    if (changed) switch (foreign_key.on_update orelse .NoAction) {
+                        .Restrict, .NoAction => return error.ConstraintViolation,
+                        .Cascade, .SetNull => return error.UnsupportedCompositeForeignKeyAction,
+                    };
+                    continue;
+                }
+                if (foreign_key.deferred and self.connection.in_transaction and (foreign_key.on_update orelse .NoAction) == .NoAction) continue;
                 const parent_idx = parent_table.getColumnIndex(foreign_key.reference_column) orelse return error.ConstraintViolation;
                 if (parent_idx >= old_values.len or parent_idx >= new_values.len) return error.ConstraintViolation;
                 if (self.valuesEqual(old_values[parent_idx], new_values[parent_idx])) continue;
@@ -1678,6 +1783,34 @@ pub const VirtualMachine = struct {
             if (child_idx >= item.row.values.len) continue;
             const child_value = item.row.values[child_idx];
             if (child_value != .Null and self.valuesEqual(child_value, parent_value)) return true;
+        }
+        return false;
+    }
+
+    fn childReferencesCompositeParent(self: *Self, child_table: *storage.Table, foreign_key: ast.ForeignKeyConstraint, parent_table: *storage.Table, parent_values: []const storage.Value) !bool {
+        const child_columns = foreign_key.columns orelse return false;
+        const parent_columns = foreign_key.reference_columns orelse return error.ConstraintViolation;
+        const rows = try child_table.selectWithKeys(self.connection.allocator);
+        defer {
+            for (rows) |item| {
+                var row = item.row;
+                row.deinit(self.connection.allocator);
+            }
+            self.connection.allocator.free(rows);
+        }
+        for (rows) |item| {
+            var matches = true;
+            for (child_columns, parent_columns) |child_column, parent_column| {
+                const child_idx = child_table.getColumnIndex(child_column) orelse return error.ConstraintViolation;
+                const parent_idx = parent_table.getColumnIndex(parent_column) orelse return error.ConstraintViolation;
+                if (child_idx >= item.row.values.len or parent_idx >= parent_values.len or item.row.values[child_idx] == .Null or
+                    !self.valuesEqual(item.row.values[child_idx], parent_values[parent_idx]))
+                {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) return true;
         }
         return false;
     }
@@ -4368,6 +4501,30 @@ pub const VirtualMachine = struct {
         resolved.connection.invalidateResultCache(resolved.table_name);
     }
 
+    fn executeAlterTable(self: *Self, alter: *planner.AlterTableStep, result: *ExecutionResult) !void {
+        _ = result;
+        try self.rejectSchemaChangeInSavepoint();
+        if (self.connection.in_transaction) return error.UnsupportedDDLInTransaction;
+        const resolved = try self.resolveTableRef(alter.table_name);
+        try resolved.connection.ensureWritable();
+
+        switch (alter.action) {
+            .RenameTable => |new_name| {
+                try resolved.connection.storage_engine.renameTable(resolved.table_name, new_name);
+                resolved.connection.invalidateResultCache(resolved.table_name);
+                resolved.connection.invalidateResultCache(new_name);
+            },
+            .RenameColumn => |rename| {
+                try resolved.connection.storage_engine.renameColumn(resolved.table_name, rename.old_name, rename.new_name);
+                resolved.connection.invalidateResultCache(resolved.table_name);
+            },
+            .AddColumn => |column| {
+                try resolved.connection.storage_engine.addColumn(resolved.table_name, column);
+                resolved.connection.invalidateResultCache(resolved.table_name);
+            },
+        }
+    }
+
     /// Execute PRAGMA statement
     fn executePragma(self: *Self, pragma: *planner.PragmaStep, result: *ExecutionResult) !void {
         const allocator = self.connection.allocator;
@@ -4463,6 +4620,43 @@ pub const VirtualMachine = struct {
                     .values = try row_values.toOwnedSlice(allocator),
                 });
             }
+        } else if (std.ascii.eqlIgnoreCase(pragma.name, "index_list")) {
+            const table_name = pragma.argument orelse return error.PragmaRequiresArgument;
+            if (self.connection.storage_engine.getTable(table_name) == null) return error.TableNotFound;
+            var seq: i64 = 0;
+            var index_it = self.connection.storage_engine.indexes.iterator();
+            while (index_it.next()) |entry| {
+                const index = entry.value_ptr.*;
+                if (!std.mem.eql(u8, index.table_name, table_name)) continue;
+                const values = try allocator.alloc(storage.Value, 5);
+                values[0] = .{ .Integer = seq };
+                values[1] = .{ .Text = try allocator.dupe(u8, index.name) };
+                values[2] = .{ .Integer = if (index.is_unique) 1 else 0 };
+                values[3] = .{ .Text = try allocator.dupe(u8, "c") };
+                values[4] = .{ .Integer = if (index.where_clause != null) 1 else 0 };
+                try result.rows.append(allocator, .{ .values = values });
+                seq += 1;
+            }
+        } else if (std.ascii.eqlIgnoreCase(pragma.name, "foreign_key_list")) {
+            const table_name = pragma.argument orelse return error.PragmaRequiresArgument;
+            const table = self.connection.storage_engine.getTable(table_name) orelse return error.TableNotFound;
+            for (table.schema.foreign_keys, 0..) |foreign_key, fk_id| {
+                const child_count = if (foreign_key.columns) |columns| columns.len else 1;
+                for (0..child_count) |seq| {
+                    const child_column = if (foreign_key.columns) |columns| columns[seq] else foreign_key.column orelse return error.InvalidForeignKey;
+                    const parent_column = if (foreign_key.reference_columns) |columns| columns[seq] else foreign_key.reference_column;
+                    const values = try allocator.alloc(storage.Value, 8);
+                    values[0] = .{ .Integer = @intCast(fk_id) };
+                    values[1] = .{ .Integer = @intCast(seq) };
+                    values[2] = .{ .Text = try allocator.dupe(u8, foreign_key.reference_table) };
+                    values[3] = .{ .Text = try allocator.dupe(u8, child_column) };
+                    values[4] = .{ .Text = try allocator.dupe(u8, parent_column) };
+                    values[5] = .{ .Text = try allocator.dupe(u8, foreignKeyActionName(foreign_key.on_update)) };
+                    values[6] = .{ .Text = try allocator.dupe(u8, foreignKeyActionName(foreign_key.on_delete)) };
+                    values[7] = .{ .Text = try allocator.dupe(u8, "NONE") };
+                    try result.rows.append(allocator, .{ .values = values });
+                }
+            }
         } else if (std.ascii.eqlIgnoreCase(pragma.name, "database_list")) {
             // PRAGMA database_list
             // Returns: seq, name, file
@@ -4540,6 +4734,15 @@ pub const VirtualMachine = struct {
         } else {
             return error.UnknownPragma;
         }
+    }
+
+    fn foreignKeyActionName(action: ?ast.ForeignKeyAction) []const u8 {
+        return switch (action orelse .NoAction) {
+            .NoAction => "NO ACTION",
+            .Restrict => "RESTRICT",
+            .Cascade => "CASCADE",
+            .SetNull => "SET NULL",
+        };
     }
 
     fn executeAnalyze(self: *Self, analyze: *planner.AnalyzeStep, result: *ExecutionResult) !void {
@@ -5320,6 +5523,7 @@ pub const VirtualMachine = struct {
             .CreateIndex => |idx| try std.fmt.allocPrint(allocator, "CREATE INDEX {s} ON {s}", .{ idx.index_name, idx.table_name }),
             .DropIndex => |idx| try std.fmt.allocPrint(allocator, "DROP INDEX {s}", .{idx.index_name}),
             .DropTable => |drop| try std.fmt.allocPrint(allocator, "DROP TABLE {s}", .{drop.table_name}),
+            .AlterTable => |alter| try std.fmt.allocPrint(allocator, "ALTER TABLE {s}", .{alter.table_name}),
             .CreateCTE => |cte| try std.fmt.allocPrint(allocator, "CREATE CTE {s}", .{cte.name}),
             .Pragma => |pragma| try std.fmt.allocPrint(allocator, "PRAGMA {s}", .{pragma.name}),
             .Analyze => |analyze| if (analyze.table_name) |table_name|

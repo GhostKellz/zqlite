@@ -1,5 +1,7 @@
 const std = @import("std");
 const zqlite = @import("zqlite");
+const builtin = @import("builtin");
+const temp_dir = @import("temp_dir");
 
 // Helper function to count rows from a query
 fn countRows(conn: *zqlite.Connection, sql: []const u8) !usize {
@@ -754,6 +756,62 @@ test "secure mode rejects relative attach paths" {
     try std.testing.expectError(error.RelativePathNotAllowed, conn.attachDatabase("relative.db", "aux"));
 }
 
+test "secure ATTACH defaults deny filesystem paths" {
+    const allocator = std.testing.allocator;
+    const absolute_path = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(absolute_path);
+
+    const database_path = try std.fs.path.join(allocator, &.{ absolute_path, "secure-default.db" });
+    defer allocator.free(database_path);
+
+    try std.testing.expectError(
+        error.PathNotInAllowedRoots,
+        zqlite.db.AttachPathPolicy.SECURE_DEFAULT.validatePath(allocator, database_path),
+    );
+
+    const memory_path = try zqlite.db.AttachPathPolicy.SECURE_DEFAULT.validatePath(allocator, ":memory:");
+    defer allocator.free(memory_path);
+    try std.testing.expectEqualStrings(":memory:", memory_path);
+}
+
+test "secure ATTACH canonicalizes and confines allowed roots" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var allowed = try temp_dir.TempDir.init(std.testing.io, allocator, "zqlite-attach-allowed");
+    defer allowed.deinit();
+    var outside = try temp_dir.TempDir.init(std.testing.io, allocator, "zqlite-attach-outside");
+    defer outside.deinit();
+
+    const current_path = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(current_path);
+    const allowed_root = try std.fs.path.join(allocator, &.{ current_path, allowed.path });
+    defer allocator.free(allowed_root);
+    const outside_root = try std.fs.path.join(allocator, &.{ current_path, outside.path });
+    defer allocator.free(outside_root);
+
+    const policy = zqlite.db.AttachPathPolicy{
+        .allowed_roots = &.{allowed_root},
+        .allow_memory = false,
+        .allow_relative = false,
+    };
+
+    const legitimate_path = try std.fs.path.join(allocator, &.{ allowed_root, "data..db" });
+    defer allocator.free(legitimate_path);
+    const validated = try policy.validatePath(allocator, legitimate_path);
+    defer allocator.free(validated);
+    try std.testing.expectEqualStrings(legitimate_path, validated);
+
+    try allowed.dir.symLink(std.testing.io, outside_root, "escape", .{ .is_directory = true });
+    const escaped_path = try std.fs.path.join(allocator, &.{ allowed_root, "escape", "escaped.db" });
+    defer allocator.free(escaped_path);
+    try std.testing.expectError(error.PathNotInAllowedRoots, policy.validatePath(allocator, escaped_path));
+
+    const traversal_path = try std.fs.path.join(allocator, &.{ allowed_root, "..", "escape.db" });
+    defer allocator.free(traversal_path);
+    try std.testing.expectError(error.PathTraversalDetected, policy.validatePath(allocator, traversal_path));
+}
+
 test "fts virtual table match query executes" {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
@@ -832,4 +890,30 @@ test "prepared statement lifecycle can be reused safely" {
     try std.testing.expectEqual(@as(usize, 2), result.count());
     try std.testing.expectEqualStrings("Alice", result.rows.items[0].values[0].Text);
     try std.testing.expectEqualStrings("Bob", result.rows.items[1].values[0].Text);
+}
+
+test "file-backed connection pool refreshes committed state across connections" {
+    const allocator = std.testing.allocator;
+    var dir = try temp_dir.TempDir.init(std.testing.io, allocator, "zqlite-file-pool");
+    defer dir.deinit();
+    const path = try dir.dbPath("pool.db");
+    defer allocator.free(path);
+
+    const pool = try zqlite.createConnectionPool(allocator, path, 2, 4);
+    defer pool.deinit();
+    const writer = try pool.acquire();
+    defer if (writer.is_in_use) writer.release() catch {};
+    const reader = try pool.acquire();
+    defer if (reader.is_in_use) reader.release() catch {};
+
+    try writer.execute("CREATE TABLE pooled_items (id INTEGER PRIMARY KEY, name TEXT)");
+    try writer.execute("INSERT INTO pooled_items VALUES (1, 'committed')");
+
+    var rows = try reader.connection.query("SELECT * FROM pooled_items");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.items.len);
+
+    try writer.connection.begin();
+    try std.testing.expectError(error.TransactionActive, writer.release());
+    try writer.connection.rollback();
 }

@@ -342,6 +342,11 @@ pub fn build(b: *std.Build) void {
 
     advanced_tests.root_module.addImport("zqlite", lib.root_module);
     advanced_tests.root_module.addOptions("build_options", build_options);
+    advanced_tests.root_module.addImport("temp_dir", b.createModule(.{
+        .root_source_file = b.path("tests/standalone/temp_dir.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
 
     const run_advanced_tests = b.addRunArtifact(advanced_tests);
 
@@ -566,6 +571,51 @@ pub fn build(b: *std.Build) void {
     const storage_stress_step = b.step("test-storage-stress", "Run deterministic reopen/checkpoint/rollback storage stress tests");
     storage_stress_step.dependOn(&run_storage_stress_test.step);
 
+    const schema_evolution_test = b.addExecutable(.{
+        .name = "test_schema_evolution",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/standalone/test_schema_evolution.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    schema_evolution_test.root_module.addImport("zqlite", lib.root_module);
+    schema_evolution_test.root_module.addOptions("build_options", build_options);
+    const run_schema_evolution_test = b.addRunArtifact(schema_evolution_test);
+    const schema_evolution_step = b.step("test-schema-evolution", "Run ALTER TABLE and catalog persistence tests");
+    schema_evolution_step.dependOn(&run_schema_evolution_test.step);
+    storage_step.dependOn(&run_schema_evolution_test.step);
+
+    const index_persistence_test = b.addExecutable(.{
+        .name = "test_index_persistence",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/standalone/test_index_persistence.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    index_persistence_test.root_module.addImport("zqlite", lib.root_module);
+    index_persistence_test.root_module.addOptions("build_options", build_options);
+    const run_index_persistence_test = b.addRunArtifact(index_persistence_test);
+    const index_persistence_step = b.step("test-index-persistence", "Run simple and advanced index persistence tests");
+    index_persistence_step.dependOn(&run_index_persistence_test.step);
+    storage_step.dependOn(&run_index_persistence_test.step);
+
+    const fts_persistence_test = b.addExecutable(.{
+        .name = "test_fts_persistence",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/standalone/test_fts_persistence.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    fts_persistence_test.root_module.addImport("zqlite", lib.root_module);
+    fts_persistence_test.root_module.addOptions("build_options", build_options);
+    const run_fts_persistence_test = b.addRunArtifact(fts_persistence_test);
+    const fts_persistence_step = b.step("test-fts-persistence", "Run persistent FTS phrase and boolean query tests");
+    fts_persistence_step.dependOn(&run_fts_persistence_test.step);
+    storage_step.dependOn(&run_fts_persistence_test.step);
+
     const concurrent_access_test = b.addExecutable(.{
         .name = "test_concurrent_access",
         .root_module = b.createModule(.{
@@ -640,6 +690,27 @@ pub fn build(b: *std.Build) void {
     const sqlite_diff_step = b.step("test-sqlite-diff", "Run explicit SQLite differential tests; requires sqlite3 on PATH");
     sqlite_diff_step.dependOn(&run_sqlite_diff_test.step);
 
+    const coverage_binaries_step = b.step("coverage-binaries", "Build stable test binaries for external coverage collection");
+    const coverage_artifacts = [_]*std.Build.Step.Compile{
+        lib_unit_tests,
+        test_runner,
+        sql_conformance_test,
+        advanced_tests,
+        security_test,
+        file_backed_test,
+        transaction_test,
+        durability_error_test,
+        storage_property_test,
+        storage_stress_test,
+        concurrent_access_test,
+        wal_recovery_test,
+        catalog_format_test,
+        filesystem_error_test,
+    };
+    for (coverage_artifacts) |artifact| {
+        coverage_binaries_step.dependOn(&b.addInstallArtifact(artifact, .{}).step);
+    }
+
     if (enable_ffi) {
         const c_api_tests = b.addTest(.{
             .name = "c_api_tests",
@@ -657,6 +728,7 @@ pub fn build(b: *std.Build) void {
 
         const c_api_test_step = b.step("test-c-api", "Run C API unit tests");
         c_api_test_step.dependOn(&run_c_api_tests.step);
+        coverage_binaries_step.dependOn(&b.addInstallArtifact(c_api_tests, .{}).step);
     }
 
     // Add simple benchmark suite (avoids B-tree OrderMismatch bug)
@@ -688,6 +760,22 @@ pub fn build(b: *std.Build) void {
     const run_operational_benchmark = b.addRunArtifact(operational_benchmark);
     const operational_benchmark_step = b.step("bench-operational", "Run operational performance evidence benchmarks");
     operational_benchmark_step.dependOn(&run_operational_benchmark.step);
+
+    const storage_evidence = b.addExecutable(.{
+        .name = "storage_evidence",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/bench/storage_evidence.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    storage_evidence.root_module.addImport("zqlite", lib.root_module);
+    storage_evidence.root_module.addImport("temp_dir", b.createModule(.{
+        .root_source_file = b.path("tests/standalone/temp_dir.zig"),
+    }));
+    const run_storage_evidence = b.addRunArtifact(storage_evidence);
+    const storage_evidence_step = b.step("bench-storage-evidence", "Report machine-readable storage, WAL, checkpoint, and allocator metrics");
+    storage_evidence_step.dependOn(&run_storage_evidence.step);
 
     // Add benchmark validator for CI regression detection
     const benchmark_validator = b.addExecutable(.{

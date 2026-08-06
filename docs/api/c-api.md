@@ -34,13 +34,20 @@ Patch and minor ABI additions preserve existing function signatures and numeric 
 | 0 | ZQLITE_OK | Success |
 | 1 | ZQLITE_ERROR | Generic error |
 | 5 | ZQLITE_BUSY | Database locked |
+| 6 | ZQLITE_LOCKED | Locked transaction state |
 | 7 | ZQLITE_NOMEM | Out of memory |
+| 8 | ZQLITE_READONLY | Write attempted on a read-only database |
+| 9 | ZQLITE_INTERRUPT | Operation interrupted or timed out |
 | 10 | ZQLITE_IOERR | I/O failure |
 | 11 | ZQLITE_CORRUPT | Corrupt data |
 | 19 | ZQLITE_CONSTRAINT | Constraint violation |
 | 20 | ZQLITE_MISMATCH | Type mismatch |
 | 21 | ZQLITE_MISUSE | API misuse |
+| 22 | ZQLITE_NOLFS | Unsupported filesystem operation |
+| 23 | ZQLITE_AUTH | Authorization or path-policy denial |
+| 24 | ZQLITE_FORMAT | Unsupported database format |
 | 25 | ZQLITE_RANGE | Parameter or column index out of range |
+| 26 | ZQLITE_NOTADB | Input is not a database |
 | 100 | ZQLITE_ROW | `zqlite_step()` produced a row |
 | 101 | ZQLITE_DONE | `zqlite_step()` completed |
 
@@ -131,6 +138,12 @@ Prepared statement indices are zero-based. Named binds accept names with or with
 when execution is complete, or an error code. Column accessor pointers are
 borrowed from the statement and remain valid until the next `zqlite_step()`,
 `zqlite_reset()`, or `zqlite_finalize()` call on that statement.
+
+Handles are validated before use. Null handles, repeated result destruction,
+double finalization, and double connection close are safe misuse cases. A
+statement whose parent connection has closed returns `ZQLITE_MISUSE` and may
+still be finalized exactly once. Do not race close or finalize against another
+thread actively using the same handle.
 
 ### Transactions
 

@@ -25,8 +25,46 @@ pub fn main(init: std.process.Init) !void {
     try testBasicIndexPersistence(allocator);
     try testUniqueIndexPersistence(allocator);
     try testMultiColumnIndexPersistence(allocator);
+    try testAdvancedIndexPersistence(allocator);
 
     std.log.info("=== ALL INDEX PERSISTENCE TESTS PASSED ===", .{});
+}
+
+fn testAdvancedIndexPersistence(allocator: std.mem.Allocator) !void {
+    std.log.info("[TEST] Partial and expression index definitions persist", .{});
+    const path = try test_dir.dbPath("advanced.db");
+    defer allocator.free(path);
+
+    {
+        const conn = try zqlite.open(allocator, path);
+        defer conn.close();
+        try conn.execute("CREATE TABLE partial_items (sku TEXT, active INTEGER)");
+        try conn.execute("CREATE UNIQUE INDEX idx_partial_active ON partial_items (sku) WHERE active = 1");
+        try conn.execute("INSERT INTO partial_items VALUES ('A', 1)");
+        try conn.execute("INSERT INTO partial_items VALUES ('A', 0)");
+
+        try conn.execute("CREATE TABLE expression_items (a INTEGER, b INTEGER)");
+        try conn.execute("CREATE UNIQUE INDEX idx_expression_sum ON expression_items ((a + b))");
+        try conn.execute("INSERT INTO expression_items VALUES (1, 2)");
+    }
+
+    {
+        const conn = try zqlite.open(allocator, path);
+        defer conn.close();
+        const partial = conn.storage_engine.getIndex("idx_partial_active") orelse return error.PartialIndexMissingAfterReopen;
+        try std.testing.expect(partial.where_clause != null);
+        const expression = conn.storage_engine.getIndex("idx_expression_sum") orelse return error.ExpressionIndexMissingAfterReopen;
+        try std.testing.expectEqual(@as(usize, 1), expression.expressions.len);
+        var listed = try conn.query("PRAGMA index_list(partial_items)");
+        defer listed.deinit();
+        try std.testing.expectEqual(@as(usize, 1), listed.rows.items.len);
+        try std.testing.expectEqual(@as(i64, 1), listed.rows.items[0].values[4].Integer);
+
+        try std.testing.expectError(error.UniqueConstraintViolation, conn.execute("INSERT INTO partial_items VALUES ('A', 1)"));
+        try conn.execute("INSERT INTO partial_items VALUES ('A', 0)");
+        try std.testing.expectError(error.UniqueConstraintViolation, conn.execute("INSERT INTO expression_items VALUES (2, 1)"));
+    }
+    std.log.info("[PASS] Advanced index definitions and enforcement survived reopen", .{});
 }
 
 fn testBasicIndexPersistence(allocator: std.mem.Allocator) !void {

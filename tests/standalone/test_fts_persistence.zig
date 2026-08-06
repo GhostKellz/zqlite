@@ -26,6 +26,12 @@ pub fn main(init: std.process.Init) !void {
         defer result.deinit();
 
         std.debug.assert(result.rows.items.len == 1);
+        var phrase = try conn.query("SELECT title FROM docs WHERE body MATCH '\"quantum safe\"'");
+        defer phrase.deinit();
+        try std.testing.expectEqual(@as(usize, 1), phrase.rows.items.len);
+        var boolean = try conn.query("SELECT title FROM docs WHERE body MATCH 'quantum AND guide'");
+        defer boolean.deinit();
+        try std.testing.expectEqual(@as(usize, 1), boolean.rows.items.len);
         std.log.info("[PASS] Initial FTS query works", .{});
     }
 
@@ -48,6 +54,12 @@ pub fn main(init: std.process.Init) !void {
 
         std.debug.assert(second.rows.items.len == 1);
         std.debug.assert(std.mem.eql(u8, second.rows.items[0].values[0].Text, "Roadmap"));
+        var alternative = try conn.query("SELECT title FROM docs WHERE body MATCH 'classical OR roadmap'");
+        defer alternative.deinit();
+        try std.testing.expectEqual(@as(usize, 2), alternative.rows.items.len);
+        var excluded = try conn.query("SELECT title FROM docs WHERE body MATCH 'quantum NOT roadmap'");
+        defer excluded.deinit();
+        try std.testing.expectEqual(@as(usize, 1), excluded.rows.items.len);
         std.log.info("[PASS] FTS metadata and inserts survive reopen", .{});
     }
 

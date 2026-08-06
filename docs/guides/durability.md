@@ -11,7 +11,7 @@ ZQLite reports persistence failures through fallible transaction, flush, and clo
 | `rollback()` | Modified pages were restored and flushed, and rollback WAL state was cleared |
 | `flush()` | Pending WAL, database pages, and metadata were written and synchronized; rejected during an active transaction |
 | `checkpoint()` | Alias for the public checkpoint/flush durability boundary; rejected during an active transaction |
-| `backupToFile()` | Checkpoints and flushes the source database, then copies the main database file to the destination |
+| `backupToFile()` | Produces one complete committed snapshot while coordinating with concurrent writers |
 | `vacuumInto()` | Runs storage maintenance, validates integrity, and writes a flushed compact backup copy |
 | `closeFallible()` | Performs cleanup and returns the first checkpoint, metadata, or synchronization failure after cleanup completes |
 | `close()` | Convenience cleanup for `defer`; logs persistence failures but cannot return them |
@@ -46,7 +46,24 @@ Do not call both `close()` and `closeFallible()` on the same connection. Both co
 - After the WAL commit record is durable, a later checkpoint or database synchronization error is returned, but the transaction remains logically committed. Recovery retries committed WAL work when possible.
 - Callers must not report success to upstream systems until `commit()`, `flush()`, or `closeFallible()` returns successfully at the durability boundary they require.
 - File backups should be created with `backupToFile()` instead of copying a live database file directly; it checkpoints first and refuses in-memory databases.
+- A racing commit appears wholly before or wholly after the backup snapshot; uncommitted or partially committed rows are not copied.
 - Compact copy-out workflows should use `vacuumInto()` so maintenance and integrity validation happen before the backup file is written.
+- `VACUUM` rebuilds live rows, indexes, FTS metadata, and the catalog into a compact image, validates it, then swaps it under the stable database sidecar lock. Existing connections refresh on their next statement. A failure before replacement leaves the original file active.
+
+## Coordination Sidecars
+
+A writable file-backed database uses three adjacent files. They are part of the
+database's coordination state and should not be removed while any process may
+have the database open:
+
+| Path | Purpose |
+|---|---|
+| `<database>-lock` | Stable database-wide coordination across operations such as the atomic `VACUUM` file replacement |
+| `<database>-writer` | Exclusive writer reservation, kept separate from WAL I/O so Windows readers can recover committed WAL records while another process owns the writer reservation |
+| `<database>-wal` | Transaction records used for commit, recovery, and checkpointing |
+
+These sidecars may remain after a clean close. Back up a live database with
+`backupToFile()` rather than copying or selectively deleting its files.
 
 ## Read-Only and Immutable Opens
 

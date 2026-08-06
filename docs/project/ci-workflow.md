@@ -7,7 +7,7 @@ in hosted CI for ZQLite release work.
 
 ```mermaid
 flowchart TD
-    change["push / pull request"] --> fmt["format check"]
+    change["push to main / manual dispatch"] --> fmt["format check"]
     fmt --> build["build profiles"]
     build --> tests["stable tests"]
     tests --> extended["extended tests"]
@@ -32,7 +32,7 @@ flowchart TD
 | storage | storage and durability targets | Validate WAL, catalog, filesystem, and recovery behavior. |
 | C ABI | `zig build test-c-api` and release package checks | Validate header, symbols, and external consumers. |
 | benchmarks | `zig build bench-validate` | Check benchmark harness and thresholds. |
-| coverage | `./scripts/coverage-report.sh` | Informational stable-core coverage workload until a runner coverage collector is selected. |
+| coverage | `./scripts/coverage-report.sh` | Generate merged stable-core line coverage and a Cobertura artifact with `kcov`. |
 | profile matrix | `zig build test-stable-profiles` | Validate supported profiles and optimized modes. |
 
 ## Local Validation
@@ -78,4 +78,4 @@ flowchart LR
 Do not update version-number files until the release gate is intentionally
 approved.
 
-The hosted workflow lives in [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) and covers the Linux release gate, profile/optimization matrix, Linux x86_64/aarch64 cross-compilation, macOS file-backed storage tests, and the declared minimum Zig version.
+The hosted workflow lives in [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) and runs on pushes to `main` or explicit manual dispatch. It covers formatting and repository contracts, builds and unit tests, memory regressions, benchmark validation, extended security/storage/C ABI tests, the profile/optimization matrix, Linux x86_64/aarch64 cross-compilation, and stable-core line coverage. Every job verifies the exact Zig version declared in `build.zig.zon` and uses the repository's Linux x86_64 self-hosted runner. Pull requests do not execute automatically because this public repository must not run untrusted fork code on a persistent self-hosted runner.

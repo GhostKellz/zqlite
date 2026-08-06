@@ -90,6 +90,7 @@ pub const Planner = struct {
             .CreateIndex => |*create_idx| try self.planCreateIndex(create_idx),
             .DropIndex => |*drop_idx| try self.planDropIndex(drop_idx),
             .DropTable => |*drop_tbl| try self.planDropTable(drop_tbl),
+            .AlterTable => |*alter| try self.planAlterTable(alter),
             .With => |*with| try self.planWith(with), // Handle CTE
             .Pragma => |*pragma| try self.planPragma(pragma),
             .Analyze => |*analyze| try self.planAnalyze(analyze),
@@ -744,7 +745,7 @@ pub const Planner = struct {
                     try check_constraints.append(self.allocator, try self.cloneCondition(&check.condition));
                 },
                 .ForeignKey => |foreign_key| {
-                    try foreign_keys.append(self.allocator, try self.cloneForeignKeyWithColumn(foreign_key, foreign_key.column orelse return error.ColumnNotFound));
+                    try foreign_keys.append(self.allocator, try self.cloneForeignKeyWithColumn(foreign_key, foreign_key.column orelse ""));
                 },
                 else => {},
             }
@@ -764,6 +765,66 @@ pub const Planner = struct {
         return ExecutionPlan{
             .steps = try steps.toOwnedSlice(self.allocator),
             .allocator = self.allocator,
+        };
+    }
+
+    fn planAlterTable(self: *Self, alter: *const ast.AlterTableStatement) !ExecutionPlan {
+        const action: AlterTableStep.Action = switch (alter.action) {
+            .RenameTable => |new_name| .{ .RenameTable = try self.allocator.dupe(u8, new_name) },
+            .RenameColumn => |rename| .{ .RenameColumn = .{
+                .old_name = try self.allocator.dupe(u8, rename.old_name),
+                .new_name = try self.allocator.dupe(u8, rename.new_name),
+            } },
+            .AddColumn => |column| blk: {
+                for (column.constraints) |constraint| switch (constraint) {
+                    .NotNull, .Default => {},
+                    else => return error.UnsupportedAlterTableColumn,
+                };
+                break :blk .{ .AddColumn = try self.planColumn(column) };
+            },
+        };
+        const steps = try self.allocator.alloc(ExecutionStep, 1);
+        steps[0] = .{ .AlterTable = .{
+            .table_name = try self.allocator.dupe(u8, alter.table_name),
+            .action = action,
+        } };
+        return .{ .steps = steps, .allocator = self.allocator };
+    }
+
+    fn planColumn(self: *Self, col_def: ast.ColumnDefinition) !storage.Column {
+        return .{
+            .name = try self.allocator.dupe(u8, col_def.name),
+            .data_type = switch (col_def.data_type) {
+                .Integer, .Timestamp, .Boolean, .SmallInt, .BigInt => .Integer,
+                .Text, .DateTime, .Date, .Time, .Varchar, .Char => .Text,
+                .Real, .Decimal, .Float, .Double => .Real,
+                .Blob => .Blob,
+                .JSON => .JSON,
+                .JSONB => .JSONB,
+                .UUID => .UUID,
+                .Array => .Array,
+                .TimestampTZ => .TimestampTZ,
+                .Interval => .Interval,
+                .Numeric => .Numeric,
+            },
+            .is_primary_key = for (col_def.constraints) |constraint| {
+                if (constraint == .PrimaryKey) break true;
+            } else false,
+            .is_nullable = for (col_def.constraints) |constraint| {
+                if (constraint == .NotNull) break false;
+            } else true,
+            .default_value = for (col_def.constraints) |constraint| {
+                if (constraint == .Default) break try self.convertAstDefaultToStorage(constraint.Default);
+            } else null,
+            .generated = for (col_def.constraints) |constraint| {
+                if (constraint == .Generated) break .{
+                    .expression = try self.cloneExpression(constraint.Generated.expression),
+                    .stored = constraint.Generated.stored,
+                };
+            } else null,
+            .is_unique = for (col_def.constraints) |constraint| {
+                if (constraint == .Unique) break true;
+            } else false,
         };
     }
 
@@ -1027,12 +1088,25 @@ pub const Planner = struct {
     }
 
     fn cloneForeignKeyWithColumn(self: *Self, foreign_key: ast.ForeignKeyConstraint, column_name: []const u8) !ast.ForeignKeyConstraint {
+        const columns = if (foreign_key.columns) |source| blk: {
+            const cloned = try self.allocator.alloc([]const u8, source.len);
+            for (source, 0..) |column, i| cloned[i] = try self.allocator.dupe(u8, column);
+            break :blk cloned;
+        } else null;
+        const reference_columns = if (foreign_key.reference_columns) |source| blk: {
+            const cloned = try self.allocator.alloc([]const u8, source.len);
+            for (source, 0..) |column, i| cloned[i] = try self.allocator.dupe(u8, column);
+            break :blk cloned;
+        } else null;
         return .{
-            .column = try self.allocator.dupe(u8, column_name),
+            .column = if (foreign_key.column) |column| try self.allocator.dupe(u8, column) else if (column_name.len > 0) try self.allocator.dupe(u8, column_name) else null,
+            .columns = columns,
             .reference_table = try self.allocator.dupe(u8, foreign_key.reference_table),
             .reference_column = try self.allocator.dupe(u8, foreign_key.reference_column),
+            .reference_columns = reference_columns,
             .on_delete = foreign_key.on_delete,
             .on_update = foreign_key.on_update,
+            .deferred = foreign_key.deferred,
         };
     }
 
@@ -1669,6 +1743,7 @@ pub const ExecutionStep = union(enum) {
     CreateIndex: CreateIndexStep,
     DropIndex: DropIndexStep,
     DropTable: DropTableStep,
+    AlterTable: AlterTableStep,
     CreateCTE: CreateCTEStep, // Common Table Expression support
     Pragma: PragmaStep, // PRAGMA statements for introspection
     Analyze: AnalyzeStep, // ANALYZE planner statistics
@@ -1707,6 +1782,7 @@ pub const ExecutionStep = union(enum) {
             .CreateIndex => |*step| step.deinit(allocator),
             .DropIndex => |*step| step.deinit(allocator),
             .DropTable => |*step| step.deinit(allocator),
+            .AlterTable => |*step| step.deinit(allocator),
             .CreateCTE => |*step| step.deinit(allocator),
             .Pragma => |*step| step.deinit(allocator),
             .Analyze => |*step| step.deinit(allocator),
@@ -1927,6 +2003,33 @@ pub const UniqueConstraintStep = struct {
             allocator.free(column);
         }
         allocator.free(self.columns);
+    }
+};
+
+pub const AlterTableStep = struct {
+    table_name: []const u8,
+    action: Action,
+
+    pub const Action = union(enum) {
+        RenameTable: []const u8,
+        RenameColumn: struct { old_name: []const u8, new_name: []const u8 },
+        AddColumn: storage.Column,
+    };
+
+    pub fn deinit(self: *AlterTableStep, allocator: std.mem.Allocator) void {
+        allocator.free(self.table_name);
+        switch (self.action) {
+            .RenameTable => |name| allocator.free(name),
+            .RenameColumn => |rename| {
+                allocator.free(rename.old_name);
+                allocator.free(rename.new_name);
+            },
+            .AddColumn => |column| {
+                allocator.free(column.name);
+                if (column.default_value) |default_value| default_value.deinit(allocator);
+                if (column.generated) |generated| generated.deinit(allocator);
+            },
+        }
     }
 };
 

@@ -145,6 +145,9 @@ defer result.deinit();
 
 Prepared statements capture the catalog `schema_version` at prepare time. If DDL changes the schema before execution, `execute()` or `openCursor()` returns `error.PreparedStatementExpired`; prepare the statement again after the schema change.
 
+Prepared DML may be rebound and executed repeatedly without `reset()`.
+`reset()` clears bound values; it is not required to clear execution state.
+
 ### Cursor Results
 
 Use `openCursor()` when you want row-by-row iteration semantics instead of working directly with the full `ResultSet` API:
@@ -237,6 +240,26 @@ Read-only and immutable file-backed connections can also use `backupToFile()`.
 They copy the main database file without checkpointing because they intentionally
 do not open WAL.
 
+A backup is one complete committed snapshot. A concurrent commit may appear
+entirely before or entirely after it; partial transactions are never copied.
+
+### Bounded BLOB Slice Access
+
+```zig
+const blob = try conn.openBlob("objects", "payload", "id", .{ .Integer = 7 }, true);
+defer blob.deinit();
+
+var header: [16]u8 = undefined;
+_ = try blob.read(0, &header);
+try blob.write(32, replacement);
+```
+
+The key must select exactly one row. Reads and writes are bounds checked;
+writes never resize the BLOB. Writes join the connection's active transaction,
+or run as an atomic autocommit statement when no transaction is active.
+Each operation currently materializes the complete BLOB; this is not a
+storage-level incremental I/O API.
+
 ## Ownership and Lifetimes
 
 - `Connection` values returned by `open()` / `openMemory()` are owned by the caller; close them with `close()` or `closeFallible()`.
@@ -244,6 +267,7 @@ do not open WAL.
 - `Row` handles obtained from a `ResultSet` are borrowed and valid only while the result set is alive.
 - `Value.Text` and `Value.Blob` slices read from result rows are borrowed from the result set. Duplicate them if they must escape the result lifetime.
 - `PreparedStatement` values returned by `prepare()` are owned by the caller; call `deinit()`. Bound values are cloned by the statement.
+- `BlobHandle` values returned by `openBlob()` are owned by the caller; call `deinit()` before closing the connection.
 - `interrupt()` remains set until `clearInterrupt()` is called.
 - Storage-level `Row` / `Value` instances you allocate directly follow normal Zig ownership: whoever allocates text/blob/array contents must deinitialize them with the matching allocator unless ownership is explicitly transferred to storage.
 
@@ -254,8 +278,18 @@ var pool = try zqlite.createConnectionPool(allocator, "mydata.db", 4, 16);
 defer pool.deinit();
 
 var conn = try pool.acquire();
-defer pool.release(conn);
+defer conn.release() catch {};
+
+// Bound queueing when every pooled connection is in use.
+var bounded = try pool.acquireWithTimeout(500);
+defer bounded.release() catch {};
 ```
+
+File-backed pooled connections have independent connection state and coordinate
+through the database/WAL locks. In-memory pooled connections serialize access to
+their shared storage. Releasing a connection with an active transaction returns
+`error.TransactionActive`; an exhausted timed acquisition returns
+`error.PoolAcquireTimeout`.
 
 ## Value Types
 

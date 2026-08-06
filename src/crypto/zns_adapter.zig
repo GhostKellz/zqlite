@@ -47,7 +47,7 @@ pub const ZNSAdapter = struct {
 
     /// Generate domain-specific hash for ZNS records
     pub fn domainHash(self: Self, domain: []const u8, record_type: ZNSRecord.RecordType) ![32]u8 {
-        const type_bytes = @as(u8, @intFromEnum(record_type));
+        const type_bytes = @as(u8, @backingInt(record_type));
 
         // Combine domain, record type, and salt
         const combined_len = domain.len + 1 + self.domain_salt.len;
@@ -192,7 +192,7 @@ pub const ZNSAdapter = struct {
         offset += record.domain.len;
 
         // Write record type
-        serialized[offset] = @intFromEnum(record.record_type);
+        serialized[offset] = @backingInt(record.record_type);
         offset += 1;
 
         // Write value length and value
