@@ -115,6 +115,11 @@ var conn = try zqlite.openMemoryWithOptions(allocator, .{
 
 Queries that exceed a configured row, VM-step, statement-size, page-count, cache, or materialization-memory limit return `error.ResourceLimitExceeded`.
 
+Page-count and cache-page limits apply to the database pager. Derived index
+trees live in separate in-memory pagers and are reconstructed from table rows;
+their storage is not included in those limits or the query-materialization
+memory limit. Use the connection allocator to enforce a total allocation budget.
+
 Use `try conn.configureResourceLimits(limits)` when changing page limits after open; it fails if the database already exceeds the requested page cap. `conn.setResourceLimits(limits)` remains available for non-failing row/statement/progress updates.
 
 Progress handlers are cooperative cancellation hooks:
@@ -142,6 +147,15 @@ defer result.deinit();
 ```
 
 `zqlite.migration.MigrationManager` applies ordered migrations transactionally and advances `user_version` only after a migration succeeds.
+
+SQL `ALTER TABLE ... ADD COLUMN` supports populated tables with nullable columns
+or constant defaults. `NOT NULL` requires a non-NULL default when rows have been
+stored. The operation copies rows into a replacement tree before publishing the
+schema; it preserves the existing file format and row IDs. Function defaults
+on populated tables and DDL inside explicit transactions/savepoints are rejected.
+Consequently, this DDL cannot run inside the transactional `MigrationManager`;
+applications must execute it outside that wrapper. Extra file pages are reclaimed
+by `VACUUM`.
 
 Prepared statements capture the catalog `schema_version` at prepare time. If DDL changes the schema before execution, `execute()` or `openCursor()` returns `error.PreparedStatementExpired`; prepare the statement again after the schema change.
 

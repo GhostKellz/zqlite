@@ -673,17 +673,26 @@ pub const Parser = struct {
         try self.expect(.Into);
 
         const table_name = try self.expectQualifiedIdentifierOrKeyword();
+        errdefer self.allocator.free(table_name);
 
         // Parse optional column list
         var columns: ?[][]const u8 = null;
+        errdefer if (columns) |names| {
+            for (names) |name| self.allocator.free(name);
+            self.allocator.free(names);
+        };
         if (std.meta.activeTag(self.current_token) == .LeftParen) {
             try self.advance();
             var column_list: std.ArrayListUnmanaged([]const u8) = .empty;
             defer column_list.deinit(self.allocator);
+            errdefer for (column_list.items) |column| self.allocator.free(column);
 
             while (true) {
-                const col = try self.expectIdentifierOrKeyword();
-                try column_list.append(self.allocator, col);
+                {
+                    const col = try self.expectIdentifierOrKeyword();
+                    errdefer self.allocator.free(col);
+                    try column_list.append(self.allocator, col);
+                }
 
                 if (std.meta.activeTag(self.current_token) == .Comma) {
                     try self.advance();
@@ -704,9 +713,14 @@ pub const Parser = struct {
 
             var values: std.ArrayListUnmanaged([]ast.Value) = .empty;
             defer values.deinit(self.allocator);
+            errdefer for (values.items) |owned_row| {
+                for (owned_row) |value| value.deinit(self.allocator);
+                self.allocator.free(owned_row);
+            };
             try values.append(self.allocator, try self.allocator.alloc(ast.Value, 0));
 
             var returning: ?ast.ReturningClause = null;
+            errdefer if (returning) |*clause| clause.deinit(self.allocator);
             if (std.meta.activeTag(self.current_token) == .Returning) {
                 returning = try self.parseReturning();
             }
@@ -728,6 +742,10 @@ pub const Parser = struct {
 
         var values: std.ArrayListUnmanaged([]ast.Value) = .empty;
         defer values.deinit(self.allocator);
+        errdefer for (values.items) |owned_row| {
+            for (owned_row) |value| value.deinit(self.allocator);
+            self.allocator.free(owned_row);
+        };
 
         // Parse value rows
         while (true) {
@@ -735,10 +753,14 @@ pub const Parser = struct {
 
             var row: std.ArrayListUnmanaged(ast.Value) = .empty;
             defer row.deinit(self.allocator);
+            errdefer for (row.items) |value| value.deinit(self.allocator);
 
             while (true) {
-                const value = try self.parseValue();
-                try row.append(self.allocator, value);
+                {
+                    const value = try self.parseValue();
+                    errdefer value.deinit(self.allocator);
+                    try row.append(self.allocator, value);
+                }
 
                 if (std.meta.activeTag(self.current_token) == .Comma) {
                     try self.advance();
@@ -748,7 +770,8 @@ pub const Parser = struct {
             }
 
             try self.expect(.RightParen);
-            try values.append(self.allocator, try row.toOwnedSlice(self.allocator));
+            try values.ensureUnusedCapacity(self.allocator, 1);
+            values.appendAssumeCapacity(try row.toOwnedSlice(self.allocator));
 
             if (std.meta.activeTag(self.current_token) == .Comma) {
                 try self.advance();
@@ -759,12 +782,14 @@ pub const Parser = struct {
 
         // Parse optional ON CONFLICT clause
         var on_conflict: ?ast.OnConflictClause = null;
+        errdefer if (on_conflict) |*clause| clause.deinit(self.allocator);
         if (std.meta.activeTag(self.current_token) == .On) {
             on_conflict = try self.parseOnConflict();
         }
 
         // Parse optional RETURNING clause
         var returning: ?ast.ReturningClause = null;
+        errdefer if (returning) |*clause| clause.deinit(self.allocator);
         if (std.meta.activeTag(self.current_token) == .Returning) {
             returning = try self.parseReturning();
         }
@@ -792,10 +817,12 @@ pub const Parser = struct {
             try self.advance();
             var cols: std.ArrayListUnmanaged([]const u8) = .empty;
             defer cols.deinit(self.allocator);
+            errdefer for (cols.items) |column| self.allocator.free(column);
 
             while (true) {
+                try cols.ensureUnusedCapacity(self.allocator, 1);
                 const col = try self.expectIdentifierOrKeyword();
-                try cols.append(self.allocator, col);
+                cols.appendAssumeCapacity(col);
 
                 if (std.meta.activeTag(self.current_token) == .Comma) {
                     try self.advance();
@@ -890,14 +917,16 @@ pub const Parser = struct {
 
         var columns: std.ArrayListUnmanaged([]const u8) = .empty;
         defer columns.deinit(self.allocator);
+        errdefer for (columns.items) |column| self.allocator.free(column);
 
         while (true) {
+            try columns.ensureUnusedCapacity(self.allocator, 1);
             if (std.meta.activeTag(self.current_token) == .Asterisk) {
                 try self.advance();
-                try columns.append(self.allocator, try self.allocator.dupe(u8, "*"));
+                columns.appendAssumeCapacity(try self.allocator.dupe(u8, "*"));
             } else {
                 const col = try self.expectIdentifier();
-                try columns.append(self.allocator, col);
+                columns.appendAssumeCapacity(col);
             }
 
             if (std.meta.activeTag(self.current_token) == .Comma) {
@@ -1266,8 +1295,10 @@ pub const Parser = struct {
         }
 
         const index_name = try self.expectQualifiedIdentifier();
+        errdefer self.allocator.free(index_name);
         try self.expect(.On);
         const table_name = try self.expectQualifiedIdentifier();
+        errdefer self.allocator.free(table_name);
 
         try self.expect(.LeftParen);
 
@@ -2700,6 +2731,18 @@ pub const Parser = struct {
 
     /// Parse value literal
     fn parseValue(self: *Self) Error!ast.Value {
+        if (self.current_token == .Minus or self.current_token == .Plus) {
+            const negative = self.current_token == .Minus;
+            try self.advance();
+            const signed: ast.Value = switch (self.current_token) {
+                .Integer => |value| .{ .Integer = if (negative) -value else value },
+                .IntegerMagnitude => if (negative) .{ .Integer = std.math.minInt(i64) } else return error.Overflow,
+                .Real => |value| .{ .Real = if (negative) -value else value },
+                else => return error.ExpectedValue,
+            };
+            try self.advance();
+            return signed;
+        }
         // Handle CASE expression
         if (std.meta.activeTag(self.current_token) == .Case) {
             return try self.parseCaseExpression();
@@ -2721,6 +2764,7 @@ pub const Parser = struct {
 
         const value = switch (self.current_token) {
             .Integer => |i| ast.Value{ .Integer = i },
+            .IntegerMagnitude => return error.Overflow,
             .Real => |r| ast.Value{ .Real = r },
             .String => |s| ast.Value{ .Text = try self.allocator.dupe(u8, s) },
             .Null => ast.Value.Null,
@@ -2767,6 +2811,7 @@ pub const Parser = struct {
             },
             else => return error.ExpectedValue,
         };
+        errdefer value.deinit(self.allocator);
         try self.advance();
         return value;
     }
@@ -2891,6 +2936,7 @@ pub const Parser = struct {
             return error.ExpectedIdentifier;
         }
         const value = try self.allocator.dupe(u8, self.current_token.Identifier);
+        errdefer self.allocator.free(value);
         try self.advance();
         return value;
     }
@@ -2900,6 +2946,7 @@ pub const Parser = struct {
         switch (self.current_token) {
             .Identifier => |id| {
                 const value = try self.allocator.dupe(u8, id);
+                errdefer self.allocator.free(value);
                 try self.advance();
                 return value;
             },
@@ -2961,6 +3008,7 @@ pub const Parser = struct {
     /// Advance to next token
     fn advance(self: *Self) !void {
         self.current_token.deinit(self.allocator);
+        self.current_token = .EOF;
         self.current_token = try self.tokenizer.nextToken(self.allocator);
     }
 

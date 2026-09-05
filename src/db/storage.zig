@@ -310,27 +310,32 @@ pub const StorageEngine = struct {
         self.allocator.free(old_column_name);
     }
 
-    /// Add a column without rewriting table pages. The current storage format
-    /// requires every stored row to match the schema width, so this subset is
-    /// deliberately limited to tables that have never stored rows.
+    /// Rewrite rows into a replacement tree before publishing its root and
+    /// schema together. Existing rows retain their keys and storage format.
     pub fn addColumn(self: *Self, table_name: []const u8, column: Column) !void {
         try self.ensureWritable();
         const table = self.tables.get(table_name) orelse return error.TableNotFound;
         if (table.getColumnIndex(column.name) != null) return error.ColumnAlreadyExists;
-        if (table.row_count != 0) return error.AlterTableRequiresRewrite;
         if (column.is_primary_key or column.is_unique or column.generated != null) return error.UnsupportedAlterTableColumn;
+        var fill: Value = .Null;
+        if (table.row_count != 0) {
+            if (column.default_value) |default| {
+                fill = switch (default) {
+                    .Literal => |value| value,
+                    .FunctionCall => return error.UnsupportedAlterTableDefault,
+                };
+            }
+            if (!column.is_nullable and fill == .Null) return error.MissingRequiredValue;
+        }
 
         const old_columns = table.schema.columns;
         const expanded = try self.allocator.alloc(Column, old_columns.len + 1);
-        var expanded_owned = true;
-        errdefer if (expanded_owned) self.allocator.free(expanded);
+        errdefer self.allocator.free(expanded);
         @memcpy(expanded[0..old_columns.len], old_columns);
         const new_name = try self.allocator.dupe(u8, column.name);
-        var new_name_owned = true;
-        errdefer if (new_name_owned) self.allocator.free(new_name);
+        errdefer self.allocator.free(new_name);
         const new_default = if (column.default_value) |default_value| try default_value.clone(self.allocator) else null;
-        var new_default_owned = true;
-        errdefer if (new_default_owned) if (new_default) |default_value| default_value.deinit(self.allocator);
+        errdefer if (new_default) |default_value| default_value.deinit(self.allocator);
         expanded[old_columns.len] = .{
             .name = new_name,
             .data_type = column.data_type,
@@ -340,20 +345,45 @@ pub const StorageEngine = struct {
             .generated = null,
             .is_unique = false,
         };
+
+        const old_tree = table.btree;
+        const replacement = try btree.BTree.init(self.allocator, self.pager);
+        errdefer replacement.deinit();
+        const rows = try old_tree.selectAllWithKeys(self.allocator);
+        defer {
+            for (rows) |item| {
+                var row = item.row;
+                row.deinit(self.allocator);
+            }
+            self.allocator.free(rows);
+        }
+        for (rows) |item| {
+            const values = try self.allocator.alloc(Value, expanded.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (values[0..initialized]) |value| value.deinit(self.allocator);
+                self.allocator.free(values);
+            }
+            for (item.row.values, 0..) |value, i| {
+                values[i] = try value.clone(self.allocator);
+                initialized += 1;
+            }
+            values[old_columns.len] = try fill.clone(self.allocator);
+            initialized += 1;
+            try replacement.insert(item.key, .{ .values = values });
+        }
+
         const old_schema_version = self.schema_version;
         table.schema.columns = expanded;
-        expanded_owned = false;
-        new_name_owned = false;
-        new_default_owned = false;
+        table.btree = replacement;
         self.bumpSchemaVersion();
         self.rewriteAllMetadata() catch |err| {
             table.schema.columns = old_columns;
+            table.btree = old_tree;
             self.schema_version = old_schema_version;
-            self.allocator.free(expanded[old_columns.len].name);
-            if (expanded[old_columns.len].default_value) |default_value| default_value.deinit(self.allocator);
-            self.allocator.free(expanded);
             return err;
         };
+        old_tree.deinit();
         self.allocator.free(old_columns);
     }
 
@@ -1046,7 +1076,16 @@ pub const StorageEngine = struct {
         where_clause: ?ast.Condition,
         is_unique: bool,
     ) !*Index {
-        const index = try Index.createEx(self.allocator, self.pager, name, table_name, column_names, expressions, where_clause, is_unique);
+        // Only index definitions are persisted. Rebuilding derived trees into
+        // the database file leaks unreferenced pages and prevents read-only open.
+        const index_pager = try pager.Pager.initMemory(self.allocator);
+        // Derived pages have no backing file; eviction would discard index data.
+        index_pager.setCachePageLimit(std.math.maxInt(u32));
+        const index = Index.createEx(self.allocator, index_pager, name, table_name, column_names, expressions, where_clause, is_unique) catch |err| {
+            index_pager.deinit();
+            return err;
+        };
+        index.owned_pager = index_pager;
         errdefer index.deinit(self.allocator);
 
         const duped_name = try self.allocator.dupe(u8, name);
@@ -1147,27 +1186,48 @@ pub const StorageEngine = struct {
     }
 
     pub fn checkUniqueIndexes(self: *Self, table: *Table, candidate_values: []const Value) !void {
+        return self.checkUniqueIndexesExcept(table, candidate_values, null);
+    }
+
+    pub fn checkUniqueIndexesExcept(self: *Self, table: *Table, candidate_values: []const Value, exclude_row_id: ?i64) !void {
         var index_iter = self.indexes.iterator();
         while (index_iter.next()) |entry| {
             const index = entry.value_ptr.*;
-            if (!index.is_unique or !std.mem.eql(u8, index.table_name, table.name)) {
-                continue;
-            }
+            if (!index.is_unique or !std.mem.eql(u8, index.table_name, table.name)) continue;
+            if (!rowMatchesPartialPredicate(table, index, candidate_values)) continue;
+            const key = computeIndexKey(table, index, candidate_values) orelse continue;
+            var context = UniqueIndexContext{
+                .table = table,
+                .index = index,
+                .candidate = candidate_values,
+                .exclude_row_id = exclude_row_id,
+            };
+            try index.btree.visitEqual(key, &context, UniqueIndexContext.check);
+        }
+    }
 
-            const rows = try table.selectWithKeys(self.allocator);
-            defer {
-                for (rows) |item| {
-                    for (item.row.values) |value| {
-                        value.deinit(self.allocator);
+    /// DML updates derived entries after the table mutation has an undo record.
+    /// Statement/savepoint rollback rebuilds these trees if any step fails.
+    pub fn maintainIndexes(self: *Self, table: *Table, old_row_id: ?i64, new_row_id: ?i64) !void {
+        if (self.indexes.count() == 0) return;
+        var old_row = if (old_row_id) |id| try table.btree.search(@intCast(id)) else null;
+        defer if (old_row) |*row| row.deinit(self.allocator);
+        var new_row = if (new_row_id) |id| try table.getRow(id) else null;
+        defer if (new_row) |*row| row.deinit(self.allocator);
+        var it = self.indexes.iterator();
+        while (it.next()) |entry| {
+            const index = entry.value_ptr.*;
+            if (!std.mem.eql(u8, index.table_name, table.name)) continue;
+            if (old_row) |row| {
+                if (rowMatchesPartialPredicate(table, index, row.values)) {
+                    if (computeIndexKey(table, index, row.values)) |key| {
+                        if (!try index.btree.removeIndexEntry(key, old_row_id.?)) return error.CorruptedData;
                     }
-                    self.allocator.free(item.row.values);
                 }
-                self.allocator.free(rows);
             }
-
-            for (rows) |item| {
-                if (rowMatchesUniqueIndex(table, index, item.row.values, candidate_values)) {
-                    return error.UniqueConstraintViolation;
+            if (new_row) |row| {
+                if (rowMatchesPartialPredicate(table, index, row.values)) {
+                    if (computeIndexKey(table, index, row.values)) |key| try index.insertEntry(key, @intCast(new_row_id.?));
                 }
             }
         }
@@ -1181,8 +1241,13 @@ pub const StorageEngine = struct {
     fn rebuildIndex(self: *Self, index: *Index) !void {
         const table = self.getTable(index.table_name) orelse return error.TableNotFound;
 
-        index.btree.deinit();
-        index.btree = try btree.BTree.init(self.allocator, self.pager);
+        const rebuilt_pager = try pager.Pager.initMemory(self.allocator);
+        rebuilt_pager.setCachePageLimit(std.math.maxInt(u32));
+        errdefer rebuilt_pager.deinit();
+        const rebuilt_tree = try btree.BTree.init(self.allocator, rebuilt_pager);
+        errdefer rebuilt_tree.deinit();
+        var rebuilt = index.*;
+        rebuilt.btree = rebuilt_tree;
 
         const rows = try table.selectWithKeys(self.allocator);
         defer {
@@ -1198,9 +1263,38 @@ pub const StorageEngine = struct {
         for (rows) |item| {
             if (!rowMatchesPartialPredicate(table, index, item.row.values)) continue;
             const key = computeIndexKey(table, index, item.row.values) orelse continue;
-            try index.insert(key, @intCast(item.key));
+            if (index.is_unique) {
+                var context = UniqueIndexContext{ .table = table, .index = index, .candidate = item.row.values };
+                try rebuilt_tree.visitEqual(key, &context, UniqueIndexContext.check);
+            }
+            try rebuilt.insertEntry(key, @intCast(item.key));
         }
+        // Publish only a complete rebuild. A failed unique check or allocation
+        // leaves the previous tree available until statement rollback completes.
+        index.btree.deinit();
+        if (index.owned_pager) |owned| owned.deinit();
+        index.btree = rebuilt_tree;
+        index.owned_pager = rebuilt_pager;
     }
+
+    const UniqueIndexContext = struct {
+        table: *Table,
+        index: *Index,
+        candidate: []const Value,
+        exclude_row_id: ?i64 = null,
+
+        fn check(context: *@This(), entry: Row) anyerror!void {
+            if (entry.values.len != 1 or entry.values[0] != .Integer) return error.CorruptedData;
+            if (context.exclude_row_id == entry.values[0].Integer) return;
+            if (try context.table.getRow(entry.values[0].Integer)) |row| {
+                var owned = row;
+                defer owned.deinit(context.table.allocator);
+                // Hash equality is only a candidate match, including for UNIQUE.
+                if (rowMatchesUniqueIndex(context.table, context.index, row.values, context.candidate))
+                    return error.UniqueConstraintViolation;
+            }
+        }
+    };
 
     fn computeIndexKey(table: *Table, index: *Index, values: []const Value) ?u64 {
         const part_count = index.keyPartCount();
@@ -1346,7 +1440,7 @@ pub const StorageEngine = struct {
         };
     }
 
-    fn valueToIndexKey(value: Value) u64 {
+    pub fn valueToIndexKey(value: Value) u64 {
         return switch (value) {
             .Integer => |i| @bitCast(i),
             .Text => |t| blk: {
@@ -1356,7 +1450,7 @@ pub const StorageEngine = struct {
                 }
                 break :blk hash;
             },
-            .Real => |r| @bitCast(r),
+            .Real => |r| if (r == 0) 0 else @bitCast(r),
             .Boolean => |flag| if (flag) 1 else 0,
             .SmallInt => |s| @bitCast(@as(i64, s)),
             .BigInt => |bi| @bitCast(bi),
@@ -3690,6 +3784,7 @@ pub const Index = struct {
     where_clause: ?ast.Condition,
     btree: *btree.BTree,
     is_unique: bool,
+    owned_pager: ?*pager.Pager = null,
 
     const Self = @This();
 
@@ -3709,21 +3804,38 @@ pub const Index = struct {
         is_unique: bool,
     ) !*Self {
         var index = try allocator.create(Self);
+        errdefer allocator.destroy(index);
+        index.owned_pager = null;
         index.name = try allocator.dupe(u8, name);
+        errdefer allocator.free(index.name);
         index.table_name = try allocator.dupe(u8, table_name);
+        errdefer allocator.free(index.table_name);
 
         // Clone column names
         index.column_names = try allocator.alloc([]const u8, column_names.len);
+        var columns_initialized: usize = 0;
+        errdefer {
+            for (index.column_names[0..columns_initialized]) |column| allocator.free(column);
+            allocator.free(index.column_names);
+        }
         for (column_names, 0..) |col_name, i| {
             index.column_names[i] = try allocator.dupe(u8, col_name);
+            columns_initialized += 1;
         }
 
         index.expressions = try allocator.alloc(ast.Expression, expressions.len);
+        var expressions_initialized: usize = 0;
+        errdefer {
+            for (index.expressions[0..expressions_initialized]) |*expression| expression.deinit(allocator);
+            allocator.free(index.expressions);
+        }
         for (expressions, 0..) |expression, i| {
             index.expressions[i] = try cloneAstExpression(allocator, expression);
+            expressions_initialized += 1;
         }
 
         index.where_clause = if (where_clause) |condition| try cloneAstCondition(allocator, &condition) else null;
+        errdefer if (index.where_clause) |*condition| condition.deinit(allocator);
         index.btree = try btree.BTree.init(allocator, page_manager);
         index.is_unique = is_unique;
 
@@ -3745,11 +3857,16 @@ pub const Index = struct {
             }
         }
 
+        try self.insertEntry(key, row_id);
+    }
+
+    fn insertEntry(self: *Self, key: u64, row_id: u64) !void {
         // Create a row with just the row ID
-        const index_row = Row{
+        var index_row = Row{
             .values = try self.btree.allocator.alloc(Value, 1),
         };
         index_row.values[0] = Value{ .Integer = @intCast(row_id) };
+        errdefer index_row.deinit(self.btree.allocator);
 
         try self.btree.insert(key, index_row);
     }
@@ -3789,6 +3906,7 @@ pub const Index = struct {
             condition.deinit(allocator);
         }
         self.btree.deinit();
+        if (self.owned_pager) |owned| owned.deinit();
         allocator.destroy(self);
     }
 };

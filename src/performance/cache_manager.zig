@@ -229,6 +229,7 @@ pub const QueryPlanCache = struct {
     allocator: std.mem.Allocator,
     cache: std.hash_map.HashMap(u64, CachedPlan, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage),
     max_size: usize,
+    invalidated: bool = false,
 
     const CachedPlan = struct {
         sql_hash: u64,
@@ -251,6 +252,12 @@ pub const QueryPlanCache = struct {
 
     /// Get cached plan
     pub fn get(self: *Self, sql: []const u8) ?*planner.ExecutionPlan {
+        if (self.invalidated) {
+            var iterator = self.cache.iterator();
+            while (iterator.next()) |entry| entry.value_ptr.plan.deinit();
+            self.cache.clearRetainingCapacity();
+            self.invalidated = false;
+        }
         const hash = self.hashSQL(sql);
 
         if (self.cache.getPtr(hash)) |cached_plan| {

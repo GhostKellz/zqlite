@@ -9,6 +9,85 @@ const TestCase = struct {
 
 const cases = [_]TestCase{
     .{
+        .name = "signed_insert_literals",
+        .setup = &.{
+            "CREATE TABLE signed_values (i INTEGER, r REAL)",
+            "INSERT INTO signed_values VALUES (-42, -3.5), (+17, 2.5)",
+        },
+        .query = "SELECT i, r FROM signed_values ORDER BY i",
+    },
+    .{
+        .name = "populated_add_column",
+        .setup = &.{
+            "CREATE TABLE migrating (id INTEGER)",
+            "INSERT INTO migrating VALUES (1), (2)",
+            "CREATE UNIQUE INDEX migrating_id ON migrating (id)",
+            "ALTER TABLE migrating ADD COLUMN note TEXT",
+            "ALTER TABLE migrating ADD COLUMN state TEXT NOT NULL DEFAULT 'new'",
+        },
+        .query = "SELECT id, note, state FROM migrating ORDER BY id",
+    },
+    .{
+        .name = "indexed_duplicates_and_residual_predicate",
+        .setup = &.{
+            "CREATE TABLE indexed (id INTEGER, bucket INTEGER)",
+            "INSERT INTO indexed VALUES (1, 7), (2, 7), (3, 8), (4, NULL)",
+            "CREATE INDEX indexed_bucket ON indexed (bucket)",
+        },
+        .query = "SELECT id FROM indexed WHERE bucket = 7 AND id > 1 ORDER BY id",
+    },
+    .{
+        .name = "indexed_hash_collision",
+        .setup = &.{
+            "CREATE TABLE indexed (id INTEGER, value TEXT)",
+            "INSERT INTO indexed VALUES (1, 'Aa'), (2, 'BB'), (3, 'Aa')",
+            "CREATE INDEX indexed_value ON indexed (value)",
+        },
+        .query = "SELECT id FROM indexed WHERE value = 'Aa' ORDER BY id",
+    },
+    .{
+        .name = "unique_index_hash_collision",
+        .setup = &.{
+            "CREATE TABLE indexed (id INTEGER, value TEXT)",
+            "INSERT INTO indexed VALUES (1, 'Aa'), (2, 'BB'), (3, NULL), (4, NULL)",
+            "CREATE UNIQUE INDEX indexed_value ON indexed (value)",
+        },
+        .query = "SELECT id FROM indexed WHERE value = 'BB' ORDER BY id",
+    },
+    .{
+        .name = "indexed_mixed_numeric_equality",
+        .setup = &.{
+            "CREATE TABLE indexed (id INTEGER, value BLOB)",
+            "INSERT INTO indexed VALUES (1, 1), (2, 1.0), (3, '1'), (4, NULL)",
+            "CREATE INDEX indexed_value ON indexed (value)",
+        },
+        .query = "SELECT id FROM indexed WHERE value = 1.0 ORDER BY id",
+    },
+    .{
+        .name = "indexed_changes_and_rollback",
+        .setup = &.{
+            "CREATE TABLE indexed (id INTEGER, bucket INTEGER)",
+            "INSERT INTO indexed VALUES (1, 7), (2, 7), (3, 8)",
+            "CREATE INDEX indexed_bucket ON indexed (bucket)",
+            "UPDATE indexed SET bucket = 8 WHERE id = 1",
+            "BEGIN",
+            "DELETE FROM indexed WHERE id = 2",
+            "UPDATE indexed SET bucket = 7 WHERE id = 3",
+            "ROLLBACK",
+        },
+        .query = "SELECT id FROM indexed WHERE bucket = 8 ORDER BY id",
+    },
+    .{
+        .name = "composite_index_is_not_single_column_lookup",
+        .setup = &.{
+            "CREATE TABLE indexed (a INTEGER, b INTEGER)",
+            "INSERT INTO indexed VALUES (1, 2), (1, 3)",
+            "CREATE UNIQUE INDEX indexed_ab ON indexed (a, b)",
+            "ANALYZE",
+        },
+        .query = "SELECT b FROM indexed WHERE a = 1 ORDER BY b",
+    },
+    .{
         .name = "basic_where_order",
         .setup = &.{
             "CREATE TABLE users (id INTEGER, name TEXT)",

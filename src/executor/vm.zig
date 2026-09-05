@@ -463,6 +463,10 @@ pub const VirtualMachine = struct {
 
     /// Execute index scan (uses index for direct lookup instead of full table scan)
     fn executeIndexScan(self: *Self, scan: *planner.IndexScanStep, result: *ExecutionResult) !void {
+        if (self.cte_context.contains(scan.table_name)) {
+            var fallback = planner.TableScanStep{ .table_name = scan.table_name };
+            return self.executeTableScan(&fallback, result);
+        }
         // Get the table
         const resolved = try self.resolveTableRef(scan.table_name);
         const table = resolved.connection.storage_engine.getTable(resolved.table_name) orelse {
@@ -470,115 +474,115 @@ pub const VirtualMachine = struct {
         };
         self.current_table = table;
 
-        // Try to use the index for lookup
-        if (resolved.connection.storage_engine.getIndex(scan.index_name)) |index| {
-            // Convert lookup value to index key
-            const key = self.valueToIndexKey(scan.lookup_value);
-
-            // Use index search to find row_id
-            if (try index.search(key)) |row_id| {
-                // Get the row from the table
-                if (try table.getRow(@intCast(row_id))) |row| {
-                    try self.connection.recordRowsScanned(1);
-                    defer {
-                        for (row.values) |value| {
-                            value.deinit(self.connection.allocator);
-                        }
-                        self.connection.allocator.free(row.values);
-                    }
-
-                    // Clone the row values for the result
-                    var values = try self.connection.allocator.alloc(storage.Value, row.values.len);
-                    errdefer self.connection.allocator.free(values);
-
-                    var cloned_count: usize = 0;
-                    errdefer {
-                        for (values[0..cloned_count]) |v| {
-                            v.deinit(self.connection.allocator);
-                        }
-                    }
-
-                    for (row.values, 0..) |val, i| {
-                        values[i] = try val.clone(self.connection.allocator);
-                        cloned_count = i + 1;
-                    }
-                    try result.rows.append(self.connection.allocator, storage.Row{ .values = values });
-                    try self.connection.recordResultRows(result.rows.items.len);
-                }
-            }
-        } else {
-            // Index not found, fallback to table scan
+        self.current_column_names = null;
+        try self.registerTableAlias(scan.table_name, table);
+        const index = resolved.connection.storage_engine.getIndex(scan.index_name) orelse
             return self.executeTableScanFallback(table, result);
+        const value = try self.resolveValue(scan.lookup_value);
+        defer value.deinit(self.connection.allocator);
+        if (value == .Null) return;
+
+        // The index key encoding distinguishes integer and real values,
+        // while SQL compares them numerically. Probe both exact representations.
+        // Outside the exact integer range, f64 rounding can equate several keys;
+        // use the regular filter/scan path there rather than lose matches.
+        var keys: [3]u64 = undefined;
+        var key_count: usize = 1;
+        switch (value) {
+            .Text => keys[0] = storage.StorageEngine.valueToIndexKey(value),
+            .Integer => |integer| {
+                if (integer <= -9007199254740992 or integer >= 9007199254740992)
+                    return self.executeTableScanFallback(table, result);
+                keys[0] = @bitCast(integer);
+                keys[1] = @bitCast(@as(f64, @floatFromInt(integer)));
+                key_count = 2;
+                if (integer == 0) {
+                    keys[2] = @bitCast(@as(f64, -0.0));
+                    key_count = 3;
+                }
+            },
+            .Real => |real| {
+                if (!std.math.isFinite(real) or @abs(real) >= 9007199254740992)
+                    return self.executeTableScanFallback(table, result);
+                keys[0] = @bitCast(real);
+                if (@trunc(real) == real) {
+                    keys[1] = @bitCast(@as(i64, @intFromFloat(real)));
+                    key_count = 2;
+                    if (real == 0) {
+                        keys[2] = @bitCast(-real);
+                        key_count = 3;
+                    }
+                }
+            },
+            else => return self.executeTableScanFallback(table, result),
+        }
+        var context = IndexScanContext{ .machine = self, .table = table, .result = result };
+        for (keys[0..key_count], 0..) |key, i| {
+            if (std.mem.indexOfScalar(u64, keys[0..i], key) != null) continue;
+            try index.btree.visitEqual(key, &context, IndexScanContext.visit);
         }
     }
 
-    /// Convert a storage Value to an index key (u64)
-    fn valueToIndexKey(self: *Self, value: storage.Value) u64 {
-        _ = self;
-        return switch (value) {
-            .Integer => |i| @bitCast(i),
-            .Text => |t| blk: {
-                // Simple hash for text values
-                var hash: u64 = 0;
-                for (t) |byte| {
-                    hash = hash *% 31 +% byte;
-                }
-                break :blk hash;
-            },
-            .Real => |r| @bitCast(r),
-            else => 0,
-        };
-    }
+    const IndexScanContext = struct {
+        machine: *Self,
+        table: *storage.Table,
+        result: *ExecutionResult,
+
+        fn visit(context: *@This(), entry: storage.Row) anyerror!void {
+            const machine = context.machine;
+            try machine.connection.checkOperation();
+            if (entry.values.len != 1 or entry.values[0] != .Integer) return error.CorruptedData;
+            if (try context.table.getRow(entry.values[0].Integer)) |row| {
+                var owned = row;
+                errdefer owned.deinit(machine.connection.allocator);
+                try machine.connection.recordRowsScanned(1);
+                // getRow already returns owned values; pass them to the result
+                // instead of allocating and cloning the complete row again.
+                try machine.connection.recordResultRows(context.result.rows.items.len + 1);
+                try context.result.rows.append(machine.connection.allocator, owned);
+            }
+        }
+    };
 
     /// Fallback to table scan when index is unavailable
     fn executeTableScanFallback(self: *Self, table: *storage.Table, result: *ExecutionResult) !void {
         // Full table scan fallback - iterate through all rows in the table
-        var row_id: i64 = 1;
-        while (row_id <= @as(i64, @intCast(table.row_count))) : (row_id += 1) {
+        var row_id: i64 = 0;
+        while (row_id < @as(i64, @intCast(table.row_count))) : (row_id += 1) {
             try self.connection.checkOperation();
             try self.connection.recordRowsScanned(1);
             if (try table.getRow(row_id)) |row| {
-                var values = try self.connection.allocator.alloc(storage.Value, row.values.len);
-                errdefer self.connection.allocator.free(values);
-
-                var cloned_count: usize = 0;
-                errdefer {
-                    for (values[0..cloned_count]) |v| {
-                        v.deinit(self.connection.allocator);
-                    }
-                }
-
-                for (row.values, 0..) |val, i| {
-                    values[i] = try val.clone(self.connection.allocator);
-                    cloned_count = i + 1;
-                }
-                try result.rows.append(self.connection.allocator, storage.Row{ .values = values });
-                try self.connection.recordResultRows(result.rows.items.len);
+                var owned = row;
+                errdefer owned.deinit(self.connection.allocator);
+                try self.connection.recordResultRows(result.rows.items.len + 1);
+                try result.rows.append(self.connection.allocator, owned);
             }
         }
     }
 
     /// Execute filter (WHERE clause)
     fn executeFilter(self: *Self, filter: *planner.FilterStep, result: *ExecutionResult) !void {
-        var filtered_rows: std.ArrayListUnmanaged(storage.Row) = .empty;
-
-        for (result.rows.items) |row| {
+        var kept: usize = 0;
+        var processed: usize = 0;
+        // On interruption/error, preserve ownership of both kept rows and the
+        // unprocessed suffix for ExecutionResult's cleanup.
+        errdefer {
+            const remaining = result.rows.items.len - processed;
+            std.mem.copyForwards(storage.Row, result.rows.items[kept..][0..remaining], result.rows.items[processed..]);
+            result.rows.items.len = kept + remaining;
+        }
+        while (processed < result.rows.items.len) : (processed += 1) {
+            var row = result.rows.items[processed];
             try self.connection.checkOperation();
             try self.connection.recordRowsScanned(1);
             if (try self.evaluateCondition(&filter.condition, &row)) {
-                try filtered_rows.append(self.connection.allocator, row);
+                result.rows.items[kept] = row;
+                kept += 1;
             } else {
-                // Free rows that don't match the filter condition
-                for (row.values) |value| {
-                    value.deinit(self.connection.allocator);
-                }
-                self.connection.allocator.free(row.values);
+                row.deinit(self.connection.allocator);
             }
         }
-
-        // Only free the ArrayList structure, not its contents (they're now in filtered_rows or freed)
-        result.rows.deinit(self.connection.allocator);
-        result.rows = filtered_rows;
+        result.rows.items.len = kept;
     }
 
     /// Execute HAVING clause (filter after GROUP BY aggregation)
@@ -1333,7 +1337,6 @@ pub const VirtualMachine = struct {
             try self.validateCheckConstraints(table, final_values);
             try self.validateNotNullConstraints(table, final_values);
             try self.validateForeignKeyReferences(table, final_values);
-            try resolved.connection.storage_engine.checkUniqueIndexes(table, final_values);
 
             // Handle ON CONFLICT - check for primary key conflict before insert
             if (insert.on_conflict != null) {
@@ -1418,14 +1421,17 @@ pub const VirtualMachine = struct {
                                     try self.validateNotNullConstraints(table, existing_row.values);
                                     try self.validateForeignKeyReferences(table, existing_row.values);
 
+                                    try resolved.connection.storage_engine.checkUniqueIndexesExcept(table, existing_row.values, @intCast(conflict_row_key.?));
+
                                     var replacement_values = try self.connection.allocator.alloc(storage.Value, existing_row.values.len);
                                     var replacement_initialized: usize = 0;
-                                    errdefer {
+                                    var replacement_transferred = false;
+                                    errdefer if (!replacement_transferred) {
                                         for (replacement_values[0..replacement_initialized]) |value| {
                                             value.deinit(self.connection.allocator);
                                         }
                                         self.connection.allocator.free(replacement_values);
-                                    }
+                                    };
 
                                     for (existing_row.values, 0..) |value, i| {
                                         replacement_values[i] = try value.clone(self.connection.allocator);
@@ -1446,6 +1452,8 @@ pub const VirtualMachine = struct {
                                     }
 
                                     try table.updateRow(self.connection.allocator, @intCast(conflict_row_key.?), replacement_values);
+                                    replacement_transferred = true;
+                                    try resolved.connection.storage_engine.maintainIndexes(table, @intCast(conflict_row_key.?), new_row_id);
                                     result.affected_rows += 1;
                                     try self.connection.recordAffectedRows(result.affected_rows);
 
@@ -1466,9 +1474,8 @@ pub const VirtualMachine = struct {
                 }
             }
 
-            // Insert the row and get the row_id
-            const row_id = try table.insert(self.connection.allocator, final_values);
-            ownership_transferred = true; // Table now owns final_values
+            try resolved.connection.storage_engine.checkUniqueIndexes(table, final_values);
+            const row_id: i64 = @intCast(table.row_count);
 
             // Log undo entry if in transaction
             if (resolved.connection.in_transaction) {
@@ -1481,6 +1488,10 @@ pub const VirtualMachine = struct {
                     .old_values = null,
                 });
             }
+
+            _ = try table.insert(self.connection.allocator, final_values);
+            ownership_transferred = true;
+            try resolved.connection.storage_engine.maintainIndexes(table, null, row_id);
 
             if (resolved.connection.storage_engine.getFTSIndex(resolved.table_name)) |fts_index| {
                 if (try table.btree.search(@intCast(row_id))) |inserted_row| {
@@ -1514,9 +1525,7 @@ pub const VirtualMachine = struct {
             }
         }
 
-        if (result.affected_rows > 0) {
-            try resolved.connection.storage_engine.refreshIndexesForTable(resolved.table_name);
-        }
+        if (result.affected_rows > 0) try resolved.connection.storage_engine.saveAllMetadata();
 
         // Invalidate query result cache for this table
         resolved.connection.invalidateResultCache(resolved.table_name);
@@ -1848,11 +1857,12 @@ pub const VirtualMachine = struct {
             }
 
             try child_table.delete(self.connection.allocator, item.key);
+            try self.connection.storage_engine.maintainIndexes(child_table, item.key, null);
             changed = true;
         }
 
         if (changed) {
-            try self.connection.storage_engine.refreshIndexesForTable(child_table.name);
+            try self.connection.storage_engine.saveAllMetadata();
             self.connection.invalidateResultCache(child_table.name);
         }
     }
@@ -1878,21 +1888,24 @@ pub const VirtualMachine = struct {
 
             var updated_values = try self.connection.allocator.alloc(storage.Value, item.row.values.len);
             var values_cloned: usize = 0;
-            errdefer {
+            var values_transferred = false;
+            errdefer if (!values_transferred) {
                 for (updated_values[0..values_cloned]) |value| value.deinit(self.connection.allocator);
                 self.connection.allocator.free(updated_values);
-            }
+            };
 
             for (item.row.values, 0..) |value, i| {
                 updated_values[i] = try value.clone(self.connection.allocator);
                 values_cloned = i + 1;
             }
+            const replacement = try replacement_value.clone(self.connection.allocator);
             updated_values[child_idx].deinit(self.connection.allocator);
-            updated_values[child_idx] = try replacement_value.clone(self.connection.allocator);
+            updated_values[child_idx] = replacement;
 
             try self.validateNotNullConstraints(child_table, updated_values);
             try self.validateCheckConstraints(child_table, updated_values);
             try self.validateForeignKeyReferencesSkipping(child_table, updated_values, &foreign_key);
+            try self.connection.storage_engine.checkUniqueIndexesExcept(child_table, updated_values, item.key);
             try self.applyParentForeignKeyUpdateActions(child_table, item.row.values, updated_values);
 
             const new_row_id: i64 = @intCast(child_table.row_count);
@@ -1908,11 +1921,13 @@ pub const VirtualMachine = struct {
             }
 
             try child_table.updateRow(self.connection.allocator, item.key, updated_values);
+            values_transferred = true;
+            try self.connection.storage_engine.maintainIndexes(child_table, item.key, new_row_id);
             changed = true;
         }
 
         if (changed) {
-            try self.connection.storage_engine.refreshIndexesForTable(child_table.name);
+            try self.connection.storage_engine.saveAllMetadata();
             self.connection.invalidateResultCache(child_table.name);
         }
     }
@@ -2083,12 +2098,13 @@ pub const VirtualMachine = struct {
                 // Create updated row by cloning the original and applying changes
                 var updated_values = try self.connection.allocator.alloc(storage.Value, item.row.values.len);
                 var values_cloned: usize = 0;
-                errdefer {
+                var values_transferred = false;
+                errdefer if (!values_transferred) {
                     for (updated_values[0..values_cloned]) |value| {
                         value.deinit(self.connection.allocator);
                     }
                     self.connection.allocator.free(updated_values);
-                }
+                };
 
                 for (item.row.values, 0..) |value, i| {
                     updated_values[i] = try self.cloneValue(value);
@@ -2107,9 +2123,9 @@ pub const VirtualMachine = struct {
                     }
                     if (col_idx) |idx| {
                         if (idx < updated_values.len) {
+                            const replacement = try self.evaluateUpdateExpression(assignment.expr, item.row.values, table);
                             updated_values[idx].deinit(self.connection.allocator);
-                            // Evaluate expression against current row values
-                            updated_values[idx] = try self.evaluateUpdateExpression(assignment.expr, item.row.values, table);
+                            updated_values[idx] = replacement;
                         }
                     }
                 }
@@ -2117,8 +2133,9 @@ pub const VirtualMachine = struct {
                 try self.computeGeneratedColumns(table, updated_values);
 
                 var returning_values: ?[]storage.Value = null;
+                var returning_initialized: usize = 0;
                 errdefer if (returning_values) |values| {
-                    for (values) |value| {
+                    for (values[0..returning_initialized]) |value| {
                         value.deinit(self.connection.allocator);
                     }
                     self.connection.allocator.free(values);
@@ -2126,13 +2143,6 @@ pub const VirtualMachine = struct {
 
                 if (update.returning_columns != null) {
                     returning_values = try self.connection.allocator.alloc(storage.Value, updated_values.len);
-                    var returning_initialized: usize = 0;
-                    errdefer if (returning_values) |values| {
-                        for (values[0..returning_initialized]) |value| {
-                            value.deinit(self.connection.allocator);
-                        }
-                    };
-
                     for (updated_values, 0..) |value, i| {
                         returning_values.?[i] = try value.clone(self.connection.allocator);
                         returning_initialized = i + 1;
@@ -2145,6 +2155,7 @@ pub const VirtualMachine = struct {
                 try self.validateCheckConstraints(table, updated_values);
                 try self.validateNotNullConstraints(table, updated_values);
                 try self.validateForeignKeyReferences(table, updated_values);
+                try resolved.connection.storage_engine.checkUniqueIndexesExcept(table, updated_values, item.key);
                 try self.applyParentForeignKeyUpdateActions(table, item.row.values, updated_values);
 
                 // Log undo entry before updating (if in transaction)
@@ -2161,6 +2172,8 @@ pub const VirtualMachine = struct {
 
                 // Perform logical update (marks old as deleted, inserts new)
                 try table.updateRow(self.connection.allocator, item.key, updated_values);
+                values_transferred = true;
+                try resolved.connection.storage_engine.maintainIndexes(table, item.key, new_row_id);
                 updated_count += 1;
                 try self.connection.recordAffectedRows(updated_count);
 
@@ -2178,9 +2191,7 @@ pub const VirtualMachine = struct {
 
         result.affected_rows = updated_count;
 
-        if (updated_count > 0) {
-            try resolved.connection.storage_engine.refreshIndexesForTable(resolved.table_name);
-        }
+        if (updated_count > 0) try resolved.connection.storage_engine.saveAllMetadata();
 
         // Invalidate query result cache for this table
         resolved.connection.invalidateResultCache(resolved.table_name);
@@ -2242,6 +2253,7 @@ pub const VirtualMachine = struct {
 
                 // Perform logical delete
                 try table.delete(self.connection.allocator, item.key);
+                try resolved.connection.storage_engine.maintainIndexes(table, item.key, null);
                 deleted_count += 1;
                 try self.connection.recordAffectedRows(deleted_count);
             }
@@ -2249,9 +2261,7 @@ pub const VirtualMachine = struct {
 
         result.affected_rows = deleted_count;
 
-        if (deleted_count > 0) {
-            try resolved.connection.storage_engine.refreshIndexesForTable(resolved.table_name);
-        }
+        if (deleted_count > 0) try resolved.connection.storage_engine.saveAllMetadata();
 
         // Invalidate query result cache for this table
         resolved.connection.invalidateResultCache(resolved.table_name);
@@ -2431,12 +2441,7 @@ pub const VirtualMachine = struct {
     /// Execute a subquery and return the full result
     fn executeSubquery(self: *Self, subquery: *ast.SelectStatement) anyerror!ExecutionResult {
         // Create execution plan for subquery
-        var query_planner = planner.Planner.initWithContext(
-            self.connection.allocator,
-            &self.connection.aggregate_function_names,
-            self.connection.planner_table_stats.items,
-            self.connection.planner_index_stats.items,
-        );
+        var query_planner = self.connection.createPlanner(self.connection.allocator);
         var cloned_stmt = try query_planner.cloneSelectStatement(subquery.*);
         defer @constCast(&cloned_stmt).deinit(self.connection.allocator);
 
@@ -5639,12 +5644,7 @@ pub fn execute(connection: *db.Connection, parsed: *const ast.Statement) !void {
     var vm = VirtualMachine.init(connection.allocator, connection);
     defer vm.deinitVM();
 
-    var query_planner = planner.Planner.initWithContext(
-        connection.allocator,
-        &connection.aggregate_function_names,
-        connection.planner_table_stats.items,
-        connection.planner_index_stats.items,
-    );
+    var query_planner = connection.createPlanner(connection.allocator);
     var plan = try query_planner.plan(parsed);
     defer plan.deinit();
 

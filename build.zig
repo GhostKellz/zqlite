@@ -214,6 +214,18 @@ pub fn build(b: *std.Build) void {
     const run_sql_conformance_test = b.addRunArtifact(sql_conformance_test);
     const sql_conformance_step = b.step("test-sql-conformance", "Run statement-level SQL conformance tests");
     sql_conformance_step.dependOn(&run_sql_conformance_test.step);
+    const insert_parser_tests = b.addTest(.{
+        .name = "insert_parser_tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/standalone/test_insert_parser.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    insert_parser_tests.root_module.addImport("zqlite", lib.root_module);
+    const run_insert_parser = b.addRunArtifact(insert_parser_tests);
+    b.step("test-insert-parser", "Test signed INSERT values and parser allocation failures").dependOn(&run_insert_parser.step);
+    comprehensive_test_step.dependOn(&run_insert_parser.step);
     comprehensive_test_step.dependOn(&run_sql_conformance_test.step);
 
     // Add quick validation test
@@ -691,6 +703,18 @@ pub fn build(b: *std.Build) void {
     sqlite_diff_step.dependOn(&run_sqlite_diff_test.step);
 
     const coverage_binaries_step = b.step("coverage-binaries", "Build stable test binaries for external coverage collection");
+    const index_queries_test = b.addExecutable(.{
+        .name = "test_index_queries",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/standalone/test_index_queries.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    index_queries_test.root_module.addImport("zqlite", lib.root_module);
+    const run_index_queries = b.addRunArtifact(index_queries_test);
+    b.step("test-index-queries", "Test indexed equality, rebinding, duplicates, and reopen").dependOn(&run_index_queries.step);
+    storage_step.dependOn(&run_index_queries.step);
     const coverage_artifacts = [_]*std.Build.Step.Compile{
         lib_unit_tests,
         test_runner,
@@ -760,6 +784,34 @@ pub fn build(b: *std.Build) void {
     const run_operational_benchmark = b.addRunArtifact(operational_benchmark);
     const operational_benchmark_step = b.step("bench-operational", "Run operational performance evidence benchmarks");
     operational_benchmark_step.dependOn(&run_operational_benchmark.step);
+
+    const index_evidence = b.addExecutable(.{
+        .name = "index_evidence",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/bench/index_evidence.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    index_evidence.root_module.addImport("zqlite", lib.root_module);
+    index_evidence.root_module.addImport("temp_dir", b.createModule(.{
+        .root_source_file = b.path("tests/standalone/temp_dir.zig"),
+    }));
+    b.step("bench-index-evidence", "Measure literal/prepared unique/duplicate lookups across reopen and ANALYZE").dependOn(&b.addRunArtifact(index_evidence).step);
+
+    const write_evidence = b.addExecutable(.{
+        .name = "write_evidence",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/bench/write_evidence.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    write_evidence.root_module.addImport("zqlite", lib.root_module);
+    write_evidence.root_module.addImport("temp_dir", b.createModule(.{
+        .root_source_file = b.path("tests/standalone/temp_dir.zig"),
+    }));
+    b.step("bench-write-evidence", "Measure indexed INSERT/UPDATE/DELETE allocation and latency scaling").dependOn(&b.addRunArtifact(write_evidence).step);
 
     const storage_evidence = b.addExecutable(.{
         .name = "storage_evidence",

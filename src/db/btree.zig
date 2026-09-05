@@ -286,6 +286,67 @@ pub const BTree = struct {
         return self.searchNode(self.root_page, key);
     }
 
+    /// Visit borrowed rows for one key without materializing the index. Splits
+    /// can leave equal keys on either side of a separator, so both bounds are
+    /// inclusive when choosing children.
+    pub fn visitEqual(self: *Self, key: u64, context: anytype, comptime visit: fn (@TypeOf(context), storage.Row) anyerror!void) !void {
+        try self.visitEqualNode(self.root_page, key, context, visit);
+    }
+
+    fn visitEqualNode(self: *Self, page_id: u32, key: u64, context: anytype, comptime visit: fn (@TypeOf(context), storage.Row) anyerror!void) anyerror!void {
+        var node = try self.readNode(page_id);
+        defer node.deinit(self.allocator);
+        var first: u32 = 0;
+        while (first < node.key_count and node.keys[first] < key) : (first += 1) {}
+        if (node.is_leaf) {
+            var i = first;
+            while (i < node.key_count and node.keys[i] == key) : (i += 1) {
+                try visit(context, node.values[i]);
+            }
+        } else {
+            var i = first;
+            while (true) : (i += 1) {
+                try self.visitEqualNode(node.children[i], key, context, visit);
+                if (i == node.key_count or node.keys[i] > key) break;
+            }
+        }
+    }
+
+    /// Remove one derived index entry without disturbing equal keys belonging
+    /// to other rows. Separators remain valid lower bounds after deletion;
+    /// underfull pages are retained until the derived tree is rebuilt.
+    pub fn removeIndexEntry(self: *Self, key: u64, row_id: i64) !bool {
+        return self.removeIndexEntryNode(self.root_page, key, row_id);
+    }
+
+    fn removeIndexEntryNode(self: *Self, page_id: u32, key: u64, row_id: i64) anyerror!bool {
+        var node = try self.readNode(page_id);
+        defer node.deinit(self.allocator);
+        var first: u32 = 0;
+        while (first < node.key_count and node.keys[first] < key) : (first += 1) {}
+        if (node.is_leaf) {
+            var i = first;
+            while (i < node.key_count and node.keys[i] == key) : (i += 1) {
+                const row = node.values[i];
+                if (row.values.len != 1 or row.values[0] != .Integer) return error.CorruptedData;
+                if (row.values[0].Integer != row_id) continue;
+                node.values[i].deinit(self.allocator);
+                std.mem.copyForwards(u64, node.keys[i .. node.key_count - 1], node.keys[i + 1 .. node.key_count]);
+                std.mem.copyForwards(storage.Row, node.values[i .. node.key_count - 1], node.values[i + 1 .. node.key_count]);
+                node.key_count -= 1;
+                try self.writeNode(page_id, &node);
+                return true;
+            }
+        } else {
+            var i = first;
+            while (true) : (i += 1) {
+                if (try self.removeIndexEntryNode(node.children[i], key, row_id)) return true;
+                if (i == node.key_count or node.keys[i] > key) break;
+            }
+        }
+        return false;
+    }
+
     /// Select all rows (for table scans)
     pub fn selectAll(self: *Self, allocator: std.mem.Allocator) ![]storage.Row {
         var results: std.ArrayListUnmanaged(storage.Row) = .empty;
@@ -489,7 +550,10 @@ pub const BTree = struct {
         }
 
         // Search in appropriate child
-        return self.searchNode(node.children[search_result.index], key);
+        // A separator is the first key in its right subtree. Equality must
+        // follow that subtree, just as insertion does, or boundary rows vanish.
+        const child_index = search_result.index + @as(u32, @intFromBool(search_result.found));
+        return self.searchNode(node.children[child_index], key);
     }
 
     /// Clone a row with all its values

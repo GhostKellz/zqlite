@@ -224,7 +224,13 @@ pub const Tokenizer = struct {
             const value = try std.fmt.parseFloat(f64, number_str);
             return Token{ .Real = value };
         } else {
-            const value = try std.fmt.parseInt(i64, number_str, 10);
+            const value = std.fmt.parseInt(i64, number_str, 10) catch |err| {
+                // The sign is a separate token. Preserve the one magnitude
+                // that is valid only when preceded by a minus sign.
+                if (err == error.Overflow and std.mem.eql(u8, number_str, "9223372036854775808"))
+                    return .IntegerMagnitude;
+                return err;
+            };
             return Token{ .Integer = value };
         }
     }
@@ -300,6 +306,7 @@ pub const Tokenizer = struct {
 pub const Token = union(enum) {
     // Literals
     Integer: i64,
+    IntegerMagnitude,
     Real: f64,
     String: []const u8,
     Identifier: []const u8,

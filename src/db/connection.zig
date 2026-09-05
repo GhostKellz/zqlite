@@ -749,16 +749,13 @@ pub const Connection = struct {
         try self.checkOperation();
         try self.ensureStatementAllowed(&parsed.statement);
 
+        const statement_undo_start = self.undo_log.items.len;
         const auto_transaction = !self.in_transaction and statementNeedsAutoTransaction(parsed.statement);
         const acquired = if (auto_transaction) blk: {
             try self.beginTransaction();
             break :blk false;
         } else try self.beginStatementAccess(&parsed.statement);
-        errdefer if (auto_transaction and self.in_transaction) {
-            self.rollbackTransaction() catch |rollback_err| {
-                std.log.err("autocommit rollback failed: {s}", .{@errorName(rollback_err)});
-            };
-        } else self.abortStatementAccess(acquired);
+        errdefer self.abortExecution(auto_transaction, acquired, statement_undo_start);
 
         // Execute via virtual machine
         try vm.execute(self, &parsed.statement);
@@ -949,6 +946,12 @@ pub const Connection = struct {
         const text = try std.fmt.allocPrint(allocator, fmt, args);
         defer allocator.free(text);
         try output.appendSlice(allocator, text);
+    }
+
+    pub fn createPlanner(self: *Self, allocator: std.mem.Allocator) planner.Planner {
+        var query_planner = planner.Planner.initWithContext(allocator, &self.aggregate_function_names, self.planner_table_stats.items, self.planner_index_stats.items);
+        query_planner.storage_engine = self.storage_engine;
+        return query_planner;
     }
 
     fn clearPlannerStats(self: *Self) void {
@@ -1515,6 +1518,25 @@ pub const Connection = struct {
         try self.refreshAllIndexesAndCaches();
     }
 
+    fn abortExecution(self: *Self, auto_transaction: bool, acquired: bool, undo_start: usize) void {
+        if (auto_transaction and self.in_transaction) {
+            self.rollbackTransaction() catch |err| {
+                std.log.err("autocommit rollback failed: {s}", .{@errorName(err)});
+            };
+        } else {
+            if (self.in_transaction and self.undo_log.items.len > undo_start) {
+                self.rollbackUndoTo(undo_start) catch |err| {
+                    std.log.err("statement undo failed: {s}", .{@errorName(err)});
+                    return;
+                };
+                self.refreshAllIndexesAndCaches() catch |err| {
+                    std.log.err("statement index restoration failed: {s}", .{@errorName(err)});
+                };
+            }
+            self.abortStatementAccess(acquired);
+        }
+    }
+
     fn rollbackUndoTo(self: *Self, target_len: usize) !void {
         while (self.undo_log.items.len > target_len) {
             if (self.undo_log.pop()) |entry_val| {
@@ -1543,7 +1565,11 @@ pub const Connection = struct {
         switch (entry.operation) {
             .Insert => {
                 // Undo INSERT by deleting the row (logical delete)
-                try table.delete(self.allocator, entry.row_id);
+                if (try table.getRow(entry.row_id)) |row| {
+                    var owned = row;
+                    owned.deinit(self.allocator);
+                    try table.delete(self.allocator, entry.row_id);
+                }
             },
             .Delete => {
                 // Undo DELETE by undeleting the row (it's still in the btree)
@@ -1553,16 +1579,24 @@ pub const Connection = struct {
                 // Undo UPDATE: undelete the old row and delete the new row
                 table.undelete(entry.row_id);
                 if (entry.new_row_id) |new_id| {
-                    try table.delete(self.allocator, new_id);
+                    if (try table.getRow(new_id)) |row| {
+                        var owned = row;
+                        owned.deinit(self.allocator);
+                        try table.delete(self.allocator, new_id);
+                    }
                 }
             },
         }
     }
 
-    /// Log an undo entry for transaction rollback
+    /// Consume an undo entry, including on allocation failure.
     pub fn logUndo(self: *Self, entry: UndoEntry) !void {
         if (self.in_transaction) {
-            try self.undo_log.append(self.allocator, entry);
+            self.undo_log.append(self.allocator, entry) catch |err| {
+                var owned = entry;
+                owned.deinit(self.allocator);
+                return err;
+            };
         } else {
             // Not in a transaction, free the entry immediately
             var mutable_entry = entry;
@@ -1634,16 +1668,13 @@ pub const Connection = struct {
         try self.checkOperation();
         try self.ensureStatementAllowed(&parsed.statement);
 
+        const statement_undo_start = self.undo_log.items.len;
         const auto_transaction = !self.in_transaction and statementNeedsAutoTransaction(parsed.statement);
         const acquired = if (auto_transaction) blk: {
             try self.beginTransaction();
             break :blk false;
         } else try self.beginStatementAccess(&parsed.statement);
-        errdefer if (auto_transaction and self.in_transaction) {
-            self.rollbackTransaction() catch |rollback_err| {
-                std.log.err("autocommit rollback failed: {s}", .{@errorName(rollback_err)});
-            };
-        } else self.abortStatementAccess(acquired);
+        errdefer self.abortExecution(auto_transaction, acquired, statement_undo_start);
 
         if (self.result_cache) |cache| {
             const sql_hash = query_cache.QueryHasher.hashQuery(sql);
@@ -1669,7 +1700,7 @@ pub const Connection = struct {
                 plan_ptr = cached_plan;
             } else {
                 // Cache miss - create new plan and cache it
-                var query_planner = planner.Planner.initWithContext(self.allocator, &self.aggregate_function_names, self.planner_table_stats.items, self.planner_index_stats.items);
+                var query_planner = self.createPlanner(self.allocator);
                 const new_plan = try query_planner.plan(&parsed.statement);
                 try cache.put(sql, new_plan);
                 // Get pointer from cache (cache now owns the plan)
@@ -1677,7 +1708,7 @@ pub const Connection = struct {
             }
         } else {
             // No cache - create plan that we own
-            var query_planner = planner.Planner.initWithContext(self.allocator, &self.aggregate_function_names, self.planner_table_stats.items, self.planner_index_stats.items);
+            var query_planner = self.createPlanner(self.allocator);
             const owned_plan = try self.allocator.create(planner.ExecutionPlan);
             owned_plan.* = try query_planner.plan(&parsed.statement);
             plan_ptr = owned_plan;
@@ -1915,7 +1946,7 @@ pub const Connection = struct {
         try self.ensureStatementAllowed(&parsed.statement);
 
         // Create execution plan
-        var query_planner = planner.Planner.initWithContext(self.allocator, &self.aggregate_function_names, self.planner_table_stats.items, self.planner_index_stats.items);
+        var query_planner = self.createPlanner(self.allocator);
         var plan = try query_planner.plan(&parsed.statement);
         defer plan.deinit();
 
@@ -2117,15 +2148,6 @@ pub const Connection = struct {
             self.wal_callback_ctx = null;
         }
 
-        // Clean up plan cache
-        if (self.plan_cache) |*cache| {
-            cache.deinit();
-        }
-        self.clearPlannerStats();
-        self.planner_table_stats.deinit(self.allocator);
-        self.planner_index_stats.deinit(self.allocator);
-        self.deinitFunctionRegistries();
-
         // Roll back an unfinished transaction before attempting a checkpoint.
         // This must happen before the undo log is freed because rollback consumes
         // and frees the undo entries itself; freeing them first would double-free.
@@ -2134,6 +2156,15 @@ pub const Connection = struct {
                 if (first_error == null) first_error = err;
             };
         }
+
+        // Clean up plan cache
+        if (self.plan_cache) |*cache| {
+            cache.deinit();
+        }
+        self.clearPlannerStats();
+        self.planner_table_stats.deinit(self.allocator);
+        self.planner_index_stats.deinit(self.allocator);
+        self.deinitFunctionRegistries();
 
         // Clean up any remaining undo log entries
         for (self.undo_log.items) |*entry| {
@@ -2220,6 +2251,10 @@ pub const Connection = struct {
     /// Invalidate query result cache entries for a specific table
     /// Called by VM after INSERT/UPDATE/DELETE operations
     pub fn invalidateResultCache(self: *Self, table_name: []const u8) void {
+        self.clearPlannerStats();
+        // A cached DML plan may still be executing. Retire plans at the next
+        // lookup, after execution releases its borrowed pointer.
+        if (self.plan_cache) |*cache| cache.invalidated = true;
         if (self.result_cache) |cache| {
             cache.invalidateTable(table_name) catch {};
         }
@@ -2908,7 +2943,7 @@ pub const PreparedStatement = struct {
         defer connection.abortStatementAccess(acquired);
 
         // Create execution plan
-        var query_planner = planner.Planner.initWithContext(allocator, &connection.aggregate_function_names, connection.planner_table_stats.items, connection.planner_index_stats.items);
+        var query_planner = connection.createPlanner(allocator);
         stmt.execution_plan = try query_planner.plan(&stmt.parsed_statement);
         try connection.checkOperation();
         stmt.schema_version_at_prepare = connection.getSchemaVersion();
@@ -2972,16 +3007,14 @@ pub const PreparedStatement = struct {
         defer self.connection.endOperation();
         try self.connection.checkOperation();
         try self.connection.ensureStatementAllowed(&self.parsed_statement);
+        const statement_undo_start = self.connection.undo_log.items.len;
         const auto_transaction = !self.connection.in_transaction and Connection.statementNeedsAutoTransaction(self.parsed_statement);
         const acquired = if (auto_transaction) blk: {
             try self.connection.beginTransaction();
             break :blk false;
         } else try self.connection.beginStatementAccess(&self.parsed_statement);
-        errdefer if (auto_transaction and self.connection.in_transaction) {
-            self.connection.rollbackTransaction() catch |rollback_err| {
-                std.log.err("prepared autocommit rollback failed: {s}", .{@errorName(rollback_err)});
-            };
-        } else self.connection.abortStatementAccess(acquired);
+        errdefer self.connection.abortExecution(auto_transaction, acquired, statement_undo_start);
+
         try self.ensureSchemaCurrent(self.connection);
         var virtual_machine = vm.VirtualMachine.init(self.connection.allocator, self.connection);
         defer virtual_machine.deinitVM();
@@ -3002,16 +3035,14 @@ pub const PreparedStatement = struct {
         defer connection.endOperation();
         try connection.checkOperation();
         try connection.ensureStatementAllowed(&self.parsed_statement);
+        const statement_undo_start = connection.undo_log.items.len;
         const auto_transaction = !connection.in_transaction and Connection.statementNeedsAutoTransaction(self.parsed_statement);
         const acquired = if (auto_transaction) blk: {
             try connection.beginTransaction();
             break :blk false;
         } else try connection.beginStatementAccess(&self.parsed_statement);
-        errdefer if (auto_transaction and connection.in_transaction) {
-            connection.rollbackTransaction() catch |rollback_err| {
-                std.log.err("prepared autocommit rollback failed: {s}", .{@errorName(rollback_err)});
-            };
-        } else connection.abortStatementAccess(acquired);
+        errdefer connection.abortExecution(auto_transaction, acquired, statement_undo_start);
+
         try self.ensureSchemaCurrent(connection);
         var virtual_machine = vm.VirtualMachine.init(connection.allocator, connection);
         defer virtual_machine.deinitVM();
@@ -3031,16 +3062,14 @@ pub const PreparedStatement = struct {
         defer self.connection.endOperation();
         try self.connection.checkOperation();
         try self.connection.ensureStatementAllowed(&self.parsed_statement);
+        const statement_undo_start = self.connection.undo_log.items.len;
         const auto_transaction = !self.connection.in_transaction and Connection.statementNeedsAutoTransaction(self.parsed_statement);
         const acquired = if (auto_transaction) blk: {
             try self.connection.beginTransaction();
             break :blk false;
         } else try self.connection.beginStatementAccess(&self.parsed_statement);
-        errdefer if (auto_transaction and self.connection.in_transaction) {
-            self.connection.rollbackTransaction() catch |rollback_err| {
-                std.log.err("prepared cursor autocommit rollback failed: {s}", .{@errorName(rollback_err)});
-            };
-        } else self.connection.abortStatementAccess(acquired);
+        errdefer self.connection.abortExecution(auto_transaction, acquired, statement_undo_start);
+
         try self.ensureSchemaCurrent(self.connection);
 
         if (self.connection.is_memory and self.connection.shared_storage_mutex == null) if (try self.connection.openSimpleTableCursor(&self.parsed_statement, self.parameters)) |cursor| {

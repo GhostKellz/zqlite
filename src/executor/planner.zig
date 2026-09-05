@@ -37,6 +37,7 @@ pub const Planner = struct {
     aggregate_function_names: ?*const std.StringHashMap(void),
     table_stats: []const PlannerTableStats,
     index_stats: []const PlannerIndexStats,
+    storage_engine: ?*storage.StorageEngine = null,
 
     const Self = @This();
 
@@ -108,7 +109,7 @@ pub const Planner = struct {
         var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
 
         const base_table = select.table orelse "";
-        if (try self.chooseIndexScan(base_table, select.where_clause)) |index_scan| {
+        if (if (select.joins.len == 0) try self.chooseIndexScan(base_table, select.where_clause) else null) |index_scan| {
             try steps.append(self.allocator, ExecutionStep{ .IndexScan = index_scan });
         } else {
             try steps.append(self.allocator, ExecutionStep{
@@ -486,8 +487,8 @@ pub const Planner = struct {
         switch (condition.*) {
             .Comparison => |comp| {
                 if (comp.operator != .Equal) return null;
-                if (try self.expressionColumnLiteralLookup(&comp.left, &comp.right)) |lookup| return lookup;
-                return try self.expressionColumnLiteralLookup(&comp.right, &comp.left);
+                if (try self.expressionColumnLookup(&comp.left, &comp.right)) |lookup| return lookup;
+                return try self.expressionColumnLookup(&comp.right, &comp.left);
             },
             .Logical => |logical| {
                 if (logical.operator != .And) return null;
@@ -497,11 +498,15 @@ pub const Planner = struct {
         }
     }
 
-    fn expressionColumnLiteralLookup(self: *Self, column_expr: *const ast.Expression, value_expr: *const ast.Expression) !?EqualityLookup {
-        if (column_expr.* != .Column or value_expr.* != .Literal) return null;
+    fn expressionColumnLookup(self: *Self, column_expr: *const ast.Expression, value_expr: *const ast.Expression) !?EqualityLookup {
+        if (column_expr.* != .Column) return null;
         return EqualityLookup{
             .column_name = column_expr.Column,
-            .value = try self.cloneValue(value_expr.Literal),
+            .value = switch (value_expr.*) {
+                .Literal => |value| try self.cloneValue(value),
+                .Parameter => |parameter| .{ .Parameter = parameter },
+                else => return null,
+            },
         };
     }
 
@@ -514,6 +519,43 @@ pub const Planner = struct {
 
     fn chooseBestIndex(self: *Self, table_name: []const u8, column_name: []const u8, table_cost: u64) ?IndexChoice {
         var best: ?IndexChoice = null;
+
+        // Index availability is catalog state; ANALYZE only refines estimates.
+        if (self.storage_engine) |engine| {
+            var indexes = engine.indexes.iterator();
+            while (indexes.next()) |entry| {
+                const index = entry.value_ptr.*;
+                if (!std.mem.eql(u8, index.table_name, table_name)) continue;
+                if (index.keyPartCount() != 1 or index.column_names.len != 1 or index.where_clause != null) continue;
+                if (!std.mem.eql(u8, index.column_names[0], column_name)) continue;
+                if (index.expressions.len != 0 and (index.expressions[0] != .Column or
+                    !std.mem.eql(u8, index.expressions[0].Column, column_name))) continue;
+                var estimated_rows: u64 = 1;
+                if (!index.is_unique) {
+                    for (self.index_stats) |stats| {
+                        if (std.mem.eql(u8, stats.index_name, index.name)) {
+                            estimated_rows = @max(1, stats.indexed_rows / @max(1, stats.distinct_values));
+                            break;
+                        }
+                    }
+                }
+                if (best == null or estimated_rows < best.?.estimated_rows) {
+                    best = .{
+                        .stats = .{
+                            .index_name = index.name,
+                            .table_name = index.table_name,
+                            .column_name = column_name,
+                            .indexed_rows = 0,
+                            .distinct_values = 0,
+                            .is_unique = index.is_unique,
+                        },
+                        .estimated_rows = estimated_rows,
+                        .estimated_cost = estimated_rows,
+                    };
+                }
+            }
+            return best;
+        }
 
         for (self.index_stats) |stats| {
             if (!std.mem.eql(u8, stats.table_name, table_name)) continue;

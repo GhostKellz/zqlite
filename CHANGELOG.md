@@ -5,6 +5,32 @@ All notable changes to ZQLite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [1.7.2] - 2026-09-05
+
+### Changed
+- Ordinary indexed writes maintain only affected entries, including upsert and foreign-key cascades. Unique checks probe matching keys rather than scanning every live row; partial/expression predicates and NULL behavior are preserved.
+- Populated-table `ALTER TABLE ADD COLUMN` supports nullable columns and constant defaults through copy-on-write row/schema publication under the existing file format. Non-NULL defaults permit `NOT NULL`; dynamic defaults and transactional DDL remain unsupported.
+- Ordinary single-column equality indexes are selected directly from the catalog, including non-unique indexes and prepared parameters, without requiring `ANALYZE`. Rebound values are resolved on each execution.
+- Derived index trees use owned in-memory pagers. Rebuilding them no longer appends unreachable index pages to the database file; catalog definitions and the on-disk format remain unchanged.
+- Indexed rows transfer directly into query results, and WHERE filtering compacts results in place to reduce allocations.
+
+### Fixed
+- INSERT accepts signed integer/real literals, including the minimum signed integer and negative zero. Partial INSERT parsing cleans up on syntax and allocation failures.
+- Failed DML inside explicit transactions undoes that statement while preserving earlier work. UPDATE/RETURNING and undo-log ownership remain valid on failure.
+- Index fallback scans include logical row zero, and unique real keys normalize signed zero. Derived index pagers retain their pages instead of evicting data with no backing file.
+- B-tree point lookups now follow the right child when a key equals an internal separator, preserving rows at leaf boundaries.
+- Equality scans visit all duplicate keys across leaf and internal splits. Residual predicates distinguish hash collisions, and numeric probes preserve integer/real equality with conservative scan fallbacks for rounded large values.
+- Unique index rebuilds compare actual values instead of treating a hash collision as a uniqueness violation, and retain the previous tree if a rebuild fails.
+- Read-only opens can reconstruct indexes without writing database pages.
+- Writes invalidate cached plans and statistics; close-time rollback runs before planner cleanup. Filter interruption and fallback scans preserve row ownership.
+
+### Added
+- `bench-write-evidence` measures indexed INSERT/UPDATE/DELETE allocation and latency scaling, with a recorded comparison against the preceding implementation.
+- Indexed-query regression coverage for rebinding, duplicates, collisions, numeric comparisons, resource limits, rollback, cross-connection updates, read-only access, and reopen without file growth.
+- `bench-index-evidence` reports plans, scan work, allocation requests, memory, latency, and file sizes across table sizes, `ANALYZE`, and reopen.
+
 ## [1.7.1] - 2026-08-06
 
 ### Added

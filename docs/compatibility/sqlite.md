@@ -21,10 +21,11 @@ ZQLite aims to be a strong embedded SQLite-style database, not a byte-for-byte S
 | Read-only / immutable open | Supported | Main database file is opened read-only; WAL is not opened or replayed |
 | `ALTER TABLE RENAME TO` | Partial | Supported when the table has no index, FTS, or foreign-key dependencies |
 | `ALTER TABLE RENAME COLUMN` | Partial | Supported when the column is not referenced by an index, generated/check expression, or foreign key |
-| `ALTER TABLE ADD COLUMN` | Partial | Supported for never-populated tables with nullable/`NOT NULL` columns and optional defaults; key, unique, generated, check, and foreign-key additions are rejected |
+| `ALTER TABLE ADD COLUMN` | Partial | Populated tables support nullable columns and constant defaults, including `NOT NULL` with a non-NULL default; key, unique, generated, check, and foreign-key additions are rejected |
 | Composite foreign keys | Partial | Multi-column matching, NULL-key behavior, parent protection, and catalog persistence are supported; composite CASCADE/SET NULL rewrites are rejected |
 | Deferred foreign keys | Partial | `DEFERRABLE INITIALLY DEFERRED` NO ACTION constraints validate at commit and remain transaction-active on failure |
 | Partial/expression indexes | Partial | Definitions and unique enforcement persist; deterministic same-row expressions/predicates only |
+| Equality index scans | Partial | Ordinary single-column unique/non-unique indexes support literals and rebound parameters without ANALYZE; all duplicate candidates are filtered against WHERE |
 | Busy timeout / interrupt | Supported | Cooperative connection-level timeout and interrupt checks during parse/plan/VM execution |
 | VACUUM | Partial | Rebuilds live rows, indexes, FTS metadata, and catalog state into a validated compact image; tested to reclaim deleted-row space, without claiming full SQLite VACUUM parity |
 
@@ -59,6 +60,35 @@ ZQLite aims to be a strong embedded SQLite-style database, not a byte-for-byte S
 - Full SQLite edge-case compatibility across all planner/executor paths
 
 ## Tested Expectations
+
+`zig build test-index-queries` verifies duplicate traversal across B-tree splits,
+prepared rebinding, hash collisions, integer/real equality, rollback, concurrent
+connection refresh, and indexed read-only opens. Composite, partial, and
+expression indexes are not selected by this equality fast path. Joins retain
+their table-scan path. Large rounded numeric comparisons and unsupported lookup
+value types fall back to scanning to preserve existing comparison behavior.
+
+Index definitions persist in the catalog; derived index trees are rebuilt in
+memory on open and rollback. Ordinary INSERT, UPDATE, DELETE, upsert, and FK
+cascade paths maintain affected entries incrementally, including partial and
+expression indexes. Unique checks compare actual values within the matching key
+bucket. Read-only opens rebuild without modifying the database. Underfull index
+pages remain allocated until rebuild; derived index memory is not included in
+the connection's query-result memory budget. Existing files remain readable;
+use `VACUUM` to reclaim old unreachable file pages.
+
+Populated `ADD COLUMN` copies rows into a replacement tree, then publishes the
+new root and schema together through the catalog. It uses the existing row
+format and preserves logical row IDs. Constant defaults are materialized in
+existing rows; absent defaults fill with NULL. Previously populated tables
+reject function defaults and `NOT NULL` without a non-NULL default. Explicit
+transactions/savepoints still reject this DDL. Copying requires additional
+memory and database pages; old pages are reclaimed by `VACUUM`.
+
+A failed DML statement within an explicit transaction undoes its own writes and
+rebuilds derived indexes, preserving earlier successful statements. Allocation
+or I/O failure during rollback can still prevent restoration; errors are logged
+and callers must not assume successful recovery in that case.
 
 - treat `PRAGMA` support as a curated subset, not broad SQLite parity
 - validate ATTACH behavior under your chosen path policy, especially in `secure_mode`
