@@ -1,5 +1,5 @@
 #!/bin/bash
-# ZQLite Memory Leak Detection - Zig 0.17.0-dev
+# ZQLite Memory Leak Detection
 # Runs tests with memory leak detection enabled
 
 set -e

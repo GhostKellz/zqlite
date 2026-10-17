@@ -1,5 +1,5 @@
 #!/bin/bash
-# ZQLite Build Script - Zig 0.17.0-dev
+# ZQLite Build Script
 # Builds library with specified profile and options
 
 set -e

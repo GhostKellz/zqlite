@@ -1,5 +1,5 @@
 #!/bin/bash
-# ZQLite CI/CD Pipeline Script - Zig 0.17.0-dev
+# ZQLite CI/CD Pipeline Script
 # Complete validation for continuous integration
 
 set -e

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Builds against current Zig master: `standardOptimizeOption` now returns an optional and the optimize modes are `debug`/`safe`/`fast`/`small`. The manifest minimum moves to the corresponding 0.18 nightly.
+- The installed C ABI libraries (`libzqlite_c.a`, `libzqlite_c.so`) now link libc. Without it the C API allocator's thread-local state is uninitialised when the shared library is loaded by a C program, which aborted `zqlite_open` in the release package smoke test.
+
 ## [1.7.2] - 2026-09-05
 
 ### Changed

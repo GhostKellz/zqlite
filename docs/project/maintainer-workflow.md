@@ -11,10 +11,10 @@ Local compiler baseline:
 The authoritative minimum is `minimum_zig_version` in `build.zig.zon`. Example result:
 
 ```text
-0.17.0-dev.639+284ab0ad8
+0.18.0-dev.253+16d31ceed
 ```
 
-Current validation toolchain at the time of this roadmap work: `0.17.0-dev.931+84f84267c`.
+Current validation toolchain at the time of this roadmap work: `0.18.0-dev.253+16d31ceed`.
 
 ### Quick Validation
 

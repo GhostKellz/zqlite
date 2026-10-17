@@ -507,7 +507,7 @@ pub const ConfigValidator = struct {
 
     /// Check if running in debug mode (should warn in production)
     pub fn isDebugMode() bool {
-        return @import("builtin").mode == .Debug;
+        return @import("builtin").mode == .debug;
     }
 
     /// Get recommended production settings

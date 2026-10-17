@@ -1,5 +1,5 @@
 #!/bin/bash
-# ZQLite Test Runner - Zig 0.17.0-dev
+# ZQLite Test Runner
 # Runs comprehensive test suite with all profiles
 
 set -e

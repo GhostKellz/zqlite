@@ -58,11 +58,13 @@ pub fn build(b: *std.Build) void {
     const build_date = "2026-05-05";
 
     // Build mode string
-    const build_mode = switch (optimize) {
-        .Debug => "debug",
-        .ReleaseSafe => "release-safe",
-        .ReleaseFast => "release-fast",
-        .ReleaseSmall => "release-small",
+    // A null optimize mode means the user passed no -Doptimize/--release, which
+    // the build graph resolves to debug.
+    const build_mode = switch (optimize orelse .debug) {
+        .debug => "debug",
+        .safe => "release-safe",
+        .fast => "release-fast",
+        .small => "release-small",
     };
 
     build_options.addOption([]const u8, "git_commit", git_commit);
@@ -95,6 +97,9 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("src/ffi/c_api.zig"),
                 .target = target,
                 .optimize = optimize,
+                // The C ABI libraries run inside C processes, so they must use
+                // libc's TLS: the C API allocator keeps thread-local state.
+                .link_libc = true,
             }),
         });
 
@@ -108,6 +113,7 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("src/ffi/c_api.zig"),
                 .target = target,
                 .optimize = optimize,
+                .link_libc = true,
             }),
         });
         c_lib_shared.root_module.addImport("zqlite", lib.root_module);
@@ -913,7 +919,7 @@ pub fn build(b: *std.Build) void {
     install_smoke_step.dependOn(&install_smoke_cmd.step);
 }
 
-fn createBasicExample(b: *std.Build, examples_step: *std.Build.Step, name: []const u8, lib: *std.Build.Step.Compile, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options) void {
+fn createBasicExample(b: *std.Build, examples_step: *std.Build.Step, name: []const u8, lib: *std.Build.Step.Compile, target: std.Build.ResolvedTarget, optimize: ?std.builtin.Optimize, build_options: *std.Build.Step.Options) void {
     const example = b.addExecutable(.{
         .name = name,
         .root_module = b.createModule(.{
@@ -928,7 +934,7 @@ fn createBasicExample(b: *std.Build, examples_step: *std.Build.Step, name: []con
     examples_step.dependOn(&b.addInstallArtifact(example, .{}).step);
 }
 
-fn createDemo(b: *std.Build, examples_step: *std.Build.Step, name: []const u8, lib: *std.Build.Step.Compile, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options) void {
+fn createDemo(b: *std.Build, examples_step: *std.Build.Step, name: []const u8, lib: *std.Build.Step.Compile, target: std.Build.ResolvedTarget, optimize: ?std.builtin.Optimize, build_options: *std.Build.Step.Options) void {
     const demo = b.addExecutable(.{
         .name = name,
         .root_module = b.createModule(.{

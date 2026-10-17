@@ -1,5 +1,5 @@
 #!/bin/bash
-# ZQLite Zig 0.17.0-dev Compatibility Check
+# ZQLite Zig Compatibility Check
 # Validates code against the current Zig API baseline
 
 set -e
@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
-echo "=== ZQLite Zig 0.17.0-dev Compatibility Check ==="
+echo "=== ZQLite Zig Compatibility Check ==="
 echo "Zig version: $($ZIG version)"
 echo ""
 
