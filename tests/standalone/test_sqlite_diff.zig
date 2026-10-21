@@ -267,7 +267,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn runSqlite(io: std.Io, allocator: std.mem.Allocator, case: TestCase) ![]u8 {
-    var script: std.ArrayListUnmanaged(u8) = .empty;
+    var script: std.ArrayList(u8) = .empty;
     defer script.deinit(allocator);
 
     try script.appendSlice(allocator, "PRAGMA foreign_keys=ON;\n");
@@ -319,7 +319,7 @@ fn runZqlite(allocator: std.mem.Allocator, case: TestCase) ![]u8 {
     var result = try conn.query(case.query);
     defer result.deinit();
 
-    var output: std.ArrayListUnmanaged(u8) = .empty;
+    var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);
 
     while (result.next()) |row| {
@@ -337,7 +337,7 @@ fn runZqlite(allocator: std.mem.Allocator, case: TestCase) ![]u8 {
     return output.toOwnedSlice(allocator);
 }
 
-fn appendValue(allocator: std.mem.Allocator, output: *std.ArrayListUnmanaged(u8), value: zqlite.storage.Value) !void {
+fn appendValue(allocator: std.mem.Allocator, output: *std.ArrayList(u8), value: zqlite.storage.Value) !void {
     switch (value) {
         .Null => try output.appendSlice(allocator, "NULL"),
         .Integer => |v| try appendFmt(allocator, output, "{d}", .{v}),
@@ -351,7 +351,7 @@ fn appendValue(allocator: std.mem.Allocator, output: *std.ArrayListUnmanaged(u8)
     }
 }
 
-fn appendFmt(allocator: std.mem.Allocator, output: *std.ArrayListUnmanaged(u8), comptime fmt: []const u8, args: anytype) !void {
+fn appendFmt(allocator: std.mem.Allocator, output: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !void {
     const formatted = try std.fmt.allocPrint(allocator, fmt, args);
     defer allocator.free(formatted);
     try output.appendSlice(allocator, formatted);

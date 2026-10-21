@@ -587,7 +587,7 @@ pub const VirtualMachine = struct {
 
     /// Execute HAVING clause (filter after GROUP BY aggregation)
     fn executeHaving(self: *Self, having: *planner.HavingStep, result: *ExecutionResult) !void {
-        var filtered_rows: std.ArrayListUnmanaged(storage.Row) = .empty;
+        var filtered_rows: std.ArrayList(storage.Row) = .empty;
 
         for (result.rows.items) |row| {
             try self.connection.checkOperation();
@@ -615,7 +615,7 @@ pub const VirtualMachine = struct {
             return;
         }
 
-        var unique_rows: std.ArrayListUnmanaged(storage.Row) = .empty;
+        var unique_rows: std.ArrayList(storage.Row) = .empty;
         var seen = std.StringHashMap(void).init(self.connection.allocator);
         defer seen.deinit();
 
@@ -651,7 +651,7 @@ pub const VirtualMachine = struct {
 
     /// Build a string key for a row (for deduplication)
     fn buildRowKey(self: *Self, row: *const storage.Row) ![]u8 {
-        var key_parts: std.ArrayListUnmanaged(u8) = .empty;
+        var key_parts: std.ArrayList(u8) = .empty;
         defer key_parts.deinit(self.connection.allocator);
 
         for (row.values, 0..) |value, i| {
@@ -735,7 +735,7 @@ pub const VirtualMachine = struct {
         const table = self.current_table;
 
         // Create projected rows with only selected columns
-        var projected_rows: std.ArrayListUnmanaged(storage.Row) = .empty;
+        var projected_rows: std.ArrayList(storage.Row) = .empty;
 
         for (result.rows.items) |original_row| {
             try self.connection.checkOperation();
@@ -744,7 +744,7 @@ pub const VirtualMachine = struct {
             defer self.connection.allocator.free(used_indices);
             @memset(used_indices, false);
 
-            var projected_values: std.ArrayListUnmanaged(storage.Value) = .empty;
+            var projected_values: std.ArrayList(storage.Value) = .empty;
 
             for (project.columns, 0..) |col_name, col_i| {
                 // Check if we have an expression for this column
@@ -1205,7 +1205,7 @@ pub const VirtualMachine = struct {
             }
 
             // Create new slice with limited rows
-            var limited_rows: std.ArrayListUnmanaged(storage.Row) = .empty;
+            var limited_rows: std.ArrayList(storage.Row) = .empty;
             for (result.rows.items[start..end]) |row| {
                 try limited_rows.append(self.connection.allocator, row);
             }
@@ -2502,14 +2502,14 @@ pub const VirtualMachine = struct {
             else => return false,
         };
 
-        var normalized_query = std.ArrayListUnmanaged(u8).empty;
+        var normalized_query = std.ArrayList(u8).empty;
         defer normalized_query.deinit(self.connection.allocator);
         normalizeMatchQuery(self.connection.allocator, search_query, &normalized_query) catch return false;
 
         return evaluateMatchExpression(text, normalized_query.items) catch false;
     }
 
-    fn normalizeMatchQuery(allocator: std.mem.Allocator, query: []const u8, normalized: *std.ArrayListUnmanaged(u8)) !void {
+    fn normalizeMatchQuery(allocator: std.mem.Allocator, query: []const u8, normalized: *std.ArrayList(u8)) !void {
         var i: usize = 0;
         var pending_space = false;
         while (i < query.len) {
@@ -2561,7 +2561,7 @@ pub const VirtualMachine = struct {
     }
 
     fn evaluateMatchExpression(text: []const u8, query: []const u8) !bool {
-        var tokens = std.ArrayListUnmanaged([]const u8).empty;
+        var tokens = std.ArrayList([]const u8).empty;
         defer tokens.deinit(std.heap.page_allocator);
         try tokenizeMatchExpression(std.heap.page_allocator, query, &tokens);
         if (tokens.items.len == 0) return true;
@@ -2570,7 +2570,7 @@ pub const VirtualMachine = struct {
         return parser.parseExpression(text);
     }
 
-    fn tokenizeMatchExpression(allocator: std.mem.Allocator, query: []const u8, tokens: *std.ArrayListUnmanaged([]const u8)) !void {
+    fn tokenizeMatchExpression(allocator: std.mem.Allocator, query: []const u8, tokens: *std.ArrayList([]const u8)) !void {
         var i: usize = 0;
         while (i < query.len) {
             if (std.ascii.isWhitespace(query[i])) {
@@ -3812,7 +3812,7 @@ pub const VirtualMachine = struct {
                 },
                 .GroupConcat => {
                     // GROUP_CONCAT - concatenate all values with comma separator
-                    var concat: std.ArrayListUnmanaged(u8) = .empty;
+                    var concat: std.ArrayList(u8) = .empty;
                     defer concat.deinit(self.connection.allocator);
                     var first = true;
                     for (result.rows.items) |row| {
@@ -3850,7 +3850,7 @@ pub const VirtualMachine = struct {
                     }
                     for (result.rows.items) |row| {
                         if (row.values.len > 0) {
-                            var key_buf: std.ArrayListUnmanaged(u8) = .empty;
+                            var key_buf: std.ArrayList(u8) = .empty;
                             defer key_buf.deinit(self.connection.allocator);
                             try self.appendValueToKey(&key_buf, row.values[0]);
                             const key = try self.connection.allocator.dupe(u8, key_buf.items);
@@ -4014,7 +4014,7 @@ pub const VirtualMachine = struct {
         // Build groups
         for (result.rows.items) |row| {
             // Build group key from specified columns
-            var key_parts: std.ArrayListUnmanaged(u8) = .empty;
+            var key_parts: std.ArrayList(u8) = .empty;
             defer key_parts.deinit(self.connection.allocator);
 
             for (group.group_columns) |col_name| {
@@ -4207,7 +4207,7 @@ pub const VirtualMachine = struct {
                 return max_val orelse storage.Value.Null;
             },
             .GroupConcat => {
-                var concat: std.ArrayListUnmanaged(u8) = .empty;
+                var concat: std.ArrayList(u8) = .empty;
                 defer concat.deinit(self.connection.allocator);
                 var first = true;
                 for (rows) |row| {
@@ -4231,7 +4231,7 @@ pub const VirtualMachine = struct {
                 defer seen.deinit();
                 for (rows) |row| {
                     const val = self.getAggregateColumnValue(row, col_idx);
-                    var key_buf: std.ArrayListUnmanaged(u8) = .empty;
+                    var key_buf: std.ArrayList(u8) = .empty;
                     defer key_buf.deinit(self.connection.allocator);
                     try self.appendValueToKey(&key_buf, val);
                     const key = try self.connection.allocator.dupe(u8, key_buf.items);
@@ -4568,7 +4568,7 @@ pub const VirtualMachine = struct {
 
             // Generate rows for each column in the table
             for (table.schema.columns, 0..) |column, cid| {
-                var row_values: std.ArrayListUnmanaged(storage.Value) = .empty;
+                var row_values: std.ArrayList(storage.Value) = .empty;
 
                 // cid (column index)
                 try row_values.append(allocator, storage.Value{ .Integer = @intCast(cid) });
@@ -4665,7 +4665,7 @@ pub const VirtualMachine = struct {
         } else if (std.ascii.eqlIgnoreCase(pragma.name, "database_list")) {
             // PRAGMA database_list
             // Returns: seq, name, file
-            var row_values: std.ArrayListUnmanaged(storage.Value) = .empty;
+            var row_values: std.ArrayList(storage.Value) = .empty;
             try row_values.append(allocator, storage.Value{ .Integer = 0 }); // seq
             try row_values.append(allocator, storage.Value{ .Text = try allocator.dupe(u8, "main") }); // name
             try row_values.append(allocator, storage.Value{ .Text = try allocator.dupe(u8, ":memory:") }); // file
@@ -4677,7 +4677,7 @@ pub const VirtualMachine = struct {
             var seq: i64 = 1;
             var attached_iter = self.connection.attached_databases.iterator();
             while (attached_iter.next()) |entry| {
-                var attached_row: std.ArrayListUnmanaged(storage.Value) = .empty;
+                var attached_row: std.ArrayList(storage.Value) = .empty;
                 try attached_row.append(allocator, storage.Value{ .Integer = seq });
                 try attached_row.append(allocator, storage.Value{ .Text = try allocator.dupe(u8, entry.key_ptr.*) });
 
@@ -4699,7 +4699,7 @@ pub const VirtualMachine = struct {
             while (table_iter.next()) |entry| {
                 const table_name = entry.key_ptr.*;
                 const table = entry.value_ptr.*;
-                var row_values: std.ArrayListUnmanaged(storage.Value) = .empty;
+                var row_values: std.ArrayList(storage.Value) = .empty;
 
                 try row_values.append(allocator, storage.Value{ .Text = try allocator.dupe(u8, "main") }); // schema
                 try row_values.append(allocator, storage.Value{ .Text = try allocator.dupe(u8, table_name) }); // name
@@ -4714,7 +4714,7 @@ pub const VirtualMachine = struct {
             }
         } else if (std.ascii.eqlIgnoreCase(pragma.name, "planner_stats")) {
             for (self.connection.planner_table_stats.items) |stats| {
-                var row_values: std.ArrayListUnmanaged(storage.Value) = .empty;
+                var row_values: std.ArrayList(storage.Value) = .empty;
                 try row_values.append(allocator, storage.Value{ .Text = try allocator.dupe(u8, "table") });
                 try row_values.append(allocator, storage.Value{ .Text = try allocator.dupe(u8, stats.table_name) });
                 try row_values.append(allocator, storage.Value{ .Text = try allocator.dupe(u8, "") });
@@ -4726,7 +4726,7 @@ pub const VirtualMachine = struct {
             }
 
             for (self.connection.planner_index_stats.items) |stats| {
-                var row_values: std.ArrayListUnmanaged(storage.Value) = .empty;
+                var row_values: std.ArrayList(storage.Value) = .empty;
                 try row_values.append(allocator, storage.Value{ .Text = try allocator.dupe(u8, "index") });
                 try row_values.append(allocator, storage.Value{ .Text = try allocator.dupe(u8, stats.index_name) });
                 try row_values.append(allocator, storage.Value{ .Text = try allocator.dupe(u8, stats.table_name) });
@@ -4779,7 +4779,7 @@ pub const VirtualMachine = struct {
         // We'll use the simpler EXPLAIN QUERY PLAN format for now
 
         for (explain.inner_steps, 0..) |step, step_idx| {
-            var row_values: std.ArrayListUnmanaged(storage.Value) = .empty;
+            var row_values: std.ArrayList(storage.Value) = .empty;
 
             // id (step index)
             try row_values.append(allocator, storage.Value{ .Integer = @intCast(step_idx) });
@@ -5149,7 +5149,7 @@ pub const VirtualMachine = struct {
 
         // First, project the non-window columns from each row
         // This transforms rows from [id, name, department, salary] to [name, salary]
-        var projected_rows: std.ArrayListUnmanaged(storage.Row) = .empty;
+        var projected_rows: std.ArrayList(storage.Row) = .empty;
 
         for (result.rows.items) |original_row| {
             // Extract only the projected columns
@@ -5205,7 +5205,7 @@ pub const VirtualMachine = struct {
         for (window_step.window_functions, 0..) |window_func, wf_idx| {
             const window_slot = window_step.projected_columns.len + wf_idx;
             const resolved_spec = window_functions.WindowExecutor.resolveWindowSpecification(window_func.window_spec, window_step.window_definitions) orelse window_func.window_spec;
-            var partition_indices: std.ArrayListUnmanaged(usize) = .empty;
+            var partition_indices: std.ArrayList(usize) = .empty;
             defer partition_indices.deinit(allocator);
 
             if (resolved_spec.partition_by) |partition_cols| {
@@ -5279,7 +5279,7 @@ pub const VirtualMachine = struct {
         for (0..row_count) |row_idx| {
             if (assigned[row_idx]) continue;
 
-            var group = std.ArrayListUnmanaged(usize).empty;
+            var group = std.ArrayList(usize).empty;
             defer group.deinit(allocator);
 
             if (partition_indices.len == 0) {
@@ -5420,7 +5420,7 @@ pub const VirtualMachine = struct {
             return try allocator.alloc(PartitionBoundary, 0);
         }
 
-        var boundaries: std.ArrayListUnmanaged(PartitionBoundary) = .empty;
+        var boundaries: std.ArrayList(PartitionBoundary) = .empty;
 
         var partition_start: usize = 0;
         var i: usize = 1;
@@ -5550,7 +5550,7 @@ pub const VirtualMachine = struct {
 
 /// Result of query execution
 pub const ExecutionResult = struct {
-    rows: std.ArrayListUnmanaged(storage.Row),
+    rows: std.ArrayList(storage.Row),
     affected_rows: u32,
     connection: *db.Connection, // Store connection to access consistent allocator
 

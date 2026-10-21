@@ -25,7 +25,7 @@ pub const PQQuicTransport = struct {
     allocator: std.mem.Allocator,
     quic_crypto: QuicCrypto,
     endpoint: ?Endpoint,
-    connections: std.ArrayListUnmanaged(*PQConnection), // Use ArrayList instead of HashMap
+    connections: std.ArrayList(*PQConnection), // Use ArrayList instead of HashMap
     is_server: bool,
 
     const Self = @This();
@@ -577,7 +577,7 @@ pub const PQDatabaseTransport = struct {
     pub fn executeQuery(self: *Self, conn_id: u64, query: []const u8) ![]u8 {
         if (self.query_encryption) {
             // Encrypt query with additional protection
-            var encrypted_query: std.ArrayListUnmanaged(u8) = .empty;
+            var encrypted_query: std.ArrayList(u8) = .empty;
             defer encrypted_query.deinit();
 
             try encrypted_query.appendSlice("ENCRYPTED:");
@@ -611,7 +611,7 @@ pub const PQDatabaseTransport = struct {
 pub const QueryStream = struct {
     conn_id: u64,
     transport: *PQQuicTransport,
-    buffer: std.ArrayListUnmanaged(u8),
+    buffer: std.ArrayList(u8),
 
     const Self = @This();
 

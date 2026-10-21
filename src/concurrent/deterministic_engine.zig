@@ -9,7 +9,7 @@ pub const DeterministicEngine = struct {
     mvcc_manager: *mvcc.MVCCTransactionManager,
     deterministic_clock: DeterministicClock,
     hash_state: HashState,
-    execution_log: std.ArrayListUnmanaged(ExecutionRecord),
+    execution_log: std.ArrayList(ExecutionRecord),
     random_state: RandomState,
 
     const Self = @This();
@@ -208,7 +208,7 @@ pub const DeterministicEngine = struct {
 
     /// Serialize row for deterministic storage
     fn serializeRow(self: *Self, row: storage.Row) ![]u8 {
-        var list: std.ArrayListUnmanaged(u8) = .empty;
+        var list: std.ArrayList(u8) = .empty;
         defer list.deinit(self.allocator);
 
         try list.writer(self.allocator).writeInt(u32, @intCast(row.values.len), .little);

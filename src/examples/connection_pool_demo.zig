@@ -33,7 +33,7 @@ pub fn main() !void {
     std.debug.print("\n⚡ Simulating concurrent database operations...\n", .{});
 
     // Acquire multiple connections and use them simultaneously
-    var connections: std.ArrayListUnmanaged(*zqlite.connection_pool.PooledConnection) = .empty;
+    var connections: std.ArrayList(*zqlite.connection_pool.PooledConnection) = .empty;
     defer connections.deinit(allocator);
 
     // Acquire 5 connections

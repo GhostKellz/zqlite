@@ -6,7 +6,7 @@ pub const CancelToken = struct {
     cancelled: bool = false,
     mutex: compat.Mutex = .{},
     notifier: notifier_mod.Notifier = .{},
-    waiters: std.ArrayListUnmanaged(*notifier_mod.Notifier) = .empty,
+    waiters: std.ArrayList(*notifier_mod.Notifier) = .empty,
     allocator: std.mem.Allocator,
 
     const Self = @This();

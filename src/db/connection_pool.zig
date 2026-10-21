@@ -7,8 +7,8 @@ const storage = @import("storage.zig");
 /// Connection pool for managing database connections efficiently
 pub const ConnectionPool = struct {
     allocator: std.mem.Allocator,
-    connections: std.ArrayListUnmanaged(*PooledConnection),
-    available_connections: std.ArrayListUnmanaged(*PooledConnection),
+    connections: std.ArrayList(*PooledConnection),
+    available_connections: std.ArrayList(*PooledConnection),
     // Use compat blocking primitives to avoid requiring Io context
     mutex: compat.Mutex = .{},
     condition: compat.Condition = .{},

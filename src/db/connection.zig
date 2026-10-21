@@ -301,8 +301,8 @@ pub const Connection = struct {
     path: ?[]const u8,
     owns_storage: bool, // Whether this connection owns and should clean up the storage engine
     in_transaction: bool,
-    undo_log: std.ArrayListUnmanaged(UndoEntry),
-    savepoints: std.ArrayListUnmanaged(SavepointEntry),
+    undo_log: std.ArrayList(UndoEntry),
+    savepoints: std.ArrayList(SavepointEntry),
     plan_cache: ?cache_manager.QueryPlanCache,
     result_cache: ?*query_cache.QueryCache, // Optional result cache for SELECT queries
     attached_databases: std.StringHashMap(*Self), // ATTACH DATABASE schema_name -> connection
@@ -319,8 +319,8 @@ pub const Connection = struct {
     scalar_functions: std.StringHashMap(ScalarFunction),
     aggregate_functions: std.StringHashMap(AggregateFunction),
     aggregate_function_names: std.StringHashMap(void),
-    planner_table_stats: std.ArrayListUnmanaged(PlannerTableStats),
-    planner_index_stats: std.ArrayListUnmanaged(PlannerIndexStats),
+    planner_table_stats: std.ArrayList(PlannerTableStats),
+    planner_index_stats: std.ArrayList(PlannerIndexStats),
     /// WAL callback context for transaction page logging
     wal_callback_ctx: ?*WalCallbackContext,
     /// A separate handle keeps advisory locks independent from pager lifecycle.
@@ -904,7 +904,7 @@ pub const Connection = struct {
                     if (idx >= item.row.values.len) continue;
                     indexed_rows += 1;
 
-                    var key_buf: std.ArrayListUnmanaged(u8) = .empty;
+                    var key_buf: std.ArrayList(u8) = .empty;
                     defer key_buf.deinit(self.allocator);
                     try appendPlannerStatsValueKey(self.allocator, &key_buf, item.row.values[idx]);
                     const key = try self.allocator.dupe(u8, key_buf.items);
@@ -926,7 +926,7 @@ pub const Connection = struct {
         }
     }
 
-    fn appendPlannerStatsValueKey(allocator: std.mem.Allocator, output: *std.ArrayListUnmanaged(u8), value: storage.Value) !void {
+    fn appendPlannerStatsValueKey(allocator: std.mem.Allocator, output: *std.ArrayList(u8), value: storage.Value) !void {
         switch (value) {
             .Null => try output.appendSlice(allocator, "null:"),
             .Integer => |v| try appendPlannerStatsFmt(allocator, output, "i:{d}", .{v}),
@@ -942,7 +942,7 @@ pub const Connection = struct {
         }
     }
 
-    fn appendPlannerStatsFmt(allocator: std.mem.Allocator, output: *std.ArrayListUnmanaged(u8), comptime fmt: []const u8, args: anytype) !void {
+    fn appendPlannerStatsFmt(allocator: std.mem.Allocator, output: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !void {
         const text = try std.fmt.allocPrint(allocator, fmt, args);
         defer allocator.free(text);
         try output.appendSlice(allocator, text);
@@ -2079,8 +2079,8 @@ pub const Connection = struct {
         return try self.extractColumnNames(&parsed.statement);
     }
 
-    fn cloneCachedRows(allocator: std.mem.Allocator, rows: []storage.Row) !std.ArrayListUnmanaged(storage.Row) {
-        var cloned: std.ArrayListUnmanaged(storage.Row) = .empty;
+    fn cloneCachedRows(allocator: std.mem.Allocator, rows: []storage.Row) !std.ArrayList(storage.Row) {
+        var cloned: std.ArrayList(storage.Row) = .empty;
         errdefer {
             for (cloned.items) |row| {
                 for (row.values) |value| {
@@ -2445,7 +2445,7 @@ pub const BlobHandle = struct {
 pub const ResultSet = struct {
     allocator: std.mem.Allocator,
     connection: *Connection,
-    rows: std.ArrayListUnmanaged(storage.Row),
+    rows: std.ArrayList(storage.Row),
     current_index: usize,
     column_names: [][]const u8,
 
@@ -3151,7 +3151,7 @@ pub const PreparedStatement = struct {
     }
 
     fn collectParameterNames(allocator: std.mem.Allocator, sql: []const u8) ![]?[]const u8 {
-        var names: std.ArrayListUnmanaged(?[]const u8) = .empty;
+        var names: std.ArrayList(?[]const u8) = .empty;
         errdefer {
             for (names.items) |maybe_name| {
                 if (maybe_name) |name| allocator.free(name);

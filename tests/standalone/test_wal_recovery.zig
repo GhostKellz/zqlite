@@ -55,7 +55,7 @@ const TestPaths = struct {
 
 /// Serialize a sequence of log entries and write them to the WAL file path.
 fn writeWalFile(io: std.Io, allocator: std.mem.Allocator, wal_path: []const u8, entries: []const LogEntry) !void {
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
     for (entries) |entry| {

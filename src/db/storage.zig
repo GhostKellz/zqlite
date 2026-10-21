@@ -511,13 +511,13 @@ pub const StorageEngine = struct {
         return !self.is_memory and !self.pager.in_transaction;
     }
 
-    fn appendInt(self: *Self, buf: *std.ArrayListUnmanaged(u8), comptime T: type, value: T) !void {
+    fn appendInt(self: *Self, buf: *std.ArrayList(u8), comptime T: type, value: T) !void {
         var tmp: [@divExact(@typeInfo(T).int.bits, 8)]u8 = undefined;
         std.mem.writeInt(T, &tmp, value, .little);
         try buf.appendSlice(self.allocator, &tmp);
     }
 
-    fn appendMetadataValue(self: *Self, buf: *std.ArrayListUnmanaged(u8), value: Value) !void {
+    fn appendMetadataValue(self: *Self, buf: *std.ArrayList(u8), value: Value) !void {
         switch (value) {
             .Null => try buf.append(self.allocator, @backingInt(MetadataValueTag.Null)),
             .Integer => |v| {
@@ -554,7 +554,7 @@ pub const StorageEngine = struct {
         }
     }
 
-    fn appendFunctionArgument(self: *Self, buf: *std.ArrayListUnmanaged(u8), arg: Column.FunctionArgument) !void {
+    fn appendFunctionArgument(self: *Self, buf: *std.ArrayList(u8), arg: Column.FunctionArgument) !void {
         switch (arg) {
             .Literal => |lit| {
                 try buf.append(self.allocator, @backingInt(MetadataFunctionArgTag.Literal));
@@ -572,7 +572,7 @@ pub const StorageEngine = struct {
         }
     }
 
-    fn appendDefaultValue(self: *Self, buf: *std.ArrayListUnmanaged(u8), dv: Column.DefaultValue) !void {
+    fn appendDefaultValue(self: *Self, buf: *std.ArrayList(u8), dv: Column.DefaultValue) !void {
         switch (dv) {
             .Literal => |lit| {
                 try buf.append(self.allocator, @backingInt(MetadataDefaultTag.Literal));
@@ -588,7 +588,7 @@ pub const StorageEngine = struct {
         }
     }
 
-    fn appendAstValue(self: *Self, buf: *std.ArrayListUnmanaged(u8), value: ast.Value) !void {
+    fn appendAstValue(self: *Self, buf: *std.ArrayList(u8), value: ast.Value) !void {
         const storage_value: Value = switch (value) {
             .Integer => |v| .{ .Integer = v },
             .Text => |v| .{ .Text = v },
@@ -601,7 +601,7 @@ pub const StorageEngine = struct {
         try self.appendMetadataValue(buf, storage_value);
     }
 
-    fn appendCheckExpression(self: *Self, buf: *std.ArrayListUnmanaged(u8), expr: ast.Expression) !void {
+    fn appendCheckExpression(self: *Self, buf: *std.ArrayList(u8), expr: ast.Expression) !void {
         switch (expr) {
             .Column => |column| {
                 try buf.append(self.allocator, 1);
@@ -631,7 +631,7 @@ pub const StorageEngine = struct {
         }
     }
 
-    fn appendCheckCondition(self: *Self, buf: *std.ArrayListUnmanaged(u8), condition: ast.Condition) !void {
+    fn appendCheckCondition(self: *Self, buf: *std.ArrayList(u8), condition: ast.Condition) !void {
         switch (condition) {
             .Comparison => |comp| {
                 try buf.append(self.allocator, 1);
@@ -654,7 +654,7 @@ pub const StorageEngine = struct {
         }
     }
 
-    fn appendForeignKeyAction(self: *Self, buf: *std.ArrayListUnmanaged(u8), action: ?ast.ForeignKeyAction) !void {
+    fn appendForeignKeyAction(self: *Self, buf: *std.ArrayList(u8), action: ?ast.ForeignKeyAction) !void {
         if (action) |value| {
             try buf.append(self.allocator, 1);
             try buf.append(self.allocator, @backingInt(value));
@@ -663,7 +663,7 @@ pub const StorageEngine = struct {
         }
     }
 
-    fn appendForeignKey(self: *Self, buf: *std.ArrayListUnmanaged(u8), foreign_key: ast.ForeignKeyConstraint) !void {
+    fn appendForeignKey(self: *Self, buf: *std.ArrayList(u8), foreign_key: ast.ForeignKeyConstraint) !void {
         const column = foreign_key.column orelse return error.InvalidForeignKey;
         try self.appendInt(buf, u16, @intCast(column.len));
         try buf.appendSlice(self.allocator, column);
@@ -679,7 +679,7 @@ pub const StorageEngine = struct {
     /// indexes) into a single owned buffer. Growing freely means catalog records
     /// are never silently dropped to fit a fixed page.
     fn serializeCatalog(self: *Self) ![]u8 {
-        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(self.allocator);
 
         // Tables
@@ -930,7 +930,7 @@ pub const StorageEngine = struct {
         else
             (payload.len + capacity - 1) / capacity;
 
-        var pages: std.ArrayListUnmanaged(u32) = .empty;
+        var pages: std.ArrayList(u32) = .empty;
         defer pages.deinit(self.allocator);
 
         // Reuse the slot's existing chain pages.
@@ -2976,7 +2976,7 @@ pub const Table = struct {
         defer allocator.free(all_rows);
 
         // Filter out deleted rows
-        var results: std.ArrayListUnmanaged(Row) = .empty;
+        var results: std.ArrayList(Row) = .empty;
         for (all_rows) |item| {
             if (!self.deleted_keys.contains(item.key)) {
                 try results.append(allocator, item.row);
@@ -3003,7 +3003,7 @@ pub const Table = struct {
         defer allocator.free(all_rows);
 
         // Filter out deleted rows
-        var results: std.ArrayListUnmanaged(KeyRow) = .empty;
+        var results: std.ArrayList(KeyRow) = .empty;
         for (all_rows) |item| {
             if (!self.deleted_keys.contains(item.key)) {
                 try results.append(allocator, KeyRow{
@@ -3480,7 +3480,7 @@ pub const JSONBValue = struct {
             .number_string => |s| try allocator.dupe(u8, s),
             .string => |s| try std.fmt.allocPrint(allocator, "\"{s}\"", .{s}),
             .array => |arr| blk: {
-                var result: std.ArrayListUnmanaged(u8) = .empty;
+                var result: std.ArrayList(u8) = .empty;
                 defer result.deinit(allocator);
 
                 try result.append(allocator, '[');
@@ -3495,7 +3495,7 @@ pub const JSONBValue = struct {
                 break :blk try result.toOwnedSlice(allocator);
             },
             .object => |obj| blk: {
-                var result: std.ArrayListUnmanaged(u8) = .empty;
+                var result: std.ArrayList(u8) = .empty;
                 defer result.deinit(allocator);
 
                 try result.append(allocator, '{');
@@ -3605,7 +3605,7 @@ pub const ArrayValue = struct {
 
     /// Convert array to PostgreSQL format string: {elem1,elem2,elem3}
     pub fn toString(self: ArrayValue, allocator: std.mem.Allocator) ![]u8 {
-        var result: std.ArrayListUnmanaged(u8) = .empty;
+        var result: std.ArrayList(u8) = .empty;
         defer result.deinit(allocator);
 
         try result.append(allocator, '{');
@@ -3917,7 +3917,7 @@ pub const FTSIndex = struct {
     table_name: []const u8,
     column_names: [][]const u8,
     /// Inverted index: term -> list of (rowid, column_index, position)
-    inverted_index: std.StringHashMap(std.ArrayListUnmanaged(TermOccurrence)),
+    inverted_index: std.StringHashMap(std.ArrayList(TermOccurrence)),
 
     const Self = @This();
 
@@ -3953,7 +3953,7 @@ pub const FTSIndex = struct {
             cols_allocated = i + 1;
         }
 
-        fts.inverted_index = std.StringHashMap(std.ArrayListUnmanaged(TermOccurrence)).init(allocator);
+        fts.inverted_index = std.StringHashMap(std.ArrayList(TermOccurrence)).init(allocator);
 
         return fts;
     }
@@ -3986,7 +3986,7 @@ pub const FTSIndex = struct {
                 var entry = self.inverted_index.getPtr(lower_token);
                 if (entry == null) {
                     const term_copy = try self.allocator.dupe(u8, lower_token);
-                    const new_list: std.ArrayListUnmanaged(TermOccurrence) = .empty;
+                    const new_list: std.ArrayList(TermOccurrence) = .empty;
                     try self.inverted_index.put(term_copy, new_list);
                     entry = self.inverted_index.getPtr(term_copy);
                 }
@@ -4037,7 +4037,7 @@ pub const FTSIndex = struct {
                     }
 
                     // Remove rowids not in this term's results
-                    var to_remove: std.ArrayListUnmanaged(u64) = .empty;
+                    var to_remove: std.ArrayList(u64) = .empty;
                     defer to_remove.deinit(self.allocator);
 
                     var result_iter = results.iterator();

@@ -247,7 +247,7 @@ pub const FunctionEvaluator = struct {
     fn evalJsonObjectValues(self: *Self, arguments: []const storage.Value) !storage.Value {
         if (arguments.len % 2 != 0) return error.InvalidArgumentCount;
 
-        var out: std.ArrayListUnmanaged(u8) = .empty;
+        var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.allocator);
 
         try out.append(self.allocator, '{');
@@ -356,7 +356,7 @@ pub const FunctionEvaluator = struct {
     }
 
     fn jsonStringify(self: *Self, value: std.json.Value) ![]u8 {
-        var out: std.ArrayListUnmanaged(u8) = .empty;
+        var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(self.allocator);
         try appendJsonValue(self.allocator, &out, value);
         return out.toOwnedSlice(self.allocator);
@@ -374,7 +374,7 @@ pub const FunctionEvaluator = struct {
         };
     }
 
-    fn appendJsonValue(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), value: std.json.Value) !void {
+    fn appendJsonValue(allocator: Allocator, out: *std.ArrayList(u8), value: std.json.Value) !void {
         switch (value) {
             .null => try out.appendSlice(allocator, "null"),
             .bool => |b| try out.appendSlice(allocator, if (b) "true" else "false"),
@@ -406,7 +406,7 @@ pub const FunctionEvaluator = struct {
         }
     }
 
-    fn appendStorageValueAsJson(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), value: storage.Value) !void {
+    fn appendStorageValueAsJson(allocator: Allocator, out: *std.ArrayList(u8), value: storage.Value) !void {
         switch (value) {
             .Null => try out.appendSlice(allocator, "null"),
             .Integer => |v| try appendJsonFmt(allocator, out, "{d}", .{v}),
@@ -425,7 +425,7 @@ pub const FunctionEvaluator = struct {
         }
     }
 
-    fn appendJsonString(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), text: []const u8) !void {
+    fn appendJsonString(allocator: Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
         try out.append(allocator, '"');
         for (text) |byte| {
             switch (byte) {
@@ -440,7 +440,7 @@ pub const FunctionEvaluator = struct {
         try out.append(allocator, '"');
     }
 
-    fn appendJsonFmt(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), comptime fmt: []const u8, args: anytype) !void {
+    fn appendJsonFmt(allocator: Allocator, out: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !void {
         const text = try std.fmt.allocPrint(allocator, fmt, args);
         defer allocator.free(text);
         try out.appendSlice(allocator, text);

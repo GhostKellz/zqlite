@@ -262,7 +262,7 @@ pub const Tokenizer = struct {
         const quote_char = self.current_char.?;
         self.advance(); // Skip opening quote
 
-        var content: std.ArrayListUnmanaged(u8) = .empty;
+        var content: std.ArrayList(u8) = .empty;
         errdefer content.deinit(allocator);
 
         while (self.current_char) |c| {

@@ -50,7 +50,7 @@ pub fn main() !void {
     std.debug.print("🪟 Window Function Demonstrations:\n\n", .{});
 
     // Create test rows from our data
-    var test_rows: std.ArrayListUnmanaged(zqlite.storage.Row) = .empty;
+    var test_rows: std.ArrayList(zqlite.storage.Row) = .empty;
     defer {
         for (test_rows.items) |row| {
             for (row.values) |value| {

@@ -6,7 +6,7 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
     // Collect args into a slice
-    var args_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    var args_list: std.ArrayList([]const u8) = .empty;
     defer args_list.deinit(allocator);
 
     var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
@@ -30,7 +30,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "simple test" {
-    var list: std.ArrayListUnmanaged(i32) = .empty;
+    var list: std.ArrayList(i32) = .empty;
     defer list.deinit(std.testing.allocator);
     try list.append(std.testing.allocator, 42);
     try std.testing.expectEqual(@as(i32, 42), list.pop());

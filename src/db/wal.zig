@@ -8,7 +8,7 @@ pub const WriteAheadLog = struct {
     writer_lock_fd: ?file_io.File,
     is_transaction_active: bool,
     transaction_id: u64,
-    log_entries: std.ArrayListUnmanaged(LogEntry),
+    log_entries: std.ArrayList(LogEntry),
     wal_path: []const u8,
     fault_once: ?FaultPoint,
 

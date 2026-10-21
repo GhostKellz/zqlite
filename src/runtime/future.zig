@@ -10,7 +10,7 @@ pub fn Future(comptime T: type) type {
         mutex: compat.Mutex,
         condition: compat.Condition,
         notifier: notifier_mod.Notifier,
-        waiters: std.ArrayListUnmanaged(*notifier_mod.Notifier),
+        waiters: std.ArrayList(*notifier_mod.Notifier),
         cancel_token: *cancellation.CancelToken,
         scheduled: bool,
         allocator: std.mem.Allocator,

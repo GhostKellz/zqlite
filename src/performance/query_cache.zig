@@ -227,7 +227,7 @@ pub const QueryCache = struct {
     pub fn cleanupExpired(self: *Self, ttl_seconds: i64) !void {
         const ts = time_utils.getTimespec();
         const current_time = ts.sec;
-        var entries_to_remove: std.ArrayListUnmanaged(*CacheEntry) = .empty;
+        var entries_to_remove: std.ArrayList(*CacheEntry) = .empty;
         defer entries_to_remove.deinit(self.allocator);
 
         var iterator = self.cache_entries.iterator();
@@ -244,7 +244,7 @@ pub const QueryCache = struct {
 
     /// Invalidate cache entries that might be affected by a table update
     pub fn invalidateTable(self: *Self, table_name: []const u8) !void {
-        var entries_to_remove: std.ArrayListUnmanaged(*CacheEntry) = .empty;
+        var entries_to_remove: std.ArrayList(*CacheEntry) = .empty;
         defer entries_to_remove.deinit(self.allocator);
 
         var iterator = self.cache_entries.iterator();
@@ -272,7 +272,7 @@ pub const QueryCache = struct {
         };
         defer parsed.deinit();
 
-        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        var names: std.ArrayList([]const u8) = .empty;
         errdefer {
             for (names.items) |name| {
                 self.allocator.free(name);
@@ -370,7 +370,7 @@ fn entryReferencesTable(referenced_tables: [][]const u8, table_name: []const u8)
     return false;
 }
 
-fn appendTableName(allocator: std.mem.Allocator, names: *std.ArrayListUnmanaged([]const u8), table_name: []const u8) !void {
+fn appendTableName(allocator: std.mem.Allocator, names: *std.ArrayList([]const u8), table_name: []const u8) !void {
     for (names.items) |existing| {
         if (std.ascii.eqlIgnoreCase(existing, table_name)) {
             return;
@@ -380,7 +380,7 @@ fn appendTableName(allocator: std.mem.Allocator, names: *std.ArrayListUnmanaged(
     try names.append(allocator, try allocator.dupe(u8, table_name));
 }
 
-fn collectStatementTables(allocator: std.mem.Allocator, names: *std.ArrayListUnmanaged([]const u8), statement: ast.Statement) !void {
+fn collectStatementTables(allocator: std.mem.Allocator, names: *std.ArrayList([]const u8), statement: ast.Statement) !void {
     switch (statement) {
         .Select => |select| try collectSelectTables(allocator, names, select),
         .Insert => |insert| try appendTableName(allocator, names, insert.table),
@@ -400,7 +400,7 @@ fn collectStatementTables(allocator: std.mem.Allocator, names: *std.ArrayListUnm
     }
 }
 
-fn collectSelectTables(allocator: std.mem.Allocator, names: *std.ArrayListUnmanaged([]const u8), select: ast.SelectStatement) !void {
+fn collectSelectTables(allocator: std.mem.Allocator, names: *std.ArrayList([]const u8), select: ast.SelectStatement) !void {
     if (select.table) |table_name| {
         try appendTableName(allocator, names, table_name);
     }

@@ -19,7 +19,7 @@ pub fn Channel(comptime T: type) type {
         not_empty: compat.Condition,
         not_full: compat.Condition,
         notifier: notifier_mod.Notifier,
-        waiters: std.ArrayListUnmanaged(*notifier_mod.Notifier),
+        waiters: std.ArrayList(*notifier_mod.Notifier),
         closed: bool,
         backpressure: Backpressure,
         allocator: std.mem.Allocator,

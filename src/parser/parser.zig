@@ -134,7 +134,7 @@ pub const Parser = struct {
             try self.advance();
         }
 
-        var cte_definitions: std.ArrayListUnmanaged(ast.CTEDefinition) = .empty;
+        var cte_definitions: std.ArrayList(ast.CTEDefinition) = .empty;
         defer cte_definitions.deinit(self.allocator);
         errdefer for (cte_definitions.items) |*cte| cte.deinit(self.allocator);
 
@@ -150,7 +150,7 @@ pub const Parser = struct {
             if (std.meta.activeTag(self.current_token) == .LeftParen) {
                 try self.advance();
 
-                var cols: std.ArrayListUnmanaged([]const u8) = .empty;
+                var cols: std.ArrayList([]const u8) = .empty;
                 defer cols.deinit(self.allocator);
                 errdefer for (cols.items) |col| self.allocator.free(col);
 
@@ -240,7 +240,7 @@ pub const Parser = struct {
             try self.advance();
             try self.expect(.By);
 
-            var order_clauses: std.ArrayListUnmanaged(ast.OrderByClause) = .empty;
+            var order_clauses: std.ArrayList(ast.OrderByClause) = .empty;
             defer order_clauses.deinit(self.allocator);
             errdefer for (order_clauses.items) |clause| self.allocator.free(clause.column);
 
@@ -318,7 +318,7 @@ pub const Parser = struct {
         }
 
         // Parse columns
-        var columns: std.ArrayListUnmanaged(ast.Column) = .empty;
+        var columns: std.ArrayList(ast.Column) = .empty;
         defer columns.deinit(self.allocator);
         errdefer for (columns.items) |*column| {
             self.allocator.free(column.name);
@@ -364,7 +364,7 @@ pub const Parser = struct {
         }
 
         // Parse optional JOIN clauses
-        var joins: std.ArrayListUnmanaged(ast.JoinClause) = .empty;
+        var joins: std.ArrayList(ast.JoinClause) = .empty;
         defer joins.deinit(self.allocator);
         errdefer for (joins.items) |*join| {
             self.allocator.free(join.table);
@@ -395,7 +395,7 @@ pub const Parser = struct {
             try self.advance();
             try self.expect(.By);
 
-            var group_columns: std.ArrayListUnmanaged([]const u8) = .empty;
+            var group_columns: std.ArrayList([]const u8) = .empty;
             defer group_columns.deinit(self.allocator);
             errdefer for (group_columns.items) |col| self.allocator.free(col);
 
@@ -448,7 +448,7 @@ pub const Parser = struct {
                 try self.advance();
                 try self.expect(.By);
 
-                var order_clauses: std.ArrayListUnmanaged(ast.OrderByClause) = .empty;
+                var order_clauses: std.ArrayList(ast.OrderByClause) = .empty;
                 defer order_clauses.deinit(self.allocator);
                 errdefer for (order_clauses.items) |clause| self.allocator.free(clause.column);
 
@@ -518,7 +518,7 @@ pub const Parser = struct {
     fn parseWindowDefinitions(self: *Self) ![]ast.WindowDefinition {
         try self.expect(.Window);
 
-        var definitions: std.ArrayListUnmanaged(ast.WindowDefinition) = .empty;
+        var definitions: std.ArrayList(ast.WindowDefinition) = .empty;
         errdefer {
             for (definitions.items) |*definition| {
                 definition.deinit(self.allocator);
@@ -683,7 +683,7 @@ pub const Parser = struct {
         };
         if (std.meta.activeTag(self.current_token) == .LeftParen) {
             try self.advance();
-            var column_list: std.ArrayListUnmanaged([]const u8) = .empty;
+            var column_list: std.ArrayList([]const u8) = .empty;
             defer column_list.deinit(self.allocator);
             errdefer for (column_list.items) |column| self.allocator.free(column);
 
@@ -711,7 +711,7 @@ pub const Parser = struct {
             try self.advance();
             try self.expect(.Values);
 
-            var values: std.ArrayListUnmanaged([]ast.Value) = .empty;
+            var values: std.ArrayList([]ast.Value) = .empty;
             defer values.deinit(self.allocator);
             errdefer for (values.items) |owned_row| {
                 for (owned_row) |value| value.deinit(self.allocator);
@@ -740,7 +740,7 @@ pub const Parser = struct {
         // Parse VALUES clause
         try self.expect(.Values);
 
-        var values: std.ArrayListUnmanaged([]ast.Value) = .empty;
+        var values: std.ArrayList([]ast.Value) = .empty;
         defer values.deinit(self.allocator);
         errdefer for (values.items) |owned_row| {
             for (owned_row) |value| value.deinit(self.allocator);
@@ -751,7 +751,7 @@ pub const Parser = struct {
         while (true) {
             try self.expect(.LeftParen);
 
-            var row: std.ArrayListUnmanaged(ast.Value) = .empty;
+            var row: std.ArrayList(ast.Value) = .empty;
             defer row.deinit(self.allocator);
             errdefer for (row.items) |value| value.deinit(self.allocator);
 
@@ -815,7 +815,7 @@ pub const Parser = struct {
         var target_columns: ?[][]const u8 = null;
         if (std.meta.activeTag(self.current_token) == .LeftParen) {
             try self.advance();
-            var cols: std.ArrayListUnmanaged([]const u8) = .empty;
+            var cols: std.ArrayList([]const u8) = .empty;
             defer cols.deinit(self.allocator);
             errdefer for (cols.items) |column| self.allocator.free(column);
 
@@ -858,7 +858,7 @@ pub const Parser = struct {
 
             // Parse assignments. On error, free every assignment already collected;
             // toOwnedSlice() empties the list on the success path so this no-ops then.
-            var assignments: std.ArrayListUnmanaged(ast.Assignment) = .empty;
+            var assignments: std.ArrayList(ast.Assignment) = .empty;
             errdefer {
                 for (assignments.items) |*a| a.deinit(self.allocator);
                 assignments.deinit(self.allocator);
@@ -915,7 +915,7 @@ pub const Parser = struct {
     fn parseReturning(self: *Self) !ast.ReturningClause {
         try self.expect(.Returning);
 
-        var columns: std.ArrayListUnmanaged([]const u8) = .empty;
+        var columns: std.ArrayList([]const u8) = .empty;
         defer columns.deinit(self.allocator);
         errdefer for (columns.items) |column| self.allocator.free(column);
 
@@ -1246,7 +1246,7 @@ pub const Parser = struct {
         // Column list (col1, col2, ...)
         try self.expect(.LeftParen);
 
-        var columns: std.ArrayListUnmanaged([]const u8) = .empty;
+        var columns: std.ArrayList([]const u8) = .empty;
         errdefer {
             for (columns.items) |col| {
                 self.allocator.free(col);
@@ -1302,11 +1302,11 @@ pub const Parser = struct {
 
         try self.expect(.LeftParen);
 
-        var columns: std.ArrayListUnmanaged([]const u8) = .empty;
+        var columns: std.ArrayList([]const u8) = .empty;
         defer columns.deinit(self.allocator);
         errdefer for (columns.items) |col| self.allocator.free(col);
 
-        var expressions: std.ArrayListUnmanaged(ast.Expression) = .empty;
+        var expressions: std.ArrayList(ast.Expression) = .empty;
         defer expressions.deinit(self.allocator);
         errdefer for (expressions.items) |*expr| expr.deinit(self.allocator);
 
@@ -1390,10 +1390,10 @@ pub const Parser = struct {
 
         try self.expect(.LeftParen);
 
-        var columns: std.ArrayListUnmanaged(ast.ColumnDefinition) = .empty;
+        var columns: std.ArrayList(ast.ColumnDefinition) = .empty;
         defer columns.deinit(self.allocator);
 
-        var table_constraints: std.ArrayListUnmanaged(ast.TableConstraint) = .empty;
+        var table_constraints: std.ArrayList(ast.TableConstraint) = .empty;
         defer table_constraints.deinit(self.allocator);
 
         while (true) {
@@ -1434,7 +1434,7 @@ pub const Parser = struct {
 
         try self.expect(.Set);
 
-        var assignments: std.ArrayListUnmanaged(ast.Assignment) = .empty;
+        var assignments: std.ArrayList(ast.Assignment) = .empty;
         errdefer {
             // Clean up any already-parsed assignments on error
             for (assignments.items) |*assignment| {
@@ -1783,7 +1783,7 @@ pub const Parser = struct {
         try self.expect(.LeftParen); // expect '('
 
         // Parse arguments (some window functions take arguments, e.g., LAG(column, offset, default))
-        var arguments: std.ArrayListUnmanaged(ast.FunctionArgument) = .empty;
+        var arguments: std.ArrayList(ast.FunctionArgument) = .empty;
         errdefer {
             for (arguments.items) |arg| {
                 arg.deinit(self.allocator);
@@ -1871,7 +1871,7 @@ pub const Parser = struct {
             try self.advance(); // consume PARTITION
             try self.expect(.By); // expect BY
 
-            var columns: std.ArrayListUnmanaged([]const u8) = .empty;
+            var columns: std.ArrayList([]const u8) = .empty;
             errdefer {
                 for (columns.items) |col| {
                     self.allocator.free(col);
@@ -1898,7 +1898,7 @@ pub const Parser = struct {
             try self.advance(); // consume ORDER
             try self.expect(.By); // expect BY
 
-            var order_clauses: std.ArrayListUnmanaged(ast.OrderByClause) = .empty;
+            var order_clauses: std.ArrayList(ast.OrderByClause) = .empty;
             errdefer {
                 for (order_clauses.items) |clause| {
                     self.allocator.free(clause.column);
@@ -2028,7 +2028,7 @@ pub const Parser = struct {
         const name = try self.expectIdentifierOrKeyword();
         const data_type = try self.parseDataType();
 
-        var constraints: std.ArrayListUnmanaged(ast.ColumnConstraint) = .empty;
+        var constraints: std.ArrayList(ast.ColumnConstraint) = .empty;
         defer constraints.deinit(self.allocator);
 
         // Parse constraints
@@ -2387,7 +2387,7 @@ pub const Parser = struct {
 
         try self.expect(.LeftParen);
 
-        var arguments: std.ArrayListUnmanaged(ast.FunctionArgument) = .empty;
+        var arguments: std.ArrayList(ast.FunctionArgument) = .empty;
         defer arguments.deinit(self.allocator);
 
         // Parse arguments
@@ -2665,7 +2665,7 @@ pub const Parser = struct {
         }
 
         // Otherwise parse as value list
-        var values: std.ArrayListUnmanaged(ast.Value) = .empty;
+        var values: std.ArrayList(ast.Value) = .empty;
         errdefer {
             for (values.items) |*val| {
                 val.deinit(self.allocator);
@@ -2820,7 +2820,7 @@ pub const Parser = struct {
     fn parseCaseExpression(self: *Self) Error!ast.Value {
         try self.advance(); // consume CASE
 
-        var branches: std.ArrayListUnmanaged(ast.CaseWhenBranch) = .empty;
+        var branches: std.ArrayList(ast.CaseWhenBranch) = .empty;
         errdefer {
             for (branches.items) |*branch| {
                 branch.deinit(self.allocator);
@@ -2881,7 +2881,7 @@ pub const Parser = struct {
         try self.advance(); // consume function name
         try self.expect(.LeftParen);
 
-        var arguments: std.ArrayListUnmanaged(ast.FunctionArgument) = .empty;
+        var arguments: std.ArrayList(ast.FunctionArgument) = .empty;
         errdefer {
             for (arguments.items) |*arg| {
                 arg.deinit(self.allocator);
@@ -3038,7 +3038,7 @@ pub const Parser = struct {
                 try self.advance(); // consume FOREIGN
                 try self.expect(.Key); // expect KEY
                 try self.expect(.LeftParen);
-                var child_columns: std.ArrayListUnmanaged([]const u8) = .empty;
+                var child_columns: std.ArrayList([]const u8) = .empty;
                 defer child_columns.deinit(self.allocator);
                 errdefer for (child_columns.items) |column| self.allocator.free(column);
                 while (true) {
@@ -3052,7 +3052,7 @@ pub const Parser = struct {
                 const ref_table_name = try self.expectIdentifier();
                 errdefer self.allocator.free(ref_table_name);
                 try self.expect(.LeftParen);
-                var parent_columns: std.ArrayListUnmanaged([]const u8) = .empty;
+                var parent_columns: std.ArrayList([]const u8) = .empty;
                 defer parent_columns.deinit(self.allocator);
                 errdefer for (parent_columns.items) |column| self.allocator.free(column);
                 while (true) {
@@ -3110,7 +3110,7 @@ pub const Parser = struct {
                 try self.advance(); // consume UNIQUE
                 try self.expect(.LeftParen);
 
-                var columns_list: std.ArrayListUnmanaged([]const u8) = .empty;
+                var columns_list: std.ArrayList([]const u8) = .empty;
                 defer columns_list.deinit(self.allocator);
 
                 while (true) {
@@ -3135,7 +3135,7 @@ pub const Parser = struct {
                 try self.expect(.Key); // expect KEY
                 try self.expect(.LeftParen);
 
-                var columns_list: std.ArrayListUnmanaged([]const u8) = .empty;
+                var columns_list: std.ArrayList([]const u8) = .empty;
                 defer columns_list.deinit(self.allocator);
 
                 while (true) {

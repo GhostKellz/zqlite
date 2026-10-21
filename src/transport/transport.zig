@@ -9,7 +9,7 @@ pub const PQDatabaseTransport = @import("pq_quic.zig").PQDatabaseTransport;
 pub const Transport = struct {
     allocator: std.mem.Allocator,
     endpoint: ?Endpoint,
-    connections: std.ArrayListUnmanaged(*Connection),
+    connections: std.ArrayList(*Connection),
     is_server: bool,
     crypto_enabled: bool,
     next_connection_id: ConnectionId,
@@ -26,8 +26,8 @@ pub const Transport = struct {
         id: ConnectionId,
         address: std.Io.net.IpAddress,
         state: ConnectionState,
-        write_buffer: std.ArrayListUnmanaged(u8),
-        read_buffer: std.ArrayListUnmanaged(u8),
+        write_buffer: std.ArrayList(u8),
+        read_buffer: std.ArrayList(u8),
         allocator: std.mem.Allocator,
 
         const ConnectionState = enum {

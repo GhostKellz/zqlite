@@ -6,7 +6,7 @@ const storage = @import("storage.zig");
 pub const NodeCache = struct {
     allocator: std.mem.Allocator,
     entries: std.AutoHashMap(u32, CacheEntry),
-    lru_order: std.ArrayListUnmanaged(u32),
+    lru_order: std.ArrayList(u32),
     max_entries: usize,
     hits: u64,
     misses: u64,
@@ -349,7 +349,7 @@ pub const BTree = struct {
 
     /// Select all rows (for table scans)
     pub fn selectAll(self: *Self, allocator: std.mem.Allocator) ![]storage.Row {
-        var results: std.ArrayListUnmanaged(storage.Row) = .empty;
+        var results: std.ArrayList(storage.Row) = .empty;
         try self.collectAllLeafValues(self.root_page, &results, allocator);
         return results.toOwnedSlice(allocator);
     }
@@ -362,7 +362,7 @@ pub const BTree = struct {
 
     /// Select all rows with their keys (for delete filtering)
     pub fn selectAllWithKeys(self: *Self, allocator: std.mem.Allocator) ![]KeyRowPair {
-        var results: std.ArrayListUnmanaged(KeyRowPair) = .empty;
+        var results: std.ArrayList(KeyRowPair) = .empty;
         try self.collectAllLeafValuesWithKeys(self.root_page, &results, allocator);
         return results.toOwnedSlice(allocator);
     }

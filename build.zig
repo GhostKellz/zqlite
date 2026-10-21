@@ -58,9 +58,9 @@ pub fn build(b: *std.Build) void {
     const build_date = "2026-05-05";
 
     // Build mode string
-    // A null optimize mode means the user passed no -Doptimize/--release, which
-    // the build graph resolves to debug.
-    const build_mode = switch (optimize orelse .debug) {
+    // Older supported compilers return null for the default debug mode.
+    const resolved_optimize = if (@typeInfo(@TypeOf(optimize)) == .optional) optimize orelse .debug else optimize;
+    const build_mode = switch (resolved_optimize) {
         .debug => "debug",
         .safe => "release-safe",
         .fast => "release-fast",

@@ -211,7 +211,7 @@ pub const DistributedQueryEngine = struct {
 
     /// Execute multi-node plan
     fn executeMultiNodePlan(self: *Self, plan: ExecutionPlan) !DistributedQueryResult {
-        var results: std.ArrayListUnmanaged(NodeQueryResult) = .empty;
+        var results: std.ArrayList(NodeQueryResult) = .empty;
         defer results.deinit(self.allocator);
 
         // Execute on all target nodes
@@ -434,7 +434,7 @@ const ResultAggregator = struct {
     pub fn aggregateResults(self: *Self, results: []const NodeQueryResult) !DistributedQueryResult {
         var total_affected_rows: u64 = 0;
         var max_execution_time: u64 = 0;
-        var all_rows: std.ArrayListUnmanaged([]storage.Value) = .empty;
+        var all_rows: std.ArrayList([]storage.Value) = .empty;
 
         for (results) |result| {
             if (!result.success) {

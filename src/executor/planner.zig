@@ -106,7 +106,7 @@ pub const Planner = struct {
 
     /// Plan SELECT statement execution
     fn planSelect(self: *Self, select: *const ast.SelectStatement) !ExecutionPlan {
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
 
         const base_table = select.table orelse "";
         if (if (select.joins.len == 0) try self.chooseIndexScan(base_table, select.where_clause) else null) |index_scan| {
@@ -139,7 +139,7 @@ pub const Planner = struct {
 
         if (has_aggregates) {
             // Extract aggregate operations
-            var aggregates: std.ArrayListUnmanaged(AggregateOperation) = .empty;
+            var aggregates: std.ArrayList(AggregateOperation) = .empty;
             for (select.columns) |column| {
                 if (column.expression == .Aggregate) {
                     try aggregates.append(self.allocator, AggregateOperation{
@@ -179,7 +179,7 @@ pub const Planner = struct {
 
             if (select.group_by) |group_by| {
                 // GROUP BY aggregation
-                var group_columns: std.ArrayListUnmanaged([]const u8) = .empty;
+                var group_columns: std.ArrayList([]const u8) = .empty;
                 for (group_by) |col| {
                     try group_columns.append(self.allocator, try self.allocator.dupe(u8, col));
                 }
@@ -209,12 +209,12 @@ pub const Planner = struct {
             }
         } else {
             // Regular projection step (SELECT columns)
-            var columns: std.ArrayListUnmanaged([]const u8) = .empty;
-            var expressions: std.ArrayListUnmanaged(ast.ColumnExpression) = .empty;
+            var columns: std.ArrayList([]const u8) = .empty;
+            var expressions: std.ArrayList(ast.ColumnExpression) = .empty;
             var has_expressions = false;
-            var window_functions: std.ArrayListUnmanaged(ast.WindowFunction) = .empty;
-            var window_column_names: std.ArrayListUnmanaged([]const u8) = .empty;
-            var non_window_columns: std.ArrayListUnmanaged([]const u8) = .empty;
+            var window_functions: std.ArrayList(ast.WindowFunction) = .empty;
+            var window_column_names: std.ArrayList([]const u8) = .empty;
+            var non_window_columns: std.ArrayList([]const u8) = .empty;
 
             for (select.columns) |column| {
                 switch (column.expression) {
@@ -368,7 +368,7 @@ pub const Planner = struct {
         };
     }
 
-    fn appendWindowInputColumns(self: *Self, columns: *std.ArrayListUnmanaged([]const u8), window_func: ast.WindowFunction) !void {
+    fn appendWindowInputColumns(self: *Self, columns: *std.ArrayList([]const u8), window_func: ast.WindowFunction) !void {
         for (window_func.arguments) |arg| {
             if (arg == .Column) {
                 try self.appendUniqueColumn(columns, arg.Column);
@@ -377,7 +377,7 @@ pub const Planner = struct {
         try self.appendWindowSpecInputColumns(columns, window_func.window_spec);
     }
 
-    fn appendWindowSpecInputColumns(self: *Self, columns: *std.ArrayListUnmanaged([]const u8), spec: ast.WindowSpecification) !void {
+    fn appendWindowSpecInputColumns(self: *Self, columns: *std.ArrayList([]const u8), spec: ast.WindowSpecification) !void {
         if (spec.partition_by) |partition_by| {
             for (partition_by) |col| try self.appendUniqueColumn(columns, col);
         }
@@ -386,7 +386,7 @@ pub const Planner = struct {
         }
     }
 
-    fn appendUniqueColumn(self: *Self, columns: *std.ArrayListUnmanaged([]const u8), name: []const u8) !void {
+    fn appendUniqueColumn(self: *Self, columns: *std.ArrayList([]const u8), name: []const u8) !void {
         for (columns.items) |existing| {
             if (std.mem.eql(u8, existing, name)) return;
         }
@@ -601,12 +601,12 @@ pub const Planner = struct {
 
     /// Plan INSERT statement execution
     fn planInsert(self: *Self, insert: *const ast.InsertStatement) !ExecutionPlan {
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
 
         // Clone columns if provided
         var columns: ?[][]const u8 = null;
         if (insert.columns) |cols| {
-            var cloned_cols: std.ArrayListUnmanaged([]const u8) = .empty;
+            var cloned_cols: std.ArrayList([]const u8) = .empty;
             for (cols) |col| {
                 try cloned_cols.append(self.allocator, try self.allocator.dupe(u8, col));
             }
@@ -614,9 +614,9 @@ pub const Planner = struct {
         }
 
         // Clone values
-        var values: std.ArrayListUnmanaged([]storage.Value) = .empty;
+        var values: std.ArrayList([]storage.Value) = .empty;
         for (insert.values) |row| {
-            var cloned_row: std.ArrayListUnmanaged(storage.Value) = .empty;
+            var cloned_row: std.ArrayList(storage.Value) = .empty;
             for (row) |value| {
                 try cloned_row.append(self.allocator, try self.cloneValue(value));
             }
@@ -631,7 +631,7 @@ pub const Planner = struct {
                     on_conflict = .{ .DoNothing = {} };
                 },
                 .DoUpdate => |update| {
-                    var cloned_assignments: std.ArrayListUnmanaged(UpdateAssignment) = .empty;
+                    var cloned_assignments: std.ArrayList(UpdateAssignment) = .empty;
                     for (update.assignments) |assignment| {
                         try cloned_assignments.append(self.allocator, UpdateAssignment{
                             .column = try self.allocator.dupe(u8, assignment.column),
@@ -655,7 +655,7 @@ pub const Planner = struct {
         // Clone RETURNING columns if provided
         var returning_columns: ?[][]const u8 = null;
         if (insert.returning) |ret| {
-            var cloned_ret: std.ArrayListUnmanaged([]const u8) = .empty;
+            var cloned_ret: std.ArrayList([]const u8) = .empty;
             for (ret.columns) |col| {
                 try cloned_ret.append(self.allocator, try self.allocator.dupe(u8, col));
             }
@@ -680,10 +680,10 @@ pub const Planner = struct {
 
     /// Plan CREATE TABLE statement execution
     fn planCreateTable(self: *Self, create: *const ast.CreateTableStatement) !ExecutionPlan {
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
 
         // Clone column definitions
-        var columns: std.ArrayListUnmanaged(storage.Column) = .empty;
+        var columns: std.ArrayList(storage.Column) = .empty;
         for (create.columns) |col_def| {
             try columns.append(self.allocator, storage.Column{
                 .name = try self.allocator.dupe(u8, col_def.name),
@@ -755,9 +755,9 @@ pub const Planner = struct {
             });
         }
 
-        var unique_constraints: std.ArrayListUnmanaged(UniqueConstraintStep) = .empty;
-        var check_constraints: std.ArrayListUnmanaged(ast.Condition) = .empty;
-        var foreign_keys: std.ArrayListUnmanaged(ast.ForeignKeyConstraint) = .empty;
+        var unique_constraints: std.ArrayList(UniqueConstraintStep) = .empty;
+        var check_constraints: std.ArrayList(ast.Condition) = .empty;
+        var foreign_keys: std.ArrayList(ast.ForeignKeyConstraint) = .empty;
 
         for (create.columns) |col_def| {
             for (col_def.constraints) |constraint| {
@@ -872,10 +872,10 @@ pub const Planner = struct {
 
     /// Plan UPDATE statement execution
     fn planUpdate(self: *Self, update: *const ast.UpdateStatement) !ExecutionPlan {
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
 
         // Clone assignments
-        var assignments: std.ArrayListUnmanaged(UpdateAssignment) = .empty;
+        var assignments: std.ArrayList(UpdateAssignment) = .empty;
         for (update.assignments) |assignment| {
             try assignments.append(self.allocator, UpdateAssignment{
                 .column = try self.allocator.dupe(u8, assignment.column),
@@ -891,7 +891,7 @@ pub const Planner = struct {
         // Clone RETURNING columns if provided
         var returning_columns: ?[][]const u8 = null;
         if (update.returning) |ret| {
-            var cloned_ret: std.ArrayListUnmanaged([]const u8) = .empty;
+            var cloned_ret: std.ArrayList([]const u8) = .empty;
             for (ret.columns) |col| {
                 try cloned_ret.append(self.allocator, try self.allocator.dupe(u8, col));
             }
@@ -915,7 +915,7 @@ pub const Planner = struct {
 
     /// Plan DELETE statement execution
     fn planDelete(self: *Self, delete: *const ast.DeleteStatement) !ExecutionPlan {
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
 
         var condition: ?ast.Condition = null;
         if (delete.where_clause) |where_clause| {
@@ -925,7 +925,7 @@ pub const Planner = struct {
         // Clone RETURNING columns if provided
         var returning_columns: ?[][]const u8 = null;
         if (delete.returning) |ret| {
-            var cloned_ret: std.ArrayListUnmanaged([]const u8) = .empty;
+            var cloned_ret: std.ArrayList([]const u8) = .empty;
             for (ret.columns) |col| {
                 try cloned_ret.append(self.allocator, try self.allocator.dupe(u8, col));
             }
@@ -949,7 +949,7 @@ pub const Planner = struct {
     /// Plan transaction statement
     fn planTransaction(self: *Self, trans: *const ast.TransactionStatement) !ExecutionPlan {
         _ = trans;
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
 
         try steps.append(self.allocator, ExecutionStep{
             .BeginTransaction = {},
@@ -964,7 +964,7 @@ pub const Planner = struct {
     /// Plan commit statement
     fn planCommit(self: *Self, trans: *const ast.TransactionStatement) !ExecutionPlan {
         _ = trans;
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
 
         try steps.append(self.allocator, ExecutionStep{
             .Commit = {},
@@ -979,7 +979,7 @@ pub const Planner = struct {
     /// Plan rollback statement
     fn planRollback(self: *Self, trans: *const ast.TransactionStatement) !ExecutionPlan {
         _ = trans;
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
 
         try steps.append(self.allocator, ExecutionStep{
             .Rollback = {},
@@ -993,7 +993,7 @@ pub const Planner = struct {
 
     fn planSavepoint(self: *Self, trans: *const ast.TransactionStatement) !ExecutionPlan {
         const name = trans.savepoint_name orelse return error.ExpectedIdentifier;
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
         try steps.append(self.allocator, ExecutionStep{
             .Savepoint = SavepointStep{ .name = try self.allocator.dupe(u8, name) },
         });
@@ -1005,7 +1005,7 @@ pub const Planner = struct {
 
     fn planReleaseSavepoint(self: *Self, trans: *const ast.TransactionStatement) !ExecutionPlan {
         const name = trans.savepoint_name orelse return error.ExpectedIdentifier;
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
         try steps.append(self.allocator, ExecutionStep{
             .ReleaseSavepoint = SavepointStep{ .name = try self.allocator.dupe(u8, name) },
         });
@@ -1017,7 +1017,7 @@ pub const Planner = struct {
 
     fn planRollbackToSavepoint(self: *Self, trans: *const ast.TransactionStatement) !ExecutionPlan {
         const name = trans.savepoint_name orelse return error.ExpectedIdentifier;
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
         try steps.append(self.allocator, ExecutionStep{
             .RollbackToSavepoint = SavepointStep{ .name = try self.allocator.dupe(u8, name) },
         });
@@ -1029,7 +1029,7 @@ pub const Planner = struct {
 
     /// Plan create index statement
     fn planCreateIndex(self: *Self, create_idx: *const ast.CreateIndexStatement) !ExecutionPlan {
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
 
         // Clone columns
         var columns = try self.allocator.alloc([]const u8, create_idx.columns.len);
@@ -1068,7 +1068,7 @@ pub const Planner = struct {
 
     /// Plan drop index statement
     fn planDropIndex(self: *Self, drop_idx: *const ast.DropIndexStatement) !ExecutionPlan {
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
 
         try steps.append(self.allocator, ExecutionStep{
             .DropIndex = DropIndexStep{
@@ -1085,7 +1085,7 @@ pub const Planner = struct {
 
     /// Plan drop table statement
     fn planDropTable(self: *Self, drop_tbl: *const ast.DropTableStatement) !ExecutionPlan {
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
 
         try steps.append(self.allocator, ExecutionStep{
             .DropTable = DropTableStep{
@@ -1513,7 +1513,7 @@ pub const Planner = struct {
 
     /// Plan PRAGMA statement execution
     fn planPragma(self: *Self, pragma: *const ast.PragmaStatement) !ExecutionPlan {
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
 
         try steps.append(self.allocator, ExecutionStep{
             .Pragma = PragmaStep{
@@ -1530,7 +1530,7 @@ pub const Planner = struct {
     }
 
     fn planAnalyze(self: *Self, analyze: *const ast.AnalyzeStatement) !ExecutionPlan {
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
 
         try steps.append(self.allocator, ExecutionStep{
             .Analyze = AnalyzeStep{
@@ -1545,7 +1545,7 @@ pub const Planner = struct {
     }
 
     fn planVacuum(self: *Self) !ExecutionPlan {
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
         try steps.append(self.allocator, .Vacuum);
         return ExecutionPlan{
             .steps = try steps.toOwnedSlice(self.allocator),
@@ -1555,7 +1555,7 @@ pub const Planner = struct {
 
     /// Plan ATTACH DATABASE statement
     fn planAttach(self: *Self, attach: *const ast.AttachStatement) !ExecutionPlan {
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
 
         try steps.append(self.allocator, ExecutionStep{
             .Attach = AttachStep{
@@ -1572,7 +1572,7 @@ pub const Planner = struct {
 
     /// Plan DETACH DATABASE statement
     fn planDetach(self: *Self, detach: *const ast.DetachStatement) !ExecutionPlan {
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
 
         try steps.append(self.allocator, ExecutionStep{
             .Detach = DetachStep{
@@ -1588,7 +1588,7 @@ pub const Planner = struct {
 
     /// Plan CREATE VIRTUAL TABLE statement (FTS5)
     fn planCreateVirtualTable(self: *Self, create_vt: *const ast.CreateVirtualTableStatement) !ExecutionPlan {
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
 
         // Duplicate column names
         var columns = try self.allocator.alloc([]const u8, create_vt.columns.len);
@@ -1613,7 +1613,7 @@ pub const Planner = struct {
 
     /// Plan EXPLAIN / EXPLAIN QUERY PLAN statement
     fn planExplain(self: *Self, explain: *const ast.ExplainStatement) anyerror!ExecutionPlan {
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
 
         // First, plan the inner statement to get its execution steps
         const inner_plan = try self.plan(explain.inner_statement);
@@ -1644,7 +1644,7 @@ pub const Planner = struct {
     /// Plan Common Table Expression (WITH clause) execution
     /// CTEs are executed first, their results stored, then the main query references them
     fn planWith(self: *Self, with: *const ast.WithStatement) !ExecutionPlan {
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
 
         // First, plan and create execution steps for each CTE definition
         // CTEs are executed in order and can reference previously defined CTEs
@@ -1657,7 +1657,7 @@ pub const Planner = struct {
                 self.allocator.free(cte_plan.steps);
             }
 
-            var cloned_cols: std.ArrayListUnmanaged([]const u8) = .empty;
+            var cloned_cols: std.ArrayList([]const u8) = .empty;
             errdefer {
                 for (cloned_cols.items) |col| self.allocator.free(col);
                 cloned_cols.deinit(self.allocator);
@@ -1705,7 +1705,7 @@ pub const Planner = struct {
 
     /// Plan compound SELECT (UNION/INTERSECT/EXCEPT)
     fn planCompoundSelect(self: *Self, compound: *const ast.CompoundSelectStatement) !ExecutionPlan {
-        var steps: std.ArrayListUnmanaged(ExecutionStep) = .empty;
+        var steps: std.ArrayList(ExecutionStep) = .empty;
 
         // Plan the left SELECT
         const left_plan = try self.planSelect(compound.left);
@@ -1718,7 +1718,7 @@ pub const Planner = struct {
         // Clone order_by if present
         var order_by: ?[]ast.OrderByClause = null;
         if (compound.order_by) |orig_order_by| {
-            var cloned_order: std.ArrayListUnmanaged(ast.OrderByClause) = .empty;
+            var cloned_order: std.ArrayList(ast.OrderByClause) = .empty;
             for (orig_order_by) |clause| {
                 try cloned_order.append(self.allocator, ast.OrderByClause{
                     .column = try self.allocator.dupe(u8, clause.column),

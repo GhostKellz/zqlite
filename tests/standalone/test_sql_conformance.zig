@@ -948,7 +948,7 @@ fn runCase(allocator: std.mem.Allocator, case: TestCase) ![]u8 {
 }
 
 fn executionResultToString(allocator: std.mem.Allocator, result: anytype) ![]u8 {
-    var output: std.ArrayListUnmanaged(u8) = .empty;
+    var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);
 
     for (result.rows.items) |row| {
@@ -975,7 +975,7 @@ fn runErrorCase(allocator: std.mem.Allocator, case: ErrorCase) !void {
     } else |_| {}
 }
 
-fn appendValue(allocator: std.mem.Allocator, output: *std.ArrayListUnmanaged(u8), value: Value) !void {
+fn appendValue(allocator: std.mem.Allocator, output: *std.ArrayList(u8), value: Value) !void {
     switch (value) {
         .Null => try output.appendSlice(allocator, "NULL"),
         .Integer => |v| try appendFmt(allocator, output, "{d}", .{v}),
@@ -991,7 +991,7 @@ fn appendValue(allocator: std.mem.Allocator, output: *std.ArrayListUnmanaged(u8)
 
 const Value = zqlite.storage.Value;
 
-fn appendFmt(allocator: std.mem.Allocator, output: *std.ArrayListUnmanaged(u8), comptime fmt: []const u8, args: anytype) !void {
+fn appendFmt(allocator: std.mem.Allocator, output: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !void {
     const formatted = try std.fmt.allocPrint(allocator, fmt, args);
     defer allocator.free(formatted);
     try output.appendSlice(allocator, formatted);

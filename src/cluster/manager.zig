@@ -109,7 +109,7 @@ pub const ClusterManager = struct {
         const target_nodes = try self.determineTargetNodes(query);
         defer self.allocator.free(target_nodes);
 
-        var results: std.ArrayListUnmanaged(QueryResult) = .empty;
+        var results: std.ArrayList(QueryResult) = .empty;
         defer results.deinit(self.allocator);
 
         // Execute query on target nodes
@@ -222,7 +222,7 @@ pub const ClusterManager = struct {
         const shards_to_redistribute = node.allocated_shards.items;
 
         // Find healthy nodes to take over shards
-        var available_nodes: std.ArrayListUnmanaged(*Node) = .empty;
+        var available_nodes: std.ArrayList(*Node) = .empty;
         defer available_nodes.deinit(self.allocator);
 
         var node_iterator = self.nodes.iterator();
@@ -267,7 +267,7 @@ pub const ClusterManager = struct {
 
     /// Get nodes for admin query
     fn getAdminNodes(self: *Self) ![]const *Node {
-        var nodes: std.ArrayListUnmanaged(*Node) = .empty;
+        var nodes: std.ArrayList(*Node) = .empty;
 
         var node_iterator = self.nodes.iterator();
         while (node_iterator.next()) |entry| {
@@ -320,7 +320,7 @@ pub const ClusterManager = struct {
 
     /// Select nodes for removal during scale down
     fn selectNodesForRemoval(self: *Self, count: u32) ![]const *Node {
-        var candidates: std.ArrayListUnmanaged(*Node) = .empty;
+        var candidates: std.ArrayList(*Node) = .empty;
         defer candidates.deinit(self.allocator);
 
         var node_iterator = self.nodes.iterator();
@@ -379,7 +379,7 @@ pub const Node = struct {
     status: NodeStatus,
     last_seen: i64,
     load_factor: f64,
-    allocated_shards: std.ArrayListUnmanaged(u32),
+    allocated_shards: std.ArrayList(u32),
 };
 
 /// Node status
@@ -393,7 +393,7 @@ pub const NodeStatus = enum {
 /// Load balancer
 const LoadBalancer = struct {
     allocator: std.mem.Allocator,
-    nodes: std.ArrayListUnmanaged(*Node),
+    nodes: std.ArrayList(*Node),
     round_robin_index: u32,
 
     const Self = @This();
@@ -436,7 +436,7 @@ const LoadBalancer = struct {
 /// Health monitor
 const HealthMonitor = struct {
     allocator: std.mem.Allocator,
-    nodes: std.ArrayListUnmanaged(*Node),
+    nodes: std.ArrayList(*Node),
     health_check_interval_ms: u64,
     stale_threshold_ms: u64,
 
